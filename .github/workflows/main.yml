@@ -1,0 +1,96 @@
+name: Build and Publish mswnlink Executables
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional existing release tag to upload the built files to (for example v1.0). Leave blank to only build downloadable workflow artifacts.'
+        required: false
+        type: string
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build mswnlink for ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            script: dist:fedora
+            label: fedora-x64
+          - os: windows-latest
+            script: dist:win
+            label: windows-x64
+          - os: macos-15-intel
+            script: dist:mac
+            label: macos-intel-x64
+          - os: macos-15
+            script: dist:mac
+            label: macos-apple-silicon-arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 libxtst-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libpng-dev libpng++-dev
+
+      - name: Install Node dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Check source JavaScript
+        run: npm run check
+
+      - name: Build native mouse and keyboard backend
+        run: npm run rebuild:native
+
+      - name: Package standalone application
+        run: npm run ${{ matrix.script }}
+
+      - name: Upload standalone artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mswnlink-${{ matrix.label }}
+          path: |
+            release/*.AppImage
+            release/*.exe
+            release/*.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    name: Attach builds to GitHub Release
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mswnlink-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Attach files to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.event.release.tag_name }}
+          files: release-assets/*
