@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Optional existing release tag to upload the built files to (for example v1.0). Leave blank to only build downloadable workflow artifacts.'
+        description: 'Optional existing release tag to attach builds to (for example v1.0). Leave blank to create workflow artifacts only.'
         required: false
         type: string
   release:
@@ -49,7 +49,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential python3 libxtst-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libpng-dev libpng++-dev
+          sudo apt-get install -y build-essential python3 pkg-config libxtst-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxkbfile-dev libpng-dev libpng++-dev
+
+      - name: Print toolchain versions
+        run: |
+          node --version
+          npm --version
+          node -p "process.platform + ' ' + process.arch"
 
       - name: Install Node dependencies
         run: npm install --no-audit --no-fund
@@ -57,11 +63,19 @@ jobs:
       - name: Check source JavaScript
         run: npm run check
 
-      - name: Build native mouse and keyboard backend
-        run: npm run rebuild:native
+      # RobotJS 0.9.1 provides Node-API prebuilt binaries on supported x64/arm64
+      # targets. Avoid electron-rebuild here: forcing a source build was causing
+      # the Linux/macOS jobs to fail even though Windows packaged successfully.
+      # N-API is ABI-stable; validate the module is present before packaging.
+      - name: Verify native input backend is available
+        run: node -e "const r = require('robotjs'); if (!r || typeof r.moveMouse !== 'function') process.exit(1); console.log('RobotJS input backend loaded successfully')"
 
       - name: Package standalone application
         run: npm run ${{ matrix.script }}
+
+      - name: List generated installers
+        shell: bash
+        run: ls -lah release
 
       - name: Upload standalone artifact
         uses: actions/upload-artifact@v7
