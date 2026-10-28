@@ -1,6 +1,7 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, desktopCapturer, session, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, session, shell, safeStorage } = require('electron');
+const fs = require('node:fs/promises');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
@@ -20,7 +21,9 @@ const ALLOWED_SIGNAL_TYPES = new Set(['offer', 'answer', 'candidate', 'hangup', 
 
 let mainWindow = null;
 let wss = null;
-let pairingCode = null;
+let pairingCode = null; // Active listener's current passcode, updated only by the owner.
+let persistentAccessCode = null; // Owner-configured passcode persisted via Electron safeStorage.
+let accessCodeStorageError = '';
 let chosenSourceId = null;
 let pendingSocket = null;
 let activeSocket = null;
@@ -30,9 +33,11 @@ let robot = null;
 const heldKeys = new Set();
 const heldButtons = new Set();
 const badAttempts = new Map();
+let wheelRemainderX = 0;
+let wheelRemainderY = 0;
 
 try {
-  // Native RobotJS binaries are rebuilt for Electron during npm install.
+  // Use the native input backend when built for this Electron/OS combination.
   robot = require('robotjs');
   robot.setMouseDelay(0);
   robot.setKeyboardDelay(0);
@@ -100,8 +105,81 @@ function getLanIPv4() {
   return [...new Set(result)];
 }
 
-function newPairingCode() {
-  return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+function validateAccessCode(value) {
+  if (typeof value !== 'string') return '';
+  const code = value.trim();
+  if (code.length < 8 || code.length > 64 || /[\u0000-\u001f\u007f]/u.test(code)) return '';
+  return code;
+}
+
+function getAccessCodeBackend() {
+  try {
+    return typeof safeStorage.getSelectedStorageBackend === 'function'
+      ? safeStorage.getSelectedStorageBackend()
+      : (safeStorage.isEncryptionAvailable() ? 'system' : 'unavailable');
+  } catch {
+    return 'unknown';
+  }
+}
+
+function getAccessCodeStorageWarning() {
+  const backend = getAccessCodeBackend();
+  if (backend === 'basic_text') {
+    return 'Warning: this Linux session is using Electron basic_text storage, which does not protect the passcode well. Configure GNOME Keyring/libsecret or KWallet for stronger OS-backed storage.';
+  }
+  if (!safeStorage.isEncryptionAvailable()) {
+    return 'OS secure storage is unavailable. Set up your desktop keyring and restart mswnlink before saving a permanent passcode.';
+  }
+  return '';
+}
+
+function accessCodeFilePath() {
+  return path.join(app.getPath('userData'), 'access-code.enc');
+}
+
+async function loadSavedAccessCode() {
+  const filePath = accessCodeFilePath();
+  try {
+    const stored = (await fs.readFile(filePath, 'utf8')).trim();
+    if (!safeStorage.isEncryptionAvailable()) {
+      accessCodeStorageError = 'The saved passcode exists, but OS secure storage is unavailable. Set up your desktop keyring and restart mswnlink.';
+      return null;
+    }
+    const code = validateAccessCode(safeStorage.decryptString(Buffer.from(stored, 'base64')));
+    if (!code) throw new Error('The saved passcode is invalid or damaged. Save a new passcode to replace it.');
+    accessCodeStorageError = '';
+    return code;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return null;
+    accessCodeStorageError = error && error.message ? error.message : 'Could not read the saved passcode.';
+    console.warn('[mswnlink] Could not load saved access code:', accessCodeStorageError);
+    return null;
+  }
+}
+
+async function savePersistentAccessCode(code) {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error(getAccessCodeStorageWarning() || 'OS secure storage is unavailable. Set up your desktop keyring and restart mswnlink.');
+  }
+  const encrypted = safeStorage.encryptString(code);
+  const filePath = accessCodeFilePath();
+  const directory = path.dirname(filePath);
+  await fs.mkdir(directory, { recursive: true });
+  const temporaryPath = `${filePath}.tmp-${process.pid}`;
+  await fs.writeFile(temporaryPath, encrypted.toString('base64'), { encoding: 'utf8', mode: 0o600 });
+  await fs.rename(temporaryPath, filePath);
+  persistentAccessCode = code;
+  accessCodeStorageError = '';
+  if (wss) pairingCode = code;
+  // Invalidate an already-approved pairing request made with the previous code.
+  if (pendingSocket) {
+    try { sendSocket(pendingSocket, { type: 'rejected', reason: 'The permanent access code changed. Please reconnect using the new code.' }); } catch {}
+    try { pendingSocket.close(1008, 'Access code changed'); } catch {}
+    pendingSocket = null;
+    activePeer = null;
+    sendToUI('incoming-cancelled', { reason: 'The permanent access code changed.' });
+  }
+  return { code, backend: getAccessCodeBackend(), warning: getAccessCodeStorageWarning() };
 }
 
 function parseMessage(raw) {
@@ -174,6 +252,8 @@ function clearNativeInput() {
     try { robot.mouseToggle('up', button); } catch {}
   }
   heldButtons.clear();
+  wheelRemainderX = 0;
+  wheelRemainderY = 0;
 }
 
 function closePeer(reason = 'Disconnected') {
@@ -227,8 +307,8 @@ function bindConnection(socket, req) {
         previous.count += 1;
         previous.time = now;
         badAttempts.set(remoteIp, previous);
-        sendSocket(socket, { type: 'rejected', reason: 'That pairing code is not correct.' });
-        socket.close(1008, 'Incorrect pairing code');
+        sendSocket(socket, { type: 'rejected', reason: 'That permanent access code is not correct.' });
+        socket.close(1008, 'Incorrect access code');
         return;
       }
       authenticated = true;
@@ -280,7 +360,8 @@ function bindConnection(socket, req) {
 
 async function startHost() {
   if (wss) return { code: pairingCode, port: PORT, ips: getLanIPv4() };
-  pairingCode = newPairingCode();
+  if (!persistentAccessCode) throw new Error('Set a permanent access code on the Share this PC screen before starting to share.');
+  pairingCode = persistentAccessCode;
   const server = new WebSocketServer({ host: '0.0.0.0', port: PORT, maxPayload: MAX_SIGNAL_BYTES });
   wss = server;
   server.on('connection', bindConnection);
@@ -367,8 +448,13 @@ function injectInput(event) {
         heldButtons.delete(button);
       }
     } else if (event.kind === 'wheel') {
-      const dx = Math.max(-5, Math.min(5, Math.round(Number(event.dx) / 100)));
-      const dy = Math.max(-5, Math.min(5, Math.round(Number(event.dy) / 100)));
+      // Preserve small high-resolution trackpad deltas instead of rounding them to zero.
+      wheelRemainderX += Math.max(-600, Math.min(600, Number(event.dx) || 0)) / 60;
+      wheelRemainderY += Math.max(-600, Math.min(600, Number(event.dy) || 0)) / 60;
+      const dx = Math.max(-10, Math.min(10, Math.trunc(wheelRemainderX)));
+      const dy = Math.max(-10, Math.min(10, Math.trunc(wheelRemainderY)));
+      wheelRemainderX -= dx;
+      wheelRemainderY -= dy;
       if (dx || dy) robot.scrollMouse(dx, dy);
     } else if (event.kind === 'key') {
       const key = mapKey(event);
@@ -390,7 +476,8 @@ function injectInput(event) {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  persistentAccessCode = await loadSavedAccessCode();
   session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
     try {
       const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 160, height: 100 } });
@@ -401,6 +488,25 @@ app.whenReady().then(() => {
       console.warn('[mswnlink] Screen capture request failed:', message);
       sendToUI('host-error', { message });
       callback(null);
+    }
+  });
+
+  ipcMain.handle('get-access-code', () => ({
+    configured: Boolean(persistentAccessCode),
+    code: persistentAccessCode || '',
+    backend: getAccessCodeBackend(),
+    warning: getAccessCodeStorageWarning(),
+    error: accessCodeStorageError
+  }));
+
+  ipcMain.handle('save-access-code', async (_event, value) => {
+    const code = validateAccessCode(value);
+    if (!code) return { ok: false, error: 'Choose a passcode between 8 and 64 characters. Avoid line breaks and control characters.' };
+    try {
+      const saved = await savePersistentAccessCode(code);
+      return { ok: true, ...saved };
+    } catch (error) {
+      return { ok: false, error: error && error.message ? error.message : 'Could not save the passcode securely.' };
     }
   });
 
@@ -446,8 +552,9 @@ app.whenReady().then(() => {
     }
   });
 
-  ipcMain.handle('make-pair-proof', (_event, code, nonce) => {
-    if (typeof code !== 'string' || !/^\d{6}$/.test(code) || typeof nonce !== 'string' || !/^[a-f0-9]{64}$/i.test(nonce)) throw new Error('Invalid pairing challenge.');
+  ipcMain.handle('make-pair-proof', (_event, value, nonce) => {
+    const code = validateAccessCode(value);
+    if (!code || typeof nonce !== 'string' || !/^[a-f0-9]{64}$/i.test(nonce)) throw new Error('Invalid pairing challenge. Use the saved 8–64 character access code.');
     const key = derivePairKey(code, nonce);
     return { proof: pairingProof(key, nonce), key: key.toString('hex') };
   });
