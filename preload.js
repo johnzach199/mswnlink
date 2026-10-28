@@ -15,6 +15,8 @@ const allowedEvents = new Set([
 
 contextBridge.exposeInMainWorld('lanAPI', {
   deviceInfo: () => ipcRenderer.invoke('device-info'),
+  getAccessCode: () => ipcRenderer.invoke('get-access-code'),
+  saveAccessCode: (code) => ipcRenderer.invoke('save-access-code', code),
   getSources: () => ipcRenderer.invoke('get-sources'),
   chooseSource: (id) => ipcRenderer.invoke('choose-source', id),
   startHost: () => ipcRenderer.invoke('host-start'),
