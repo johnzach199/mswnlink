@@ -9,10 +9,10 @@
   "scripts": {
     "start": "node launch.js",
     "rebuild:native": "electron-rebuild -f -w robotjs",
-    "dist:fedora": "electron-builder --linux AppImage",
-    "dist:win": "electron-builder --win portable",
-    "dist:mac": "electron-builder --mac dmg",
-    "dist": "electron-builder",
+    "dist:fedora": "electron-builder --linux AppImage --publish never",
+    "dist:win": "electron-builder --win portable --publish never",
+    "dist:mac": "electron-builder --mac dmg --publish never",
+    "dist": "electron-builder --publish never",
     "check": "node --check launch.js && node --check main.js && node --check preload.js && node --check renderer.js && node --check scripts/after-pack.cjs"
   },
   "dependencies": {
