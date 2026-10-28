@@ -52,9 +52,9 @@
                 <div class="input-wrap address-wrap"><span class="input-prefix">⌘</span><input id="host-address" name="host-address" placeholder="192.168.1.42" required spellcheck="false" autocomplete="off"><span class="input-suffix">LAN</span></div>
                 <div class="field-hint">Use the IP address shown in mswnlink on the remote PC.</div>
 
-                <label for="pairing-code">TEMPORARY PAIRING CODE</label>
-                <div class="pin-input-wrap"><input id="pairing-code" name="pairing-code" inputmode="numeric" maxlength="6" pattern="[0-9]{6}" placeholder="• • • • • •" required spellcheck="false" autocomplete="off"><span class="pin-lock">⌑</span></div>
-                <div class="field-hint">The host must approve every connection request.</div>
+                <label for="pairing-code">PERMANENT ACCESS CODE</label>
+                <div class="pin-input-wrap"><input id="pairing-code" name="pairing-code" type="password" minlength="8" maxlength="64" placeholder="Enter the saved access code" required spellcheck="false" autocomplete="current-password"><button class="pin-lock code-toggle-button" id="toggle-connect-code" type="button" aria-label="Show access code">Show</button></div>
+                <div class="field-hint">The same code stays on the host until its owner changes it. Every connection still needs host approval.</div>
 
                 <div class="form-error" id="connect-error" role="alert" hidden></div>
                 <button class="button button-primary button-full" id="connect-button" type="submit"><span>Connect to desktop</span><span class="button-arrow">↗</span></button>
@@ -68,7 +68,7 @@
                 <div class="network-panel-copy"><div class="eyebrow muted">BUILT FOR YOUR LAN</div><h3>Close by.<br><em>Far more capable.</em></h3><p>mswnlink connects devices directly on your network. Your desktop stream doesn't pass through a public cloud server.</p></div>
                 <div class="mini-metrics"><div><strong>01</strong><span>Pair</span></div><div><strong>02</strong><span>Approve</span></div><div><strong>03</strong><span>Connect</span></div></div>
               </section>
-              <section class="tip-row"><div class="tip-symbol">i</div><div><strong>First time here?</strong><p>Open <button class="text-button" data-page="share" type="button">Share this PC</button> on the other device to get its address and pairing code.</p></div></section>
+              <section class="tip-row"><div class="tip-symbol">i</div><div><strong>First time here?</strong><p>Open <button class="text-button" data-page="share" type="button">Share this PC</button> on the other device to get its LAN address and permanent access code.</p></div></section>
             </aside>
           </div>
           <div class="page-bottom"><span>BUILT FOR PRIVATE NETWORKS</span><span>NO ACCOUNT · NO CLOUD RELAY · NO TRACKING</span></div>
@@ -78,25 +78,40 @@
           <div class="page-heading compact-heading">
             <div class="eyebrow"><span class="eyebrow-line"></span> SHARE THIS DEVICE</div>
             <h1>Make this desktop<br><em>available to your LAN.</em></h1>
-            <p class="lead">Choose a display, start sharing, then give the other person your address and temporary code.</p>
+            <p class="lead">Choose a display, tune the stream, then share your LAN address and permanent access code.</p>
           </div>
 
           <div class="share-layout">
             <section class="panel share-main-panel">
               <div class="panel-heading"><div class="panel-icon green">▣</div><div><h2>Your screen</h2><p>Choose which display mswnlink can share.</p></div><span class="status-pill" id="share-status-pill"><span class="status-pill-dot"></span> NOT SHARING</span></div>
               <div class="source-grid" id="source-grid"><div class="source-loading"><span class="spinner"></span> Looking for displays…</div></div>
+              <div class="share-quality-row">
+                <div class="share-quality-copy"><strong>Stream quality</strong><span>Choose the balance that feels best on your LAN.</span></div>
+                <select id="share-quality" aria-label="Screen sharing quality">
+                  <option value="balanced">Balanced · 1080p / 30 FPS</option>
+                  <option value="smooth">Smooth · up to 60 FPS</option>
+                  <option value="sharp">Sharper · up to 1440p</option>
+                </select>
+              </div>
               <div class="share-actions"><div class="share-note"><span class="small-check">✓</span><span>Sharing is visible and can be stopped at any time.</span></div><button class="button button-green" id="share-toggle" type="button"><span id="share-toggle-label">Start sharing</span><span class="button-arrow">↗</span></button></div>
               <div class="active-peer-bar" id="active-peer-bar" hidden><div class="active-peer-avatar">↔</div><div class="active-peer-copy"><strong id="active-peer-name">Connected device</strong><span id="active-peer-detail">View-only session</span></div><button class="button button-quiet peer-control-toggle" id="toggle-host-control" type="button">Allow control</button><button class="button button-danger peer-disconnect" id="end-host-peer" type="button">Disconnect</button></div>
               <div class="host-error" id="share-error" role="alert" hidden></div>
             </section>
 
             <aside class="panel share-code-panel">
-              <div class="code-panel-heading"><div class="panel-icon violet">⌁</div><div><h2>Pairing details</h2><p>Visible only while sharing is active.</p></div></div>
-              <div class="pairing-placeholder" id="pairing-placeholder"><div class="placeholder-lock">⌑</div><strong>Not sharing yet</strong><span>Start sharing to create a temporary pairing code.</span></div>
+              <div class="code-panel-heading"><div class="panel-icon violet">⌁</div><div><h2>Permanent access code</h2><p>Choose it once. It stays the same until you change it.</p></div></div>
+              <div class="pairing-placeholder" id="pairing-placeholder"><div class="placeholder-lock">⌑</div><strong>Set your access code</strong><span>Choose a code below before starting screen sharing.</span></div>
               <div class="pairing-active" id="pairing-active" hidden>
                 <div class="detail-label">THIS DEVICE'S ADDRESS</div><div class="ip-list" id="host-ip-list"></div>
-                <div class="detail-label code-label">TEMPORARY PAIRING CODE</div><div class="code-display" id="host-pairing-code">000000</div>
-                <div class="code-foot"><span class="pulse-dot"></span><span>Changes each time you start a session.</span></div>
+                <div class="detail-label code-label">PERMANENT ACCESS CODE</div>
+                <div class="host-code-row"><div class="code-display" id="host-pairing-code"></div><button class="copy-small copy-host-code" id="copy-host-code" type="button" title="Copy permanent access code" aria-label="Copy permanent access code">⧉</button></div>
+                <div class="code-foot"><span class="pulse-dot"></span><span>Saved on this PC. It does not rotate between sessions.</span></div>
+              </div>
+              <div class="permanent-code-editor">
+                <label for="persistent-access-code">SET OR CHANGE YOUR CODE</label>
+                <div class="permanent-code-input-wrap"><input id="persistent-access-code" type="password" minlength="8" maxlength="64" autocomplete="new-password" placeholder="Create a code · 8–64 characters" spellcheck="false"><button class="code-toggle-button" id="toggle-access-code-visibility" type="button" aria-label="Show passcode">Show</button></div>
+                <div class="permanent-code-actions"><button class="button button-quiet" id="save-access-code" type="button">Save permanent code</button><span id="access-code-status" role="status" aria-live="polite">Not configured yet.</span></div>
+                <p class="access-code-hint">Your code is stored using your operating system's secure storage. Use a strong passphrase and share it only with trusted people.</p>
               </div>
               <div class="share-warning"><span class="warning-icon">!</span><p><strong>Stay in control.</strong> Each incoming request needs your approval. You choose view-only or mouse and keyboard control.</p></div>
             </aside>
