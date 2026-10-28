@@ -1,0 +1,74 @@
+name: Build and Publish mswnlink Executables
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build mswnlink for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: mswnlink.exe
+            asset_name: mswnlink-windows.exe
+          - os: ubuntu-latest
+            artifact_name: mswnlink
+            asset_name: mswnlink-linux
+          - os: macos-latest
+            artifact_name: mswnlink
+            asset_name: mswnlink-macos
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # =========================================================================
+      # OPTION A: IF MSWNLINK IS A GO PROGRAM
+      # =========================================================================
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '^1.21'
+
+      - name: Build Go Binary
+        run: |
+          go build -v -o ${{ matrix.artifact_name }} main.go
+
+      # =========================================================================
+      # OPTION B: IF MSWNLINK IS A PYTHON PROGRAM (Uncomment below and remove Go)
+      # =========================================================================
+      # - name: Set up Python
+      #   uses: actions/setup-python@v5
+      #   with:
+      #     python-version: '3.11'
+      #
+      # - name: Build Python Binary
+      #   run: |
+      #     pip install -r requirements.txt || true
+      #     pip install pyinstaller
+      #     pyinstaller --onefile main.py -n mswnlink
+
+      # =========================================================================
+      # OPTION C: IF MSWNLINK IS A C++ PROGRAM (Uncomment below and remove Go)
+      # =========================================================================
+      # - name: Build C++ Binary
+      #   run: |
+      #     g++ main.cpp -o ${{ matrix.artifact_name }}
+
+      - name: Rename Artifact for Clarity
+        shell: bash
+        run: |
+          mv ${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
