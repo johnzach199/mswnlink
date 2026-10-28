@@ -10,6 +10,15 @@ const pages = {
 };
 
 let deviceInfo = { name: 'This device', platform: 'unknown', ips: [], inputAvailable: false };
+let persistentAccessCode = '';
+let accessCodeConfigured = false;
+let accessCodeStorageWarning = '';
+let activeShareQuality = 'balanced';
+const SHARE_PROFILES = {
+  balanced: { frameRate: { ideal: 30, max: 30 }, width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 }, maxBitrate: 8000000, maxFramerate: 30 },
+  smooth: { frameRate: { ideal: 60, max: 60 }, width: { ideal: 1920, max: 1920 }, height: { ideal: 1080, max: 1080 }, maxBitrate: 12000000, maxFramerate: 60 },
+  sharp: { frameRate: { ideal: 30, max: 30 }, width: { ideal: 2560, max: 2560 }, height: { ideal: 1440, max: 1440 }, maxBitrate: 16000000, maxFramerate: 30 }
+};
 let sources = [];
 let selectedSourceId = null;
 let sourceLoadError = '';
@@ -60,6 +69,28 @@ function showShareError(message) {
   const element = $('#share-error');
   element.textContent = message;
   element.hidden = !message;
+}
+
+function setAccessCodeStatus(message, kind = '') {
+  const element = $('#access-code-status');
+  if (!element) return;
+  element.textContent = message;
+  element.classList.toggle('status-error', kind === 'error');
+  element.classList.toggle('status-success', kind === 'success');
+  element.classList.toggle('status-warning', kind === 'warning');
+}
+
+function refreshAccessCodeUI() {
+  const placeholderTitle = $('#pairing-placeholder strong');
+  const placeholderCopy = $('#pairing-placeholder span');
+  if (accessCodeConfigured) {
+    placeholderTitle.textContent = 'Permanent code saved';
+    placeholderCopy.textContent = 'Start sharing to display this PC’s LAN address and the same saved code.';
+  } else {
+    placeholderTitle.textContent = 'Set your permanent access code';
+    placeholderCopy.textContent = 'Choose a code below before starting screen sharing. It will stay saved until you change it.';
+  }
+  $('#save-access-code').textContent = accessCodeConfigured ? 'Save code changes' : 'Save permanent code';
 }
 
 function describeScreenCaptureError(error) {
@@ -149,7 +180,9 @@ function updateShareUI() {
   $('#share-toggle').classList.toggle('button-danger', active);
   $('#pairing-placeholder').hidden = active;
   $('#pairing-active').hidden = !active;
+  refreshAccessCodeUI();
   $$('.source-card').forEach(card => { card.disabled = active; });
+  $('#share-quality').disabled = active;
   $('#active-peer-bar').hidden = !hostPeerDetails;
   if (hostPeerDetails) {
     $('#active-peer-name').textContent = friendlyDeviceName(hostPeerDetails.name);
@@ -195,6 +228,14 @@ async function startSharing() {
     await stopSharing();
     return;
   }
+  if (!accessCodeConfigured || !persistentAccessCode) {
+    const message = 'Set and save your permanent access code before starting screen sharing.';
+    showShareError(message);
+    setAccessCodeStatus('Choose a code of at least 8 characters, then save it.', 'warning');
+    $('#persistent-access-code').focus();
+    showToast(message);
+    return;
+  }
   $('#share-toggle').disabled = true;
   showShareError('');
   try {
@@ -202,21 +243,26 @@ async function startSharing() {
       await refreshSources();
       if (!selectedSourceId) throw new Error(sourceLoadError || 'No display is available to share.');
     }
+    // A LAN-friendly preset controls capture resolution and frame-rate. The video track's
+    // content hint prioritizes desktop text/detail; sender parameters below favour sharpness.
+    activeShareQuality = $('#share-quality').value || 'balanced';
+    const profile = SHARE_PROFILES[activeShareQuality] || SHARE_PROFILES.balanced;
     // Must be called directly from the user's click so the OS can show its screen-sharing permission.
     const capturePromise = navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: 30, max: 30 }, width: { max: 1920 }, height: { max: 1080 } },
+      video: { frameRate: profile.frameRate, width: profile.width, height: profile.height },
       audio: false
     });
     const stream = await capturePromise;
     sharingStream = stream;
     stream.getVideoTracks().forEach(track => {
+      try { track.contentHint = 'detail'; } catch {}
       track.addEventListener('ended', () => {
         if (sharingStream === stream && hostInfo) stopSharing(true);
       }, { once: true });
     });
     hostInfo = await window.lanAPI.startHost();
     updateShareUI();
-    showToast('Sharing is active. Share the address and pairing code with the person connecting.');
+    showToast('Sharing is active. Share the LAN address and your permanent access code with the person connecting.');
   } catch (error) {
     if (sharingStream) sharingStream.getTracks().forEach(track => track.stop());
     sharingStream = null;
@@ -241,7 +287,7 @@ async function stopSharing(fromSystem = false) {
   hostControlAllowed = false;
   updateShareUI();
   $('#share-toggle').disabled = false;
-  if (!fromSystem) showToast('Screen sharing stopped. The pairing code is no longer valid.');
+  if (!fromSystem) showToast('Screen sharing stopped. Your permanent access code remains saved for next time.');
 }
 
 function sendHostSignal(message) {
@@ -310,7 +356,22 @@ async function createHostPeer() {
   if (!sharingStream) throw new Error('Screen sharing is not active.');
   const peer = new RTCPeerConnection({ iceServers: [] });
   hostPeer = peer;
-  sharingStream.getTracks().forEach(track => peer.addTrack(track, sharingStream));
+  const profile = SHARE_PROFILES[activeShareQuality] || SHARE_PROFILES.balanced;
+  for (const track of sharingStream.getTracks()) {
+    const sender = peer.addTrack(track, sharingStream);
+    if (track.kind === 'video' && sender && typeof sender.getParameters === 'function') {
+      try {
+        const parameters = sender.getParameters();
+        if (!parameters.encodings || !parameters.encodings.length) parameters.encodings = [{}];
+        parameters.encodings[0].maxBitrate = profile.maxBitrate;
+        parameters.encodings[0].maxFramerate = profile.maxFramerate;
+        parameters.degradationPreference = 'maintain-resolution';
+        await sender.setParameters(parameters);
+      } catch (error) {
+        console.debug('[mswnlink] Could not apply custom video sender parameters; using browser defaults:', error.message);
+      }
+    }
+  }
   peer.onicecandidate = (event) => {
     const candidate = normalizeIceCandidate(event.candidate && event.candidate.toJSON ? event.candidate.toJSON() : event.candidate);
     if (candidate) sendHostSignal({ type: 'candidate', candidate });
@@ -638,7 +699,7 @@ async function connectToDevice(event) {
   const address = cleanAddress($('#host-address').value);
   const code = $('#pairing-code').value.trim();
   if (!address) { showConnectError('Enter a valid LAN IPv4 address or device hostname. IPv6 is not supported in this version.'); return; }
-  if (!/^\d{6}$/.test(code)) { showConnectError('The pairing code must be exactly six digits.'); return; }
+  if (code.length < 8 || code.length > 64) { showConnectError('Enter the permanent access code (8–64 characters) configured on the host PC.'); return; }
   clientAddress = address;
   clientPairKey = '';
   clientNonce = null;
@@ -738,7 +799,7 @@ function getNormalizedPointer(event) {
 function handlePointerMove(event) {
   if (!clientConnected || !controlGranted) return;
   const now = performance.now();
-  if (now - lastPointerSend < 18) return;
+  if (now - lastPointerSend < 10) return;
   lastPointerSend = now;
   const point = getNormalizedPointer(event);
   if (point) sendInput({ kind: 'move', ...point });
@@ -759,6 +820,20 @@ function copyRemoteAddress() {
 async function initialize() {
   try { deviceInfo = await window.lanAPI.deviceInfo(); }
   catch (error) { console.warn('[mswnlink] Device info error:', error); }
+  try {
+    const saved = await window.lanAPI.getAccessCode();
+    persistentAccessCode = saved && typeof saved.code === 'string' ? saved.code : '';
+    accessCodeConfigured = Boolean(saved && saved.configured && persistentAccessCode);
+    accessCodeStorageWarning = saved && saved.warning ? saved.warning : '';
+    $('#persistent-access-code').value = persistentAccessCode;
+    refreshAccessCodeUI();
+    if (saved && saved.error) setAccessCodeStatus(`Could not load saved code: ${saved.error}. Enter a new one and save it.`, 'error');
+    else if (accessCodeStorageWarning) setAccessCodeStatus(accessCodeStorageWarning, 'warning');
+    else if (accessCodeConfigured) setAccessCodeStatus('Saved on this PC. It will stay the same until you change it.', 'success');
+    else setAccessCodeStatus('No permanent code saved yet. Create one to enable sharing.', 'warning');
+  } catch (error) {
+    setAccessCodeStatus(`Could not read passcode settings: ${error.message}`, 'error');
+  }
   const name = friendlyDeviceName(deviceInfo.name);
   $('#sidebar-device-name').textContent = name;
   $('#top-avatar').textContent = name.slice(0, 2).toUpperCase();
@@ -779,6 +854,61 @@ async function initialize() {
   }
   $('#connect-form').addEventListener('submit', connectToDevice);
   $('#share-toggle').addEventListener('click', startSharing);
+  $('#share-quality').addEventListener('change', () => {
+    const selected = SHARE_PROFILES[$('#share-quality').value] ? $('#share-quality').value : 'balanced';
+    const descriptions = {
+      balanced: 'Balanced selected · up to 1080p at 30 FPS.',
+      smooth: 'Smooth selected · up to 1080p at 60 FPS, depending on the host PC.',
+      sharp: 'Sharper selected · up to 1440p at 30 FPS, depending on the host PC.'
+    };
+    showToast(descriptions[selected]);
+  });
+  $('#toggle-connect-code').addEventListener('click', () => {
+    const input = $('#pairing-code');
+    input.type = input.type === 'password' ? 'text' : 'password';
+    $('#toggle-connect-code').textContent = input.type === 'password' ? 'Show' : 'Hide';
+    $('#toggle-connect-code').setAttribute('aria-label', input.type === 'password' ? 'Show access code' : 'Hide access code');
+  });
+  $('#toggle-access-code-visibility').addEventListener('click', () => {
+    const input = $('#persistent-access-code');
+    input.type = input.type === 'password' ? 'text' : 'password';
+    $('#toggle-access-code-visibility').textContent = input.type === 'password' ? 'Show' : 'Hide';
+    $('#toggle-access-code-visibility').setAttribute('aria-label', input.type === 'password' ? 'Show passcode' : 'Hide passcode');
+  });
+  $('#save-access-code').addEventListener('click', async () => {
+    const button = $('#save-access-code');
+    const code = $('#persistent-access-code').value.trim();
+    if (code.length < 8 || code.length > 64) {
+      setAccessCodeStatus('Use a passcode between 8 and 64 characters.', 'error');
+      $('#persistent-access-code').focus();
+      return;
+    }
+    button.disabled = true;
+    setAccessCodeStatus('Saving with system secure storage…');
+    try {
+      const result = await window.lanAPI.saveAccessCode(code);
+      if (!result || !result.ok) throw new Error(result && result.error ? result.error : 'Could not save the access code.');
+      persistentAccessCode = result.code;
+      accessCodeConfigured = true;
+      accessCodeStorageWarning = result.warning || '';
+      $('#persistent-access-code').value = persistentAccessCode;
+      if (hostInfo) hostInfo.code = persistentAccessCode;
+      if (accessCodeStorageWarning) setAccessCodeStatus(accessCodeStorageWarning, 'warning');
+      else setAccessCodeStatus('Saved on this PC. It will stay the same until you change it.', 'success');
+      updateShareUI();
+      showToast('Permanent access code saved. It will not change between sessions.');
+    } catch (error) {
+      setAccessCodeStatus(error.message || 'Could not save the access code.', 'error');
+    } finally {
+      button.disabled = false;
+    }
+  });
+  $('#copy-host-code').addEventListener('click', async () => {
+    const code = hostInfo && hostInfo.code ? hostInfo.code : persistentAccessCode;
+    if (!code) return;
+    try { await navigator.clipboard.writeText(code); showToast('Permanent access code copied.'); }
+    catch { showToast(`Permanent access code: ${code}`); }
+  });
   $('#accept-view').addEventListener('click', () => resolveIncoming('view'));
   $('#accept-control').addEventListener('click', () => resolveIncoming('control'));
   $('#reject-connection').addEventListener('click', () => resolveIncoming('reject'));
@@ -840,7 +970,7 @@ async function initialize() {
     updateShareUI();
     showToast('Remote device disconnected. Screen sharing remains active.');
   });
-  $('#pairing-code').addEventListener('input', () => { $('#pairing-code').value = $('#pairing-code').value.replace(/\D/g, '').slice(0, 6); });
+  $('#pairing-code').addEventListener('input', () => { $('#pairing-code').value = $('#pairing-code').value.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 64); });
   $('#remote-video').addEventListener('pointermove', handlePointerMove);
   $('#remote-video').addEventListener('pointerdown', (event) => {
     if (!clientConnected || !controlGranted) return;
