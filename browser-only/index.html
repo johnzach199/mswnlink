@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>mswnlink — Browser Edition</title>
+<style>
+:root{--bg:#0a0d14;--panel:#111722;--panel2:#151d2a;--line:#273244;--muted:#93a1b5;--text:#f2f5fa;--accent:#7c9cff;--accent2:#9b8cff;--green:#64dfb4;--red:#ff8d9a;--amber:#ffd27a;--radius:22px;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 500px at 10% -10%,#202c51 0%,transparent 62%),radial-gradient(800px 520px at 100% 0%,#252044 0%,transparent 55%),var(--bg);color:var(--text);min-height:100vh}
+button,input,textarea{font:inherit}button{cursor:pointer;border:0;border-radius:12px;padding:12px 15px;font-weight:700;transition:transform .15s ease,opacity .15s ease,background .15s ease}button:hover{transform:translateY(-1px)}button:disabled{opacity:.45;cursor:not-allowed;transform:none}.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#0b1020}.secondary{background:#202b3d;color:var(--text);border:1px solid #344157}.ghost{background:transparent;color:#d3dcec;border:1px solid var(--line)}.danger{background:#3b202a;color:#ffbec6;border:1px solid #653542}
+.wrap{max-width:1180px;margin:0 auto;padding:30px 22px 54px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:44px}.brand{display:flex;gap:12px;align-items:center}.logo{height:43px;width:43px;border-radius:14px;background:linear-gradient(145deg,#8ca7ff,#a994ff);display:grid;place-items:center;color:#0d1221;font-weight:950;font-size:22px;box-shadow:0 12px 30px #738aff35}.brand-name{font-weight:850;letter-spacing:-.04em;font-size:21px}.edition{font-size:11px;text-transform:uppercase;letter-spacing:.13em;color:var(--muted);margin-top:3px}.badge{display:inline-flex;align-items:center;gap:8px;border:1px solid #294339;background:#10251f;color:#9cf0d2;padding:8px 12px;border-radius:999px;font-size:12px;font-weight:750}.dot{width:7px;height:7px;background:var(--green);border-radius:50%;box-shadow:0 0 0 4px #64dfb41a}.hero{max-width:760px;margin-bottom:28px}.eyebrow{font-size:12px;letter-spacing:.15em;color:#aebdff;text-transform:uppercase;font-weight:800}.hero h1{font-size:clamp(34px,5vw,58px);line-height:1.04;letter-spacing:-.055em;margin:13px 0 15px}.gradient{background:linear-gradient(95deg,#f7f9ff 20%,#a9baff 65%,#c2a7ff);-webkit-background-clip:text;background-clip:text;color:transparent}.hero p{max-width:690px;color:#a6b1c4;font-size:16px;line-height:1.7;margin:0}.notice{margin:24px 0 28px;border:1px solid #4b432d;background:#241f16;color:#e9d5a3;border-radius:15px;padding:14px 16px;display:flex;gap:11px;line-height:1.55;font-size:13px}.notice strong{color:#fff0c8}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.card{background:linear-gradient(155deg,#141c29ee,#0f141dee);border:1px solid #293447;border-radius:var(--radius);padding:23px;box-shadow:0 24px 80px #0002;min-width:0}.card-top{display:flex;align-items:center;gap:13px;margin-bottom:17px}.card-icon{width:46px;height:46px;border-radius:15px;display:grid;place-items:center;background:#1d2d4a;color:#9fb7ff;font-size:22px}.card-icon.purple{background:#2a2345;color:#c4b4ff}.card h2{font-size:20px;letter-spacing:-.03em;margin:0 0 4px}.sub{color:var(--muted);font-size:13px}.card p{color:#a6b2c4;font-size:13px;line-height:1.65}.field-label{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:12px;font-weight:800;color:#dce4f2;margin:17px 0 8px}.helper{font-size:11px;color:#8190a6;font-weight:500}.actions{display:flex;flex-wrap:wrap;gap:9px;margin:14px 0}.field{width:100%;min-height:134px;resize:vertical;background:#090e17;color:#dce8ff;border:1px solid #2d3a4e;border-radius:13px;padding:13px;font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;outline:none}.field:focus{border-color:#829bff;box-shadow:0 0 0 3px #829bff20}.small-field{min-height:94px}.steps{margin:16px 0 0;padding:0;list-style:none;display:grid;gap:9px}.steps li{display:flex;gap:10px;align-items:flex-start;color:#9daabe;font-size:12px;line-height:1.55}.num{flex:0 0 22px;height:22px;border-radius:8px;display:grid;place-items:center;background:#202c40;color:#bccaff;font-size:11px;font-weight:800}.status{display:flex;align-items:center;gap:9px;background:#0b111b;border:1px solid #253146;border-radius:11px;padding:10px 12px;color:#aab8cd;font-size:12px;margin-top:12px;min-height:40px}.status .indicator{width:8px;height:8px;border-radius:50%;background:#6f7b90;flex:0 0 auto}.status.live .indicator{background:var(--green);box-shadow:0 0 0 4px #64dfb41b}.status.warn .indicator{background:var(--amber)}.viewer{margin-top:18px}.video-shell{background:#05070b;border:1px solid #2b3547;border-radius:17px;min-height:250px;aspect-ratio:16/9;display:grid;place-items:center;overflow:hidden;position:relative;isolation:isolate}.video-shell video{position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:contain;background:#05070b;z-index:0}.video-placeholder{position:absolute;inset:0;z-index:1;display:flex;align-items:center;justify-content:center;flex-direction:column;max-width:none;padding:24px;text-align:center;color:#75839a;pointer-events:none}.video-overlay-controls{position:absolute;z-index:5;top:12px;right:12px;display:flex;gap:8px}.fullscreen-btn{background:#141c2ddd;color:#f4f7ff;border:1px solid #64718a;padding:10px 13px;box-shadow:0 6px 22px #0006;backdrop-filter:blur(10px)}.fullscreen-btn:hover{background:#263651}.video-shell:fullscreen,.video-shell:-webkit-full-screen{position:fixed;width:100vw;height:100vh;height:100dvh;max-width:none;max-height:none;min-height:0;aspect-ratio:auto;inset:0;border:0;border-radius:0;display:block;overflow:hidden;background:#05070b;z-index:9999}.video-shell:fullscreen::backdrop,.video-shell:-webkit-full-screen::backdrop{background:#05070b}.video-shell:fullscreen video,.video-shell:-webkit-full-screen video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}.video-shell:fullscreen .video-overlay-controls,.video-shell:-webkit-full-screen .video-overlay-controls{top:20px;right:20px}.video-placeholder .screen-icon{font-size:34px;margin-bottom:12px}.video-placeholder b{display:block;color:#bdc8da;margin-bottom:7px}.video-placeholder span{font-size:12px;line-height:1.6}.footer{margin-top:24px;display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap;color:#718096;font-size:11px;line-height:1.6}.hidden{display:none!important}.foot-links{display:flex;gap:16px}.foot-links a{color:#9eafd1;text-decoration:none}.foot-links a:hover{text-decoration:underline}.file-input{display:none}.toast{position:fixed;bottom:22px;left:50%;transform:translate(-50%,20px);opacity:0;pointer-events:none;background:#e7edff;color:#101626;padding:12px 16px;border-radius:12px;font-size:13px;font-weight:700;box-shadow:0 12px 50px #0007;transition:.2s;z-index:20}.toast.show{transform:translate(-50%,0);opacity:1}.pill{display:inline-flex;border:1px solid #343d53;border-radius:99px;padding:5px 9px;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#b5c2da;font-weight:800}
+@media(max-width:800px){.grid{grid-template-columns:1fr}.top{margin-bottom:30px}.wrap{padding:20px 14px 40px}.card{padding:19px}.hero h1{font-size:39px}.badge{font-size:10px}.top{align-items:flex-start}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand"><div class="logo">m</div><div><div class="brand-name">mswnlink</div><div class="edition">Browser edition · no install</div></div></div>
+    <div class="badge"><span class="dot"></span> Direct LAN · No relay</div>
+  </header>
+  <section class="hero">
+    <div class="eyebrow">Your devices, connected</div>
+    <h1><span class="gradient">Share a screen.</span><br>Keep it local.</h1>
+    <p>Share a desktop directly between modern browsers on the same local network. No app installation, account, signaling server, or public relay is required. You exchange a short connection file or text between the two devices to pair them.</p>
+  </section>
+  <div class="notice"><span>ⓘ</span><div><strong>Browser-only limitation:</strong> this version streams video in view-only mode. Browsers do not let websites control the operating system's mouse or keyboard. Full remote control still requires the desktop app or a native helper. Keep offer/answer text private; it contains connection details for your local network.</div></div>
+  <main class="grid">
+    <section class="card" aria-labelledby="share-heading">
+      <div class="card-top"><div class="card-icon">▣</div><div><h2 id="share-heading">Share this screen</h2><div class="sub">Use this on the computer being viewed</div></div></div>
+      <p>Choose a screen, window, or browser tab in the browser prompt. mswnlink creates a direct connection offer for the other device.</p>
+      <div class="actions"><button id="start-share" class="primary">Start sharing</button><button id="stop-share" class="danger" disabled>Stop sharing</button></div>
+      <div class="status" id="host-status"><span class="indicator"></span><span id="host-status-text">Not sharing · waiting for you</span></div>
+      <div class="field-label"><label for="offer-out">1 · Connection offer</label><span class="helper">Send to the viewer</span></div>
+      <textarea id="offer-out" class="field" spellcheck="false" placeholder="Click Start sharing to create an offer…"></textarea>
+      <div class="actions"><button id="copy-offer" class="secondary" disabled>Copy offer</button><button id="download-offer" class="ghost" disabled>Save offer file</button><label class="ghost" style="display:inline-flex;align-items:center;border-radius:12px;padding:12px 15px;font-weight:700;cursor:pointer" for="load-answer-file">Load answer file</label><input id="load-answer-file" class="file-input" type="file" accept=".json,.txt,application/json,text/plain"></div>
+      <div class="field-label"><label for="answer-in">2 · Answer from viewer</label><span class="helper">Paste or load the returned answer</span></div>
+      <textarea id="answer-in" class="field small-field" spellcheck="false" placeholder="Paste the viewer's answer here…"></textarea>
+      <div class="actions"><button id="apply-answer" class="primary" disabled>Connect viewer</button><button id="clear-answer" class="ghost">Clear</button></div>
+      <ol class="steps"><li><span class="num">1</span><span>Start sharing and approve the browser's screen-selection prompt.</span></li><li><span class="num">2</span><span>Copy the offer or save it as a file and transfer it to the viewer on your LAN.</span></li><li><span class="num">3</span><span>Load/paste the answer the viewer returns, then select <b>Connect viewer</b>.</span></li></ol>
+    </section>
+    <section class="card" aria-labelledby="connect-heading">
+      <div class="card-top"><div class="card-icon purple">↗</div><div><h2 id="connect-heading">View a screen</h2><div class="sub">Use this on the computer doing the viewing</div></div></div>
+      <p>Paste or load the offer from the shared computer. The browser builds an answer and waits for the host to complete the connection.</p>
+      <div class="field-label"><label for="offer-in">1 · Offer from host</label><span class="helper">Paste or load file</span></div>
+      <textarea id="offer-in" class="field" spellcheck="false" placeholder="Paste the host's offer here…"></textarea>
+      <div class="actions"><label class="ghost" style="display:inline-flex;align-items:center;border-radius:12px;padding:12px 15px;font-weight:700;cursor:pointer" for="load-offer-file">Load offer file</label><input id="load-offer-file" class="file-input" type="file" accept=".json,.txt,application/json,text/plain"><button id="make-answer" class="primary">Create answer</button><button id="end-view" class="danger" disabled>Disconnect</button></div>
+      <div class="status" id="viewer-status"><span class="indicator"></span><span id="viewer-status-text">Not connected · waiting for an offer</span></div>
+      <div class="field-label"><label for="answer-out">2 · Connection answer</label><span class="helper">Return this to the host</span></div>
+      <textarea id="answer-out" class="field small-field" spellcheck="false" placeholder="Paste or save this answer and return it to the host…"></textarea>
+      <div class="actions"><button id="copy-answer" class="secondary" disabled>Copy answer</button><button id="download-answer" class="ghost" disabled>Save answer file</button></div>
+      <div class="viewer">
+        <div class="field-label"><span>Live screen</span><span class="pill">View only</span></div>
+        <div class="video-shell" id="video-shell"><video id="remote-video" autoplay playsinline></video><div class="video-placeholder" id="video-placeholder"><div class="screen-icon">▣</div><b>The remote screen will appear here</b><span>Paste the host offer and create an answer to start a direct LAN stream.</span></div><div class="video-overlay-controls"><button id="fullscreen-view" class="fullscreen-btn" type="button" disabled aria-label="Show live screen in fullscreen" title="Fullscreen live screen">⛶ Fullscreen</button></div></div>
+      </div>
+      <ol class="steps"><li><span class="num">1</span><span>Load/paste the host's offer and click <b>Create answer</b>.</span></li><li><span class="num">2</span><span>Copy or save the answer and transfer it back to the host.</span></li><li><span class="num">3</span><span>Ask the host to apply the answer. Your video should appear here.</span></li></ol>
+    </section>
+  </main>
+  <footer class="footer"><span>mswnlink Browser Edition · Peer-to-peer WebRTC · ICE servers disabled for LAN-only use.</span><span class="foot-links"><a href="https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getDisplayMedia" target="_blank" rel="noreferrer">Screen sharing permissions</a><a href="https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection" target="_blank" rel="noreferrer">WebRTC details</a></span></footer>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script>
+'use strict';
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    start: $('start-share'), stop: $('stop-share'), offerOut: $('offer-out'), copyOffer: $('copy-offer'), downloadOffer: $('download-offer'),
+    answerIn: $('answer-in'), applyAnswer: $('apply-answer'), clearAnswer: $('clear-answer'), loadAnswerFile: $('load-answer-file'),
+    offerIn: $('offer-in'), loadOfferFile: $('load-offer-file'), makeAnswer: $('make-answer'), endView: $('end-view'), answerOut: $('answer-out'),
+    copyAnswer: $('copy-answer'), downloadAnswer: $('download-answer'), hostStatus: $('host-status'), hostStatusText: $('host-status-text'),
+    viewerStatus: $('viewer-status'), viewerStatusText: $('viewer-status-text'), video: $('remote-video'), videoShell: $('video-shell'), fullscreen: $('fullscreen-view'), placeholder: $('video-placeholder'), toast: $('toast')
+  };
+  let hostPc = null, hostStream = null, viewerPc = null, toastTimer = null;
+  const RTC_CONFIG = { iceServers: [] }; // Deliberately no STUN/TURN: direct local candidates only.
+
+  function toast(message) {
+    el.toast.textContent = message;
+    el.toast.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.toast.classList.remove('show'), 2600);
+  }
+  function status(which, text, mode = '') {
+    const box = which === 'host' ? el.hostStatus : el.viewerStatus;
+    const label = which === 'host' ? el.hostStatusText : el.viewerStatusText;
+    box.classList.remove('live', 'warn');
+    if (mode) box.classList.add(mode);
+    label.textContent = text;
+  }
+  function waitForIceComplete(pc, timeoutMs = 15000) {
+    return new Promise((resolve) => {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        pc.removeEventListener('icegatheringstatechange', onState);
+        resolve();
+      };
+      const onState = () => { if (pc.iceGatheringState === 'complete') finish(); };
+      const timer = setTimeout(finish, timeoutMs);
+      pc.addEventListener('icegatheringstatechange', onState);
+    });
+  }
+  async function makeDescriptionText(pc) {
+    await waitForIceComplete(pc);
+    return JSON.stringify(pc.localDescription);
+  }
+  function parseDescription(text, expectedType) {
+    const raw = (text || '').trim();
+    if (!raw) throw new Error('Paste or load the connection text first.');
+    let desc;
+    try { desc = JSON.parse(raw); }
+    catch { throw new Error('This does not look like a valid mswnlink connection file. Use the Copy or Save buttons without editing the text.'); }
+    if (!desc || typeof desc.sdp !== 'string' || desc.type !== expectedType) {
+      throw new Error(`Expected a valid ${expectedType} description. Check that you transferred the correct file.`);
+    }
+    if (desc.sdp.length > 200000) throw new Error('Connection text is unexpectedly large.');
+    // Enforce local-only ICE candidates. The app never configures STUN/TURN.
+    if (/ typ (srflx|relay)\b/i.test(desc.sdp)) throw new Error('This offer contains a non-local ICE candidate. For safety, use a fresh offer generated by this LAN-only page.');
+    return desc;
+  }
+  function downloadText(text, filename) {
+    const blob = new Blob([text], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  async function copyText(textarea, kind) {
+    if (!textarea.value.trim()) return toast(`There is no ${kind} to copy yet.`);
+    try {
+      await navigator.clipboard.writeText(textarea.value);
+      toast(`${kind[0].toUpperCase() + kind.slice(1)} copied.`);
+    } catch {
+      textarea.focus(); textarea.select();
+      let copied = false;
+      try { copied = document.execCommand('copy'); } catch {}
+      toast(copied ? `${kind[0].toUpperCase() + kind.slice(1)} copied.` : 'Text selected. Copy it with Ctrl+C or ⌘C.');
+    }
+  }
+  async function loadFile(input, target, expectedTypeName) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    if (file.size > 250000) { toast('That file is too large to be a connection file.'); input.value = ''; return; }
+    try {
+      target.value = await file.text();
+      toast(`${expectedTypeName} file loaded.`);
+    } catch (error) { toast(`Could not read file: ${error.message}`); }
+    input.value = '';
+  }
+  function setControls() {
+    const sharing = !!hostStream;
+    el.start.disabled = sharing;
+    el.stop.disabled = !sharing;
+    el.copyOffer.disabled = !el.offerOut.value.trim();
+    el.downloadOffer.disabled = !el.offerOut.value.trim();
+    el.applyAnswer.disabled = !sharing || !el.answerIn.value.trim() || !hostPc;
+    el.makeAnswer.disabled = !!viewerPc;
+    el.endView.disabled = !viewerPc;
+    el.copyAnswer.disabled = !el.answerOut.value.trim();
+    el.downloadAnswer.disabled = !el.answerOut.value.trim();
+    syncFullscreenButton();
+  }
+  function syncFullscreenButton() {
+    if (!el.fullscreen || !el.videoShell) return;
+    const active = document.fullscreenElement || document.webkitFullscreenElement;
+    const isFullscreen = active === el.videoShell;
+    el.fullscreen.textContent = isFullscreen ? '⤢ Exit fullscreen' : '⛶ Fullscreen';
+    el.fullscreen.setAttribute('aria-label', isFullscreen ? 'Exit fullscreen' : 'Show live screen in fullscreen');
+    el.fullscreen.title = isFullscreen ? 'Exit fullscreen (or press Esc)' : 'View live screen fullscreen';
+    el.fullscreen.disabled = !el.video.srcObject;
+  }
+  function setPcStatus(which, pc) {
+    const update = () => {
+      if (pc.connectionState === 'connected') status(which, 'Connected directly · LAN stream active', 'live');
+      else if (pc.connectionState === 'connecting') status(which, 'Negotiating direct LAN connection…', 'warn');
+      else if (pc.connectionState === 'disconnected') status(which, 'Connection interrupted · trying to recover', 'warn');
+      else if (pc.connectionState === 'failed') status(which, 'Connection failed. Confirm both devices are on the same LAN and try a fresh offer.', 'warn');
+      else if (pc.connectionState === 'closed') status(which, 'Connection closed');
+    };
+    pc.addEventListener('connectionstatechange', update);
+    pc.addEventListener('iceconnectionstatechange', () => {
+      if (pc.iceConnectionState === 'failed') status(which, 'Direct LAN path failed. Firewall or Wi-Fi client isolation may block peer traffic.', 'warn');
+    });
+    update();
+  }
+  async function stopHost(fromTrack = false) {
+    if (hostStream) for (const track of hostStream.getTracks()) { try { track.stop(); } catch {} }
+    hostStream = null;
+    if (hostPc) { try { hostPc.close(); } catch {} }
+    hostPc = null;
+    el.offerOut.value = '';
+    el.answerIn.value = '';
+    status('host', fromTrack ? 'Screen sharing ended from the browser prompt' : 'Not sharing · waiting for you');
+    setControls();
+  }
+  async function endViewer() {
+    if (viewerPc) { try { viewerPc.close(); } catch {} }
+    viewerPc = null;
+    el.video.srcObject = null;
+    el.placeholder.classList.remove('hidden');
+    el.answerOut.value = '';
+    status('viewer', 'Not connected · waiting for an offer');
+    setControls();
+  }
+
+  el.start.addEventListener('click', async () => {
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+      status('host', 'Screen capture is unavailable in this browser context. Try a recent Chrome/Edge browser and open the local HTML file directly.', 'warn');
+      return toast('This browser does not expose screen sharing here.');
+    }
+    try {
+      el.start.disabled = true;
+      status('host', 'Waiting for browser screen-share permission…', 'warn');
+      // Must run directly from the click handler to prompt the user.
+      hostStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30, max: 60 } }, audio: false });
+      hostPc = new RTCPeerConnection(RTC_CONFIG);
+      setPcStatus('host', hostPc);
+      hostStream.getTracks().forEach(track => {
+        hostPc.addTrack(track, hostStream);
+        track.addEventListener('ended', () => { if (hostStream) stopHost(true); }, { once: true });
+      });
+      const offer = await hostPc.createOffer();
+      await hostPc.setLocalDescription(offer);
+      status('host', 'Collecting local connection details…', 'warn');
+      el.offerOut.value = await makeDescriptionText(hostPc);
+      status('host', 'Screen captured · offer ready · waiting for viewer answer', 'live');
+      toast('Offer ready. Transfer it to the viewer on your LAN.');
+    } catch (error) {
+      await stopHost();
+      status('host', `Could not start sharing: ${error.message || error}`, 'warn');
+      toast('Screen sharing was not started.');
+    } finally { setControls(); }
+  });
+
+  el.stop.addEventListener('click', async () => { await stopHost(); toast('Screen sharing stopped.'); });
+  el.copyOffer.addEventListener('click', () => copyText(el.offerOut, 'offer'));
+  el.downloadOffer.addEventListener('click', () => downloadText(el.offerOut.value, 'mswnlink-offer.json'));
+  el.applyAnswer.addEventListener('click', async () => {
+    try {
+      if (!hostPc) throw new Error('Start sharing first.');
+      const desc = parseDescription(el.answerIn.value, 'answer');
+      await hostPc.setRemoteDescription(desc);
+      status('host', 'Answer applied · completing direct connection…', 'warn');
+      toast('Answer accepted. Waiting for the direct connection.');
+    } catch (error) { status('host', error.message || String(error), 'warn'); }
+    setControls();
+  });
+  el.clearAnswer.addEventListener('click', () => { el.answerIn.value = ''; setControls(); });
+  el.loadAnswerFile.addEventListener('change', () => loadFile(el.loadAnswerFile, el.answerIn, 'Answer'));
+  el.answerIn.addEventListener('input', setControls);
+
+  el.makeAnswer.addEventListener('click', async () => {
+    try {
+      const offer = parseDescription(el.offerIn.value, 'offer');
+      el.makeAnswer.disabled = true;
+      status('viewer', 'Building answer for direct LAN connection…', 'warn');
+      viewerPc = new RTCPeerConnection(RTC_CONFIG);
+      setPcStatus('viewer', viewerPc);
+      viewerPc.addEventListener('track', event => {
+        const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+        el.video.srcObject = stream;
+        el.placeholder.classList.add('hidden');
+        setControls();
+        el.video.play().catch(() => {});
+      });
+      await viewerPc.setRemoteDescription(offer);
+      const answer = await viewerPc.createAnswer();
+      await viewerPc.setLocalDescription(answer);
+      el.answerOut.value = await makeDescriptionText(viewerPc);
+      status('viewer', 'Answer ready · return it to the host to finish connecting', 'live');
+      toast('Answer ready. Transfer it back to the host.');
+    } catch (error) {
+      if (viewerPc) { try { viewerPc.close(); } catch {} }
+      viewerPc = null;
+      status('viewer', error.message || String(error), 'warn');
+    } finally { setControls(); }
+  });
+  if (el.fullscreen) {
+    el.fullscreen.addEventListener('click', async () => {
+      try {
+        const active = document.fullscreenElement || document.webkitFullscreenElement;
+        if (active === el.videoShell) {
+          if (document.exitFullscreen) await document.exitFullscreen();
+          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        } else if (el.videoShell.requestFullscreen) {
+          await el.videoShell.requestFullscreen();
+        } else if (el.videoShell.webkitRequestFullscreen) {
+          el.videoShell.webkitRequestFullscreen();
+        } else throw new Error('Fullscreen is not supported by this browser.');
+      } catch (error) { toast(`Could not enter fullscreen: ${error.message || error}`); }
+    });
+    document.addEventListener('fullscreenchange', syncFullscreenButton);
+    document.addEventListener('webkitfullscreenchange', syncFullscreenButton);
+    el.video.addEventListener('dblclick', () => {
+      if (el.video.srcObject && !document.fullscreenElement && el.videoShell.requestFullscreen) {
+        el.videoShell.requestFullscreen().catch(() => {});
+      }
+    });
+  }
+  el.endView.addEventListener('click', async () => { await endViewer(); toast('Disconnected.'); });
+  el.copyAnswer.addEventListener('click', () => copyText(el.answerOut, 'answer'));
+  el.downloadAnswer.addEventListener('click', () => downloadText(el.answerOut.value, 'mswnlink-answer.json'));
+  el.loadOfferFile.addEventListener('change', () => loadFile(el.loadOfferFile, el.offerIn, 'Offer'));
+  el.offerIn.addEventListener('input', setControls);
+  window.addEventListener('beforeunload', () => {
+    try { if (hostStream) hostStream.getTracks().forEach(t => t.stop()); } catch {}
+    try { if (hostPc) hostPc.close(); } catch {}
+    try { if (viewerPc) viewerPc.close(); } catch {}
+  });
+  setControls();
+})();
+</script>
+</body>
+</html>
