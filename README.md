@@ -16,12 +16,21 @@ A standalone archive is also available as `mswnlink-browser-only.zip` when downl
 
 - Dark, lightweight-feeling dashboard with separate **Connect** and **Share this PC** screens.
 - Direct WebRTC screen streaming, with no STUN server, cloud account, or public relay configured.
-- Temporary six-digit pairing code (valid while sharing is active) and a host-side approval prompt for every connection.
+- Owner-configured permanent access code (8–64 characters), saved via Electron safeStorage and retained when sharing stops/restarts; a host-side approval prompt is still required for every connection.
 - Host chooses **View only** or **Allow control**, and can revoke input permission or disconnect the viewer at any time.
 - LAN-only incoming WebSocket signaling: public/non-private source addresses are rejected.
-- Pairing uses a fresh random challenge, PBKDF2-derived HMAC proof, and HMAC-signed signaling messages; the PIN is not sent over the network as plaintext.
+- Pairing uses a fresh random challenge, PBKDF2-derived HMAC proof, and HMAC-signed signaling messages; the passcode is not sent over the network as plaintext.
 - Native input bridge through RobotJS.
 - Standalone build targets: Fedora/Linux AppImage, Windows portable EXE, and macOS DMG (Intel and Apple Silicon builds).
+
+
+## Permanent access code and stream quality
+
+On **Share this PC**, set an owner-chosen passcode between 8 and 64 characters. Click **Save permanent code** before starting sharing. The app stores it through Electron `safeStorage` (using OS-backed encryption where supported) and reuses it when you start sharing again; it does not generate a new code each session. You can change it at any time. If you change the code while hosting, new connections must use the new code; an already active session may continue until disconnected. On Linux, Electron may report the `basic_text` backend if a desktop keyring isn't available; the UI warns that this backend doesn't protect the saved passcode well. Prefer GNOME Keyring/libsecret or KWallet.
+
+Before sharing, choose **Balanced** (1080p/30 FPS), **Smooth** (up to 1080p/60 FPS), or **Sharper** (up to 1440p/30 FPS). Actual resolution and frame rate depend on the source display and host computer. The sender requests a higher LAN bitrate and prioritizes retaining resolution; that may use more CPU/network bandwidth on the higher quality presets.
+
+Remote mouse/keyboard control remains consent-based: the host selects **Allow control** in the incoming request, can revoke it from the Share screen, and can disconnect the viewer at any time. Native control requires RobotJS to be available in the platform build; if it is missing, the app clearly remains view-only.
 
 ## Quick start from source
 
@@ -82,8 +91,8 @@ On Windows and macOS, `npm install` also completes without forcing a native rebu
 
 1. Put both computers on the same trusted local network.
 2. On the computer you want to access, open **Share this PC**, choose the display, and click **Start sharing**.
-3. Copy one of the listed LAN addresses and the temporary pairing code.
-4. On the other computer, open **Connect**, enter the address and code, then click **Connect to desktop**.
+3. On first use, set a permanent access code on **Share this PC** and save it. It remains the same across app restarts until you change it. Copy one of the listed LAN addresses and the permanent code.
+4. On the other computer, open **Connect**, enter the address and passcode, then click **Connect to desktop**.
 5. On the host, approve the request as **View only** or **Allow control**. The host can revoke control or disconnect the viewer from the Share screen.
 6. Click the remote video before typing. End the session from the viewer or host.
 
@@ -137,15 +146,15 @@ If the app gets past SDP negotiation but then times out, confirm both computers 
 - **macOS:** approve Screen Recording permissions for capture and Accessibility permissions for mouse/keyboard input in System Settings. Those are operating-system security requirements; the app does not bypass them.
 - **Linux:** `npm start` uses XWayland when it detects a Wayland session to avoid the native Wayland/Vulkan incompatibility. `MSWNLINK_USE_WAYLAND=1 npm start` also falls back to XWayland; native Wayland is available only as an experimental mode via `MSWNLINK_FORCE_NATIVE_WAYLAND=1 npm start`. If capture still fails, verify XWayland plus the desktop's `xdg-desktop-portal` backend and PipeWire are installed/running. For RobotJS input, install the X11/XTEST development packages listed above and run `npm run rebuild:native`; native input is best suited to X11 and may not work in a Wayland session. Test on the actual desktop environment before relying on remote control.
 - The current input mapping is aimed at the primary display. Multi-monitor coordinate mapping may need additional work.
-- The first version supports one viewer at a time and does not include audio, file transfer, clipboard sync, unattended startup, remote wake, or automatic device discovery. Enter the LAN IP/hostname manually.
+- The current version supports one viewer at a time and does not include audio, file transfer, clipboard sync, unattended startup, remote wake, or automatic device discovery. Enter the LAN IP/hostname manually.
 - IPv4 addresses and hostnames are supported in the connect form; IPv6 literals are not yet supported.
 - Electron includes its own Chromium/Node runtime, so each standalone build is larger than a native application. The end-user artifacts bundle the runtime so Node.js/npm do not need to be installed separately.
 
 ## Security model (please read)
 
-mswnlink is designed for a **trusted private LAN**. The application has no public relay or cloud account. Screen video and the WebRTC data channel use WebRTC's encrypted transport, while the signaling messages are HMAC-authenticated against the pairing-derived session key so a passive observer does not learn the PIN directly and unauthenticated edits to signaling messages are rejected. The PIN is short-lived and the host must still approve the connecting device.
+mswnlink is designed for a **trusted private LAN**. The application has no public relay or cloud account. Screen video and the WebRTC data channel use WebRTC's encrypted transport, while signaling messages are HMAC-authenticated against the passcode-derived session key so the passcode itself is not sent over the network and unauthenticated edits to signaling messages are rejected. The permanent passcode remains saved until its owner changes it, and the host must still approve every connecting device.
 
-However, this prototype's WebSocket signaling transport is **not TLS-encrypted**, so signaling metadata (including local addresses and WebRTC offer/answer data) can be visible to someone who can capture traffic on the same network. The six-digit code also remains a low-entropy secret; challenge derivation slows offline guessing but does not make a six-digit code equivalent to a certificate. Do not use this prototype across an untrusted network or expose port 49382 to the internet. Before production use, add audited pairing/key-verification and encrypted signaling (for example, pinned TLS certificates) and test against a documented threat model.
+However, this prototype's WebSocket signaling transport is **not TLS-encrypted**, so signaling metadata (including local addresses and WebRTC offer/answer data) can be visible to someone who can capture traffic on the same network. Use a long, unique permanent passphrase: although the challenge protocol derives a key with PBKDF2 and sends a proof instead of the passcode itself, a recorded exchange can still be used for offline guessing, so a weak code is not sufficient protection. Do not use this prototype across an untrusted network or expose port 49382 to the internet. Before production use, add audited pairing/key-verification and encrypted signaling (for example, pinned TLS certificates) and test against a documented threat model.
 
 The host-side approval and visible sharing controls are intentional: mswnlink has no stealth mode, unattended access, persistence-on-boot, or hidden input channel.
 
@@ -163,3 +172,10 @@ MIT; see [LICENSE](LICENSE).
 ## Fullscreen remote viewer
 
 The remote viewer fullscreen layout expands to the full viewport. The video stage uses the remaining height after its toolbar/header, and the remote image uses `object-fit: contain` so the far desktop is not cropped when its aspect ratio differs from the local display. Press `Esc` to leave fullscreen. The same fit-to-viewport fix is included in Browser Edition.
+
+
+### Fullscreen remote viewer
+
+The remote viewer fullscreen mode now reserves the entire viewport for the remote video and hides the normal bottom toolbar while fullscreen is active. The video uses `object-fit: contain`, so the full remote display stays visible without cropping; use the floating **Exit full screen** control in the top-right or press `Esc`.
+
+See [UPDATING.md](UPDATING.md) for the permanent-passcode and stream-quality changes and instructions for applying the changed files to an existing GitHub repository. Update both the host and viewer app builds together because this release accepts an 8–64 character owner-set passphrase rather than the old temporary six-digit code.
