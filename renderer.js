@@ -46,9 +46,35 @@ let connectTimeout = null;
 
 function setPage(name) {
   Object.entries(pages).forEach(([key, page]) => page.classList.toggle('page-active', key === name));
-  $$('.nav-item').forEach((button) => button.classList.toggle('active', button.dataset.page === (name === 'session' ? 'connect' : name)));
-  $('#breadcrumb-current').textContent = name === 'share' ? 'SHARE THIS PC' : name === 'session' ? 'ACTIVE SESSION' : 'CONNECT';
+  $$('.tab').forEach((button) => button.classList.toggle('active', button.dataset.page === (name === 'session' ? 'connect' : name)));
   if (name === 'share') refreshSources();
+}
+
+function setSessionState(label, kind = '') {
+  const pill = $('#session-state');
+  pill.className = `status-pill${kind ? ` ${kind}` : ''}`;
+  pill.replaceChildren();
+  const dot = document.createElement('span');
+  dot.className = 'status-pill-dot';
+  pill.append(dot, document.createTextNode(label));
+}
+
+function setInputStatus(input) {
+  const element = $('#input-status');
+  if (!element) return;
+  let text = '';
+  let kind = '';
+  if (!input) { text = ''; }
+  else if (!input.available) { text = input.message || 'Remote control is not available on this PC. Sessions will be view-only.'; kind = 'status-warning'; }
+  else if (input.state === 'starting') { text = input.message; kind = 'status-warning'; }
+  else if (input.state === 'ready') { text = input.message || 'Mouse and keyboard control is ready.'; kind = 'status-success'; }
+  else if (input.message) { text = input.message; }
+  if (deviceInfo.platform === 'darwin' && deviceInfo.macAccessibility === false && input && input.available) {
+    text = 'To allow remote clicks and keys, turn on mswnlink in System Settings › Privacy & Security › Accessibility, then restart the app.';
+    kind = 'status-warning';
+  }
+  element.textContent = text;
+  element.className = `status-text ${kind}`.trim();
 }
 
 function showToast(message) {
@@ -174,10 +200,10 @@ async function refreshSources() {
 function updateShareUI() {
   const active = Boolean(hostInfo && sharingStream);
   $('#share-status-pill').classList.toggle('active', active);
-  $('#share-status-pill').innerHTML = `<span class="status-pill-dot"></span>${active ? 'SHARING ACTIVE' : 'NOT SHARING'}`;
+  $('#share-status-pill').replaceChildren(Object.assign(document.createElement('span'), { className: 'status-pill-dot' }), document.createTextNode(active ? 'Sharing' : 'Not sharing'));
   $('#share-toggle-label').textContent = active ? 'Stop sharing' : 'Start sharing';
-  $('#share-toggle').classList.toggle('button-green', !active);
-  $('#share-toggle').classList.toggle('button-danger', active);
+  $('#share-toggle').classList.toggle('primary', !active);
+  $('#share-toggle').classList.toggle('danger', active);
   $('#pairing-placeholder').hidden = active;
   $('#pairing-active').hidden = !active;
   refreshAccessCodeUI();
@@ -186,7 +212,8 @@ function updateShareUI() {
   $('#active-peer-bar').hidden = !hostPeerDetails;
   if (hostPeerDetails) {
     $('#active-peer-name').textContent = friendlyDeviceName(hostPeerDetails.name);
-    $('#active-peer-detail').textContent = hostControlAllowed ? 'Mouse and keyboard control enabled' : 'View-only session';
+    const how = hostPeerDetails.auto ? 'Joined with the access code' : 'Approved by you';
+    $('#active-peer-detail').textContent = `${hostPeerDetails.ip ? hostPeerDetails.ip + ' · ' : ''}${how} · ${hostControlAllowed ? 'can control this PC' : 'view only'}`;
     $('#toggle-host-control').textContent = hostControlAllowed ? 'Revoke control' : 'Allow control';
     $('#toggle-host-control').disabled = !deviceInfo.inputAvailable;
   }
@@ -211,7 +238,7 @@ function updateShareUI() {
         copy.className = 'copy-small';
         copy.type = 'button';
         copy.title = `Copy ${ip}`;
-        copy.textContent = '⧉';
+        copy.textContent = 'Copy';
         copy.addEventListener('click', async () => {
           try { await navigator.clipboard.writeText(ip); showToast('Device address copied.'); }
           catch { showToast(`Device address: ${ip}`); }
@@ -261,6 +288,7 @@ async function startSharing() {
       }, { once: true });
     });
     hostInfo = await window.lanAPI.startHost();
+    if (hostInfo.input) { deviceInfo.input = hostInfo.input; deviceInfo.inputAvailable = Boolean(hostInfo.input.available); setInputStatus(hostInfo.input); }
     updateShareUI();
     showToast('Sharing is active. Share the LAN address and your permanent access code with the person connecting.');
   } catch (error) {
@@ -489,10 +517,9 @@ function updateClientControlUI() {
   $('#control-status-label').textContent = controlGranted ? 'Mouse & keyboard control enabled' : 'View-only session';
   $('#session-permission-title').textContent = controlGranted ? 'Mouse and keyboard enabled' : 'View-only access';
   $('#session-permission-copy').textContent = controlGranted
-    ? 'The host has approved remote input for this session. The host can revoke it at any time.'
-    : 'The host has not enabled remote input. Ask them to approve control on their desktop.';
+    ? 'You can use this computer’s mouse and keyboard. The host can turn this off at any time.'
+    : 'You can see this screen but not control it. The host can allow control.';
   $('#remote-video').classList.toggle('control-enabled', controlGranted);
-  $('#session-footer-status').textContent = controlGranted ? 'LOCAL NETWORK · INPUT ENABLED BY HOST' : 'LOCAL NETWORK · VIEW ONLY';
 }
 
 function showSession(name, address) {
@@ -503,7 +530,7 @@ function showSession(name, address) {
   $('#viewer-placeholder').hidden = false;
   $('#viewer-placeholder').querySelector('strong').textContent = 'Connecting to the desktop';
   $('#viewer-placeholder').querySelector('span').textContent = 'Negotiating a direct connection on your local network…';
-  $('#session-state').innerHTML = '<span class="pulse-dot"></span> CONNECTING';
+  setSessionState('Connecting');
   $('#viewer-resolution').textContent = 'Waiting for video…';
   setConnectBusy(false);
   setPage('session');
@@ -532,7 +559,7 @@ async function startClientPeer() {
     }
     video.play().catch(() => {});
     $('#viewer-placeholder').hidden = true;
-    $('#session-state').innerHTML = '<span class="pulse-dot"></span> CONNECTED';
+    setSessionState('Connected', 'active');
     $('#viewer-resolution').textContent = 'Live stream';
     clientConnected = true;
     clearConnectTimer();
@@ -545,11 +572,11 @@ async function startClientPeer() {
   peer.onconnectionstatechange = () => {
     if (peer.connectionState === 'connected') {
       clearConnectTimer();
-      $('#session-state').innerHTML = '<span class="pulse-dot"></span> CONNECTED';
+      setSessionState('Connected', 'active');
     } else if (peer.connectionState === 'failed') {
       failClientNegotiation('The direct connection failed. Check that both devices are on the same LAN and that the host firewall allows mswnlink on TCP port 49382 and the negotiated WebRTC traffic.');
     } else if (peer.connectionState === 'disconnected') {
-      $('#session-state').innerHTML = '<span class="pulse-dot"></span> RECONNECTING';
+      setSessionState('Reconnecting', 'warn');
     }
   };
   const offer = await peer.createOffer();
@@ -817,6 +844,27 @@ function copyRemoteAddress() {
   navigator.clipboard.writeText(clientAddress).then(() => showToast('Remote address copied.')).catch(() => showToast(`Remote address: ${clientAddress}`));
 }
 
+const AUTO_ACCEPT_NOTES = {
+  off: 'You choose view-only or control for every request.',
+  view: 'Anyone with the correct code can watch this screen without you approving. They cannot control it.',
+  control: 'Anyone with the correct code gets full control of this PC without you approving. Keep the code private. You can disconnect anyone from this screen.'
+};
+
+function refreshAutoAcceptNote() {
+  const value = $('#auto-accept').value;
+  $('#auto-accept-note').textContent = AUTO_ACCEPT_NOTES[value] || AUTO_ACCEPT_NOTES.off;
+}
+
+async function loadAutoAcceptSetting() {
+  try {
+    const settings = await window.lanAPI.getSettings();
+    $('#auto-accept').value = settings && ['off', 'view', 'control'].includes(settings.autoAccept) ? settings.autoAccept : 'off';
+  } catch (error) {
+    console.warn('[mswnlink] Could not load settings:', error);
+  }
+  refreshAutoAcceptNote();
+}
+
 async function initialize() {
   try { deviceInfo = await window.lanAPI.deviceInfo(); }
   catch (error) { console.warn('[mswnlink] Device info error:', error); }
@@ -836,12 +884,13 @@ async function initialize() {
   }
   const name = friendlyDeviceName(deviceInfo.name);
   $('#sidebar-device-name').textContent = name;
-  $('#top-avatar').textContent = name.slice(0, 2).toUpperCase();
   if (!deviceInfo.inputAvailable) {
     $('#accept-control').disabled = true;
-    $('#accept-control').title = 'Native mouse/keyboard control backend is unavailable on this build.';
-    $('#accept-control').querySelector('small').textContent = 'Control backend unavailable in this build';
+    $('#accept-control').title = 'Mouse and keyboard control is unavailable on this PC.';
+    $('#accept-control').querySelector('small').textContent = 'Unavailable on this PC. See the note on Share this PC.';
   }
+  setInputStatus(deviceInfo.input);
+  await loadAutoAcceptSetting();
   for (const button of $$('[data-page]')) {
     button.addEventListener('click', () => {
       const pageName = button.dataset.page;
@@ -854,6 +903,24 @@ async function initialize() {
   }
   $('#connect-form').addEventListener('submit', connectToDevice);
   $('#share-toggle').addEventListener('click', startSharing);
+  let lastAutoAccept = $('#auto-accept').value;
+  $('#auto-accept').addEventListener('change', async () => {
+    const select = $('#auto-accept');
+    const wanted = select.value;
+    select.disabled = true;
+    try {
+      const result = await window.lanAPI.saveSettings({ autoAccept: wanted });
+      if (!result || !result.ok) throw new Error(result && result.error ? result.error : 'Could not save this setting.');
+      lastAutoAccept = wanted;
+      showToast(wanted === 'off' ? 'Every connection will need your approval.' : 'Connections with the correct code will now start without asking.');
+    } catch (error) {
+      select.value = lastAutoAccept;
+      showToast(error.message);
+    } finally {
+      select.disabled = false;
+      refreshAutoAcceptNote();
+    }
+  });
   $('#share-quality').addEventListener('change', () => {
     const selected = SHARE_PROFILES[$('#share-quality').value] ? $('#share-quality').value : 'balanced';
     const descriptions = {
@@ -926,7 +993,7 @@ async function initialize() {
   function syncFullscreenButton() {
     const active = document.fullscreenElement || document.webkitFullscreenElement;
     const isFullscreen = active === viewerShell;
-    fullscreenButton.textContent = isFullscreen ? '⤢ Exit full screen' : '⛶ Full screen';
+    fullscreenButton.textContent = isFullscreen ? 'Exit full screen' : 'Full screen';
     fullscreenButton.setAttribute('aria-label', isFullscreen ? 'Exit full screen' : 'Show remote desktop fullscreen');
     fullscreenButton.title = isFullscreen ? 'Exit full screen (Esc)' : 'Fit remote desktop to the whole screen';
   }
@@ -1005,7 +1072,7 @@ async function initialize() {
     $('#request-device-ip').textContent = request.ip;
     $('#request-avatar').textContent = friendlyDeviceName(request.name).slice(0, 2).toUpperCase();
     $('#accept-control').disabled = !deviceInfo.inputAvailable;
-    $('#accept-control').querySelector('small').textContent = deviceInfo.inputAvailable ? 'Share screen and allow mouse + keyboard' : 'Native input backend unavailable';
+    $('#accept-control').querySelector('small').textContent = deviceInfo.inputAvailable ? 'They see your screen and use your mouse and keyboard.' : 'Unavailable on this PC. See the note on Share this PC.';
     $('#incoming-modal').hidden = false;
   });
   window.lanAPI.on('incoming-cancelled', () => {
@@ -1024,12 +1091,12 @@ async function initialize() {
     updateShareUI();
   });
   window.lanAPI.on('host-error', (error) => showShareError(error.message || 'The host service encountered an error.'));
-  window.lanAPI.on('peer-accepted', ({ peer, mode }) => {
+  window.lanAPI.on('peer-accepted', ({ peer, mode, auto }) => {
     $('#incoming-modal').hidden = true;
-    hostPeerDetails = peer ? { name: peer.name, ip: peer.ip } : { name: 'Connected device', ip: '' };
+    hostPeerDetails = peer ? { name: peer.name, ip: peer.ip, auto: Boolean(auto) } : { name: 'Connected device', ip: '', auto: Boolean(auto) };
     hostControlAllowed = mode === 'control';
     updateShareUI();
-    if (peer && peer.name) showToast(`${peer.name} connected · ${mode === 'control' ? 'control allowed' : 'view only'}.`);
+    if (peer && peer.name) showToast(`${peer.name} connected${auto ? ' with the access code' : ''}, ${mode === 'control' ? 'with control' : 'view only'}.`);
   });
   window.lanAPI.on('peer-disconnected', ({ reason }) => {
     const hadPeer = Boolean(hostPeerDetails);
@@ -1039,6 +1106,7 @@ async function initialize() {
     updateShareUI();
     if (reason && hadPeer) showToast(reason);
   });
+  window.lanAPI.on('input-status', (input) => { deviceInfo.input = input; deviceInfo.inputAvailable = Boolean(input && input.available); setInputStatus(input); });
   window.lanAPI.on('input-mode-changed', ({ allowed, inputAvailable }) => {
     hostControlAllowed = Boolean(allowed);
     updateShareUI();

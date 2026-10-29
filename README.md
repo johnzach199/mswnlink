@@ -1,181 +1,127 @@
 # mswnlink
 
-**A small, consent-first remote-desktop starter for trusted local networks.** mswnlink lets one computer share its screen and lets another computer view it directly over the LAN. The host decides whether the session is view-only or includes mouse and keyboard control.
+A simple remote desktop for computers on your local network. One computer shares its screen, another views and controls it, directly over the LAN. No account, no cloud, no relay.
 
-> **Status:** v0.1 prototype/source project. The flow and UI are implemented, but it has not yet been runtime-tested on Windows, macOS, and Linux in this environment. Treat it as a development build, not as a security-audited production remote-access product.
+> **Status:** v0.2 prototype. It has not been security-audited. Use it on networks you trust (see [Security](#security)).
 
-## Browser Edition (no installation)
+## Download
 
-A no-install, single-file browser version is included in `browser-only/index.html`. Copy that folder to both computers and open `index.html` in a recent desktop browser. It shares the host screen using the browser's permission prompt and WebRTC directly over the LAN; there is no signaling server and no STUN/TURN relay. Pairing is done by manually transferring the generated offer and answer text/files between the two devices.
+Get the latest build from the [Releases](../../releases) page:
 
-**Browser Edition is view-only.** A website cannot inject mouse/keyboard events into the operating system, so full remote control still requires the desktop app/native helper. Screen capture also depends on browser support for `getDisplayMedia` and secure-context policy. If a browser does not allow screen capture from a local file, it must be served from a trusted HTTPS origin.
+| Platform | File |
+| --- | --- |
+| Fedora / Linux | `mswnlink-fedora-<version>-x64.AppImage` |
+| Windows | `mswnlink-windows-<version>-x64.exe` (portable) |
+| macOS, Apple Silicon (M1 and newer) | `mswnlink-macos-<version>-arm64.dmg` |
+| macOS, Intel | `mswnlink-macos-<version>-x64.dmg` |
 
-A standalone archive is also available as `mswnlink-browser-only.zip` when downloaded from the project distribution location. The desktop app below remains the full-control edition.
+## Using it
 
-## What is in this first version?
+1. On the computer you want to reach, open **Share this PC**, pick a display, save an access code, and click **Start sharing**.
+2. On the other computer, open **Connect**, enter the address and access code shown on the first one, and click **Connect**.
+3. Under **Who can connect** the host chooses what happens when the correct code is entered:
+   - **Ask me each time**: the host approves every request as view-only or full control (default).
+   - **Connect automatically, view only**: the code alone is enough to watch the screen.
+   - **Connect automatically, with full control**: the code alone is enough to watch and control the PC, with no one needing to click Accept.
 
-- Dark, lightweight-feeling dashboard with separate **Connect** and **Share this PC** screens.
-- Direct WebRTC screen streaming, with no STUN server, cloud account, or public relay configured.
-- Owner-configured permanent access code (8–64 characters), saved via Electron safeStorage and retained when sharing stops/restarts; a host-side approval prompt is still required for every connection.
-- Host chooses **View only** or **Allow control**, and can revoke input permission or disconnect the viewer at any time.
-- LAN-only incoming WebSocket signaling: public/non-private source addresses are rejected.
-- Pairing uses a fresh random challenge, PBKDF2-derived HMAC proof, and HMAC-signed signaling messages; the passcode is not sent over the network as plaintext.
-- Native input bridge through RobotJS.
-- Standalone build targets: Fedora/Linux AppImage, Windows portable EXE, and macOS DMG (Intel and Apple Silicon builds).
+Automatic connection is opt-in and needs an access code of **12 or more characters**. The host window always shows who is connected and has a **Disconnect** button, and a system notification appears when someone joins.
 
+Both computers must allow TCP port **49382** on the private network. Don't turn the firewall off; allow mswnlink on private networks only.
 
-## Permanent access code and stream quality
+## macOS: "mswnlink is damaged and can't be opened"
 
-On **Share this PC**, set an owner-chosen passcode between 8 and 64 characters. Click **Save permanent code** before starting sharing. The app stores it through Electron `safeStorage` (using OS-backed encryption where supported) and reuses it when you start sharing again; it does not generate a new code each session. You can change it at any time. If you change the code while hosting, new connections must use the new code; an already active session may continue until disconnected. On Linux, Electron may report the `basic_text` backend if a desktop keyring isn't available; the UI warns that this backend doesn't protect the saved passcode well. Prefer GNOME Keyring/libsecret or KWallet.
+Older builds were shipped with a broken code signature, which makes macOS (especially on Apple Silicon) say the app is "damaged". From v0.2 the build is signed ad hoc and checked in CI, so you get the normal "unidentified developer" prompt instead.
 
-Before sharing, choose **Balanced** (1080p/30 FPS), **Smooth** (up to 1080p/60 FPS), or **Sharper** (up to 1440p/30 FPS). Actual resolution and frame rate depend on the source display and host computer. The sender requests a higher LAN bitrate and prioritizes retaining resolution; that may use more CPU/network bandwidth on the higher quality presets.
+Because there is no paid Apple Developer ID, macOS still asks you to approve the app once:
 
-Remote mouse/keyboard control remains consent-based: the host selects **Allow control** in the incoming request, can revoke it from the Share screen, and can disconnect the viewer at any time. Native control requires RobotJS to be available in the platform build; if it is missing, the app clearly remains view-only.
+1. Open the DMG and drag **mswnlink** to **Applications**.
+2. In Applications, right-click **mswnlink** and choose **Open**, then **Open** again. If macOS only offers *Done*, go to **System Settings › Privacy & Security** and click **Open Anyway**.
 
-## Quick start from source
+If you still see "damaged", remove the download quarantine flag and open it again:
 
-### Requirements
+```
+xattr -cr /Applications/mswnlink.app
+```
 
-- Node.js 22.12 or newer and npm (development/building only; **not required to run a packaged app**).
-- Internet access during first setup so npm can download dependencies.
-- A supported desktop session on each computer.
+Then allow these in **System Settings › Privacy & Security**:
 
-### Run the app (screen sharing / view-only)
+- **Screen & System Audio Recording**: to share this Mac's screen.
+- **Accessibility**: to let a remote computer move the mouse and type. Restart mswnlink after enabling it.
 
-```bash
-cd mswnlink
+Ad-hoc builds get a new identity each release, so macOS may ask for these permissions again after you update.
+
+## Fedora and other Linux desktops
+
+The AppImage runs on Fedora without installing Node.js. If it doesn't start, install FUSE: `sudo dnf install fuse fuse-libs`.
+
+**Remote mouse and keyboard on Wayland.** Fedora uses Wayland by default, where programs are not allowed to fake input directly. mswnlink therefore uses the desktop's own *RemoteDesktop portal* through a small Python helper (`native/wayland-input.py`):
+
+```
+sudo dnf install python3 python3-gobject xdg-desktop-portal xdg-desktop-portal-gnome   # GNOME
+sudo dnf install python3 python3-gobject xdg-desktop-portal xdg-desktop-portal-kde     # KDE Plasma
+```
+
+When you click **Start sharing**, your desktop shows an approval prompt for remote control (separate from the screen-sharing prompt). Approve it and pick the monitor you are sharing. Desktops that support it remember the approval, so the prompt appears only the first time. On the Share page, the line next to **Start sharing** tells you whether control is ready.
+
+Notes:
+
+- The desktop prompt is an operating-system rule and cannot be skipped. The "connect without asking" setting only removes mswnlink's own approval step.
+- Choose the **same monitor** in the desktop prompt as in mswnlink, so clicks land where the viewer sees them.
+- On an X11 session, mswnlink uses RobotJS directly and no portal prompt is needed.
+- If capture shows a black screen, check that PipeWire and `xdg-desktop-portal` are running, and try `MSWNLINK_FORCE_NATIVE_WAYLAND=1`.
+
+## Run from source
+
+Requires Node.js 22.12 or newer.
+
+```
 npm install
 npm start
+npm run check     # syntax check
 ```
 
-On Linux Wayland sessions, `npm start` uses `--ozone-platform=x11` (XWayland) to avoid a native Wayland/Vulkan incompatibility reported by some Electron/Chromium graphics stacks. The old command `MSWNLINK_USE_WAYLAND=1 npm start` now also falls back to XWayland for compatibility. To explicitly experiment with native Wayland, use `MSWNLINK_FORCE_NATIVE_WAYLAND=1 npm start`; this is experimental and Chromium may still print the Vulkan warning. That warning alone does not prove the app crashed. If screen sharing fails, check the desktop's PipeWire and `xdg-desktop-portal` services as described below.
+`npm start` uses XWayland on Wayland sessions by default. Optional switches: `MSWNLINK_FORCE_NATIVE_WAYLAND=1` (experimental native Wayland) and `MSWNLINK_DISABLE_GPU=1` (software rendering if the window stays blank).
 
-If the terminal prints `MESA-LOADER: failed to open dri ... Permission denied`, that line can be a non-fatal graphics-driver warning by itself; first check whether the app window opens and test **Share this PC**. If Electron will not open, shows a blank window, or graphics initialization appears to be the blocker, stop it and try the optional software-rendering fallback:
+RobotJS is an optional dependency used for input on Windows, macOS and X11. If it fails to build, the app still runs and sessions are view-only.
 
-```bash
-MSWNLINK_DISABLE_GPU=1 npm start
+## Build the apps
+
+Push a tag such as `v0.2.0`, or run **Actions › Build and Publish mswnlink Executables**, to build every platform on GitHub and attach the files to a release. See [BUILDING-RELEASES.md](BUILDING-RELEASES.md).
+
+Locally, on the target operating system:
+
 ```
-
-This disables GPU acceleration and Vulkan-related features before Electron starts, which can help isolate Mesa/GBM driver issues but may reduce rendering performance. The setting is optional and does not fix a broken screen-capture portal.
-
-If screen capture still fails, make sure XWayland is installed and that your desktop's screen-capture portal and PipeWire services are working. On Fedora, the portal backend package depends on your desktop: GNOME commonly uses `xdg-desktop-portal-gnome`, KDE Plasma uses `xdg-desktop-portal-kde`, and GTK-based desktops may use `xdg-desktop-portal-gtk`. Do not install all backends blindly; use the one for your desktop environment. Restarting the portal/PipeWire user services or logging out and back in may be needed after installing missing components.
-
-Run `npm run check` to verify the JavaScript syntax before launching. The native mouse/keyboard backend (RobotJS) is optional: **a missing Linux X11 development header will no longer make `npm install` fail**. If RobotJS cannot be loaded, mswnlink still starts for screen sharing/view-only sessions and the UI disables the remote-control option.
-
-### Enable mouse and keyboard control on Linux (optional)
-
-Install the build tools and X11/XTEST headers that RobotJS needs, using the command for your distribution:
-
-```bash
-# Fedora
-sudo dnf install gcc-c++ make python3 libXtst-devel libX11-devel libXext-devel
-
-# Debian / Ubuntu
-sudo apt-get install build-essential python3 libxtst-dev libx11-dev libxext-dev
-
-# openSUSE
-sudo zypper install gcc-c++ make python3 libXtst-devel libX11-devel libXext-devel
-```
-
-Then, from the project directory, rebuild the native module for Electron:
-
-```bash
-npm run rebuild:native
-```
-
-If this rebuild still fails, the app can be used in view-only mode; copy the last 30 lines of the error output to troubleshoot the specific Linux distribution or desktop session. RobotJS input works best under X11; Wayland support depends on the compositor and permissions.
-
-On Windows and macOS, `npm install` also completes without forcing a native rebuild. To enable remote input, run `npm run rebuild:native` with the relevant platform build tools installed. macOS still requires the user to grant Screen Recording and Accessibility permissions.
-
-### Connect two computers
-
-1. Put both computers on the same trusted local network.
-2. On the computer you want to access, open **Share this PC**, choose the display, and click **Start sharing**.
-3. On first use, set a permanent access code on **Share this PC** and save it. It remains the same across app restarts until you change it. Copy one of the listed LAN addresses and the permanent code.
-4. On the other computer, open **Connect**, enter the address and passcode, then click **Connect to desktop**.
-5. On the host, approve the request as **View only** or **Allow control**. The host can revoke control or disconnect the viewer from the Share screen.
-6. Click the remote video before typing. End the session from the viewer or host.
-
-Both computers need to permit connections on TCP port **49382** on their private network. Do not disable the firewall globally. If the host's firewall asks, allow mswnlink on private/trusted networks only.
-
-## Standalone executables (end users do not need Node.js)
-
-The release build creates standalone downloads with Electron's runtime bundled in, so you do not need to install Node.js, npm, or development tools on the computer where you run mswnlink:
-
-- **Fedora/Linux:** `mswnlink-fedora-0.1.0-x64.AppImage` — mark it executable and launch it. On Fedora Wayland sessions, the packaged launcher selects XWayland by default.
-- **Windows:** `mswnlink-windows-0.1.0-x64.exe` — a portable executable; run it directly, without an installer.
-- **macOS Intel:** `mswnlink-macos-0.1.0-x64.dmg`.
-- **macOS Apple Silicon:** `mswnlink-macos-0.1.0-arm64.dmg`.
-
-macOS uses an application bundle inside the DMG rather than one standalone binary. These builds are unsigned because no signing certificate has been configured; macOS may require the user to approve opening it, and Windows SmartScreen may show a warning for the unsigned portable EXE. Do not bypass warnings for builds from a source you do not trust.
-
-### Build artifacts automatically
-
-The GitHub Actions workflow in `.github/workflows/build.yml` builds each platform on a matching runner. If you maintain a copy of this project in a GitHub repository, open **Actions → Build mswnlink standalone apps → Run workflow**. Download the four workflow artifacts: Fedora x64, Windows x64, macOS Intel, and macOS Apple Silicon. Pushing a tag named `v*` (for example `v0.1.0`) builds the same files and publishes them as GitHub Release assets. See [BUILDING-RELEASES.md](BUILDING-RELEASES.md) for the one-time setup steps.
-
-### Build locally from source (developers only)
-
-Use Node.js 22.12+ and npm. The native mouse/keyboard backend must compile for the target platform if you want remote control; a package without RobotJS would have reduced functionality, so the automated release workflow intentionally fails if this native build fails.
-
-```bash
 npm install
-npm run rebuild:native
-npm run check
-
-# Fedora/Linux AppImage
-npm run dist:fedora
-
-# Windows portable EXE (run on Windows)
-npm run dist:win
-
-# macOS DMG (run on macOS; produces the runner's architecture)
-npm run dist:mac
+npm run dist:fedora   # Linux AppImage
+npm run dist:win      # Windows portable exe
+npm run dist:mac      # macOS dmg (signed ad hoc, then verified)
 ```
 
-Artifacts are written to `release/`. Build on the operating system where you intend to package the app. Native modules are compiled for that operating system and architecture; do not copy a Windows or macOS build from a Linux runner and expect it to work.
+To ship macOS builds with no approval prompt at all, you need an Apple Developer ID certificate and notarization. Set `CSC_LINK` and `CSC_KEY_PASSWORD` in the repository secrets and electron-builder will sign with it instead of the ad-hoc step.
 
-## Troubleshooting: stuck at “Connecting devices” / SessionDescription parse error
+## Browser edition
 
-Use the same latest mswnlink source/build on both computers, then restart sharing and reconnect. The current handshake code explicitly converts WebRTC session descriptions and ICE candidates to plain JSON data before sending them over Electron IPC and the LAN signaling WebSocket. This prevents browser host objects from arriving as empty or incomplete descriptions. If SDP parsing still fails, the app now logs only the offer/answer type and SDP length (not the full SDP) and reports the negotiation failure instead of leaving the viewer stuck on the connecting screen.
+`browser-only/index.html` works with no install. It is **view-only** (a web page cannot control your mouse and keyboard) and pairing is done by copying an offer and an answer between the two devices.
 
-If the app gets past SDP negotiation but then times out, confirm both computers are on the same reachable LAN and allow mswnlink's TCP signaling port 49382 through the host firewall. WebRTC media also requires the local ICE candidate ports negotiated between peers; some guest Wi-Fi networks and access points isolate wireless clients. No public STUN/TURN server is configured in this LAN-only prototype.
+## Security
 
-## OS notes and limitations
+mswnlink is built for a **trusted private LAN**.
 
-- **Windows:** normal desktop use should work after allowing the app through the private-network firewall prompt.
-- **macOS:** approve Screen Recording permissions for capture and Accessibility permissions for mouse/keyboard input in System Settings. Those are operating-system security requirements; the app does not bypass them.
-- **Linux:** `npm start` uses XWayland when it detects a Wayland session to avoid the native Wayland/Vulkan incompatibility. `MSWNLINK_USE_WAYLAND=1 npm start` also falls back to XWayland; native Wayland is available only as an experimental mode via `MSWNLINK_FORCE_NATIVE_WAYLAND=1 npm start`. If capture still fails, verify XWayland plus the desktop's `xdg-desktop-portal` backend and PipeWire are installed/running. For RobotJS input, install the X11/XTEST development packages listed above and run `npm run rebuild:native`; native input is best suited to X11 and may not work in a Wayland session. Test on the actual desktop environment before relying on remote control.
-- The current input mapping is aimed at the primary display. Multi-monitor coordinate mapping may need additional work.
-- The current version supports one viewer at a time and does not include audio, file transfer, clipboard sync, unattended startup, remote wake, or automatic device discovery. Enter the LAN IP/hostname manually.
-- IPv4 addresses and hostnames are supported in the connect form; IPv6 literals are not yet supported.
-- Electron includes its own Chromium/Node runtime, so each standalone build is larger than a native application. The end-user artifacts bundle the runtime so Node.js/npm do not need to be installed separately.
+- Video and the input channel use WebRTC's encrypted transport.
+- The access code is never sent over the network. A PBKDF2-derived key is used to prove knowledge of it and to authenticate signaling messages.
+- Connections from non-private addresses are rejected. Wrong codes are rate-limited per address, and after repeated failures the PC stops answering for a few minutes.
+- The access code is stored with the operating system's secure storage (Electron `safeStorage`).
 
-## Security model (please read)
+Limits you should know about:
 
-mswnlink is designed for a **trusted private LAN**. The application has no public relay or cloud account. Screen video and the WebRTC data channel use WebRTC's encrypted transport, while signaling messages are HMAC-authenticated against the passcode-derived session key so the passcode itself is not sent over the network and unauthenticated edits to signaling messages are rejected. The permanent passcode remains saved until its owner changes it, and the host must still approve every connecting device.
+- Signaling uses plain WebSocket (no TLS). Someone who can capture traffic on your network can record a login exchange and try to guess the code offline. **Use a long, unique code**, which is why automatic connection requires 12 or more characters.
+- With **Connect automatically, with full control**, anyone who knows the code controls the PC. Don't use it on shared or guest networks, and don't reuse the code anywhere else.
+- Don't expose port 49382 to the internet.
 
-However, this prototype's WebSocket signaling transport is **not TLS-encrypted**, so signaling metadata (including local addresses and WebRTC offer/answer data) can be visible to someone who can capture traffic on the same network. Use a long, unique permanent passphrase: although the challenge protocol derives a key with PBKDF2 and sends a proof instead of the passcode itself, a recorded exchange can still be used for offline guessing, so a weak code is not sufficient protection. Do not use this prototype across an untrusted network or expose port 49382 to the internet. Before production use, add audited pairing/key-verification and encrypted signaling (for example, pinned TLS certificates) and test against a documented threat model.
+## Limits
 
-The host-side approval and visible sharing controls are intentional: mswnlink has no stealth mode, unattended access, persistence-on-boot, or hidden input channel.
-
-## Useful references
-
-- Electron screen capture API: https://www.electronjs.org/docs/latest/api/desktop-capturer
-- RobotJS install and platform permissions: https://robotjs.dev/docs/
-- Electron releases: https://releases.electronjs.org/
+One viewer at a time. No audio, file transfer, clipboard sync, start-on-boot or automatic discovery. IPv4 addresses and hostnames only. Multi-monitor mapping targets the display you share.
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
-
-
-## Fullscreen remote viewer
-
-The remote viewer fullscreen layout expands to the full viewport. The video stage uses the remaining height after its toolbar/header, and the remote image uses `object-fit: contain` so the far desktop is not cropped when its aspect ratio differs from the local display. Press `Esc` to leave fullscreen. The same fit-to-viewport fix is included in Browser Edition.
-
-
-### Fullscreen remote viewer
-
-The remote viewer fullscreen mode now reserves the entire viewport for the remote video and hides the normal bottom toolbar while fullscreen is active. The video uses `object-fit: contain`, so the full remote display stays visible without cropping; use the floating **Exit full screen** control in the top-right or press `Esc`.
-
-See [UPDATING.md](UPDATING.md) for the permanent-passcode and stream-quality changes and instructions for applying the changed files to an existing GitHub repository. Update both the host and viewer app builds together because this release accepts an 8–64 character owner-set passphrase rather than the old temporary six-digit code.
+MIT. See [LICENSE](LICENSE).

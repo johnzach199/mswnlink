@@ -1,40 +1,32 @@
-# Getting the mswnlink executables
+# Building the mswnlink apps
 
-The final end-user apps are built on native platform runners. You do **not** need Node.js or npm on computers that only run the resulting app.
+The apps are built on GitHub's own Windows, Linux and macOS machines. You don't need Node.js on a computer that only runs the finished app.
 
 ## One-time setup
 
-1. Create a repository on GitHub.
-2. Extract this project ZIP on your computer.
-3. Upload the **contents** of the extracted `mswnlink` directory to the repository, making sure the hidden `.github/workflows/build.yml` file is included.
-4. In the repository, open **Settings → Actions → General** and make sure Actions are allowed. For tagged releases, allow the workflow to create releases if your repository policies have that setting.
+1. Upload the contents of this project to your GitHub repository. Make sure the hidden `.github/workflows/main.yml` file is included.
+2. In the repository, open **Settings › Actions › General**, allow Actions, and under *Workflow permissions* choose **Read and write permissions** so releases can be created.
 
-## Build the downloads
+## Build and publish a release
 
-1. Open the repository's **Actions** tab.
-2. Select **Build mswnlink standalone apps**.
-3. Click **Run workflow** and start the workflow on the default branch.
-4. When all four jobs finish successfully, open the workflow run and download the artifacts:
-   - `mswnlink-fedora-x64` — single `.AppImage` executable.
-   - `mswnlink-windows-x64` — portable `.exe`.
-   - `mswnlink-macos-intel-x64` — `.dmg` for Intel Macs.
-   - `mswnlink-macos-apple-silicon-arm64` — `.dmg` for Apple Silicon Macs.
+1. Update `version` in `package.json` (for example `0.2.0`) and commit it.
+2. Create and push a tag that matches: `git tag v0.2.0 && git push origin v0.2.0`.
+3. Open the **Actions** tab. When all four jobs are green, the files appear on the **Releases** page:
+   - `mswnlink-fedora-<version>-x64.AppImage`
+   - `mswnlink-windows-<version>-x64.exe`
+   - `mswnlink-macos-<version>-x64.dmg` (Intel)
+   - `mswnlink-macos-<version>-arm64.dmg` (Apple Silicon)
 
-The workflow compiles the RobotJS native input module on each platform before packaging. It fails rather than publishing a knowingly view-only package if that native build fails.
+To only test a build, run **Actions › Build and Publish mswnlink Executables › Run workflow**. The files are then attached to the workflow run as artifacts for 30 days.
 
-## Publish a named release
+## macOS signing
 
-After the manual workflow succeeds, create and push a version tag, for example `v0.1.0`. The workflow runs again and attaches the completed platform files to a GitHub Release. If the native build fails on any platform, the release publish job is skipped.
+Every macOS job signs the app ad hoc and then **mounts the DMG and verifies the signature**. If the signature is invalid the job fails, so a build that macOS would call "damaged" is never published.
 
-## Run the downloaded file
+Ad-hoc signing is free but is not Apple-approved, so users approve the app once (right-click › Open, or `xattr -cr /Applications/mswnlink.app`). To remove that step you need a paid Apple Developer ID and notarization: add the repository secrets `CSC_LINK` (base64 of your .p12) and `CSC_KEY_PASSWORD`; electron-builder then signs with them and the ad-hoc step is skipped.
 
-- **Fedora:** `chmod +x mswnlink-fedora-0.1.0-x64.AppImage` then `./mswnlink-fedora-0.1.0-x64.AppImage`.
-- **Windows:** double-click `mswnlink-windows-0.1.0-x64.exe`.
-- **macOS:** open the matching `.dmg`, then drag `mswnlink.app` into Applications. Builds are currently unsigned, so the operating system may show an initial security warning. Only run builds from a repository you trust.
+## Running the downloaded files
 
-Builds currently target x64 Windows and Linux, plus Intel and Apple Silicon Macs. A universal macOS build, code signing, notarization, and production security audit are not included.
-
-
-## Fullscreen viewer layout
-
-The packaged desktop viewer uses a viewport-height flex layout in fullscreen. The remote video stage consumes the available space and keeps the complete remote desktop visible with `object-fit: contain`, instead of retaining the normal preview-height limit. Browser Edition contains the same fullscreen fit and an overlay button to enter/exit fullscreen.
+- **Fedora:** `chmod +x mswnlink-fedora-*.AppImage && ./mswnlink-fedora-*.AppImage`. See the README for the Wayland remote-control packages.
+- **Windows:** double-click the `.exe`. SmartScreen may warn because the file is unsigned.
+- **macOS:** open the `.dmg`, drag **mswnlink** to Applications, then follow the steps in the README.

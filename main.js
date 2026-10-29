@@ -1,11 +1,12 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, desktopCapturer, session, shell, safeStorage } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, session, shell, safeStorage, Notification, systemPreferences } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
+const { createInputBackend } = require('./input-backend');
 
 // Optional fallback for Linux systems whose Mesa/GBM driver cannot be opened.
 // This must run before app.whenReady(); keep acceleration enabled by default.
@@ -29,29 +30,20 @@ let pendingSocket = null;
 let activeSocket = null;
 let activePeer = null;
 let inputAllowed = false;
-let robot = null;
-const heldKeys = new Set();
-const heldButtons = new Set();
+let inputBackend = null;
 const badAttempts = new Map();
-let wheelRemainderX = 0;
-let wheelRemainderY = 0;
-
-try {
-  // Use the native input backend when built for this Electron/OS combination.
-  robot = require('robotjs');
-  robot.setMouseDelay(0);
-  robot.setKeyboardDelay(0);
-} catch (error) {
-  console.warn('[mswnlink] Native input backend is unavailable:', error.message);
-}
+const globalFailures = [];
+let globalLockUntil = 0;
+let settings = { autoAccept: 'off' }; // off | view | control
+const AUTO_CONTROL_MIN_CODE = 12;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1240,
     height: 820,
-    minWidth: 980,
-    minHeight: 680,
-    backgroundColor: '#0b1020',
+    minWidth: 760,
+    minHeight: 640,
+    backgroundColor: '#f4f5f7',
     title: 'mswnlink',
     show: false,
     webPreferences: {
@@ -158,6 +150,9 @@ async function loadSavedAccessCode() {
 }
 
 async function savePersistentAccessCode(code) {
+  if (settings.autoAccept !== 'off' && code.length < AUTO_CONTROL_MIN_CODE) {
+    throw new Error(`Connecting without approval needs an access code of at least ${AUTO_CONTROL_MIN_CODE} characters. Choose a longer code, or set “Who can connect” back to “Ask me each time”.`);
+  }
   if (!safeStorage.isEncryptionAvailable()) {
     throw new Error(getAccessCodeStorageWarning() || 'OS secure storage is unavailable. Set up your desktop keyring and restart mswnlink.');
   }
@@ -180,6 +175,42 @@ async function savePersistentAccessCode(code) {
     sendToUI('incoming-cancelled', { reason: 'The permanent access code changed.' });
   }
   return { code, backend: getAccessCodeBackend(), warning: getAccessCodeStorageWarning() };
+}
+
+function settingsFilePath() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+async function loadSettings() {
+  try {
+    const parsed = JSON.parse(await fs.readFile(settingsFilePath(), 'utf8'));
+    if (parsed && ['off', 'view', 'control'].includes(parsed.autoAccept)) settings.autoAccept = parsed.autoAccept;
+  } catch {
+    // First run or unreadable file: keep the safe default (ask every time).
+  }
+}
+
+async function persistSettings() {
+  const filePath = settingsFilePath();
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.tmp-${process.pid}`;
+  await fs.writeFile(temporaryPath, JSON.stringify(settings), { encoding: 'utf8', mode: 0o600 });
+  await fs.rename(temporaryPath, filePath);
+}
+
+function inputAvailable() {
+  return Boolean(inputBackend && inputBackend.describe().available);
+}
+
+function describeInput() {
+  return inputBackend ? inputBackend.describe() : { available: false, ready: false, kind: 'none', state: 'failed', message: 'Input backend not loaded.' };
+}
+
+function recordFailedAttempt(now) {
+  globalFailures.push(now);
+  while (globalFailures.length && now - globalFailures[0] > 10 * 60_000) globalFailures.shift();
+  // Many wrong codes from anywhere on the LAN: stop answering for a few minutes.
+  if (globalFailures.length >= 12) globalLockUntil = now + 5 * 60_000;
 }
 
 function parseMessage(raw) {
@@ -243,17 +274,7 @@ function sendSocket(socket, object) {
 }
 
 function clearNativeInput() {
-  if (!robot) return;
-  for (const key of heldKeys) {
-    try { robot.keyToggle(key, 'up'); } catch {}
-  }
-  heldKeys.clear();
-  for (const button of heldButtons) {
-    try { robot.mouseToggle('up', button); } catch {}
-  }
-  heldButtons.clear();
-  wheelRemainderX = 0;
-  wheelRemainderY = 0;
+  if (inputBackend) inputBackend.releaseAll();
 }
 
 function closePeer(reason = 'Disconnected') {
@@ -294,6 +315,11 @@ function bindConnection(socket, req) {
       }
 
       const now = Date.now();
+      if (now < globalLockUntil) {
+        sendSocket(socket, { type: 'rejected', reason: 'Too many wrong codes were tried. This PC is not accepting connections for a few minutes.' });
+        socket.close(1008, 'Locked');
+        return;
+      }
       const previous = badAttempts.get(remoteIp) || { count: 0, time: now };
       if (now - previous.time > 60_000) { previous.count = 0; previous.time = now; }
       if (previous.count >= 5) {
@@ -307,6 +333,7 @@ function bindConnection(socket, req) {
         previous.count += 1;
         previous.time = now;
         badAttempts.set(remoteIp, previous);
+        recordFailedAttempt(now);
         sendSocket(socket, { type: 'rejected', reason: 'That permanent access code is not correct.' });
         socket.close(1008, 'Incorrect access code');
         return;
@@ -322,7 +349,12 @@ function bindConnection(socket, req) {
 
       pendingSocket = socket;
       activePeer = { name: safeName(msg.name), ip: remoteIp };
-      sendToUI('incoming-connection', { name: activePeer.name, ip: remoteIp });
+      if (settings.autoAccept === 'view' || settings.autoAccept === 'control') {
+        // The access code is the approval. The host window still shows who connected and can disconnect at any time.
+        resolvePending(settings.autoAccept, true);
+      } else {
+        sendToUI('incoming-connection', { name: activePeer.name, ip: remoteIp });
+      }
       return;
     }
 
@@ -358,8 +390,36 @@ function bindConnection(socket, req) {
   socket.on('error', (error) => console.warn('[mswnlink] WebSocket error:', error.message));
 }
 
+function resolvePending(mode, auto = false) {
+  if (!pendingSocket || pendingSocket.readyState !== WebSocket.OPEN) return { ok: false };
+  if (!['view', 'control', 'reject'].includes(mode)) return { ok: false };
+  const socket = pendingSocket;
+  pendingSocket = null;
+  if (mode === 'reject') {
+    sendSocket(socket, { type: 'rejected', reason: 'The request was declined on the host.' });
+    try { socket.close(); } catch {}
+    activePeer = null;
+    sendToUI('incoming-cancelled', {});
+    return { ok: true };
+  }
+  activeSocket = socket;
+  inputAllowed = mode === 'control' && inputAvailable();
+  const grantedMode = inputAllowed ? 'control' : 'view';
+  sendSocket(activeSocket, { type: 'accepted', mode: grantedMode, hostName: os.hostname() });
+  sendToUI('peer-accepted', { peer: activePeer, mode: grantedMode, inputAvailable: inputAvailable(), auto });
+  if (auto && Notification.isSupported()) {
+    try {
+      new Notification({
+        title: 'mswnlink',
+        body: `${activePeer.name} (${activePeer.ip}) connected with the access code · ${grantedMode === 'control' ? 'full control' : 'view only'}`
+      }).show();
+    } catch {}
+  }
+  return { ok: true, mode: grantedMode };
+}
+
 async function startHost() {
-  if (wss) return { code: pairingCode, port: PORT, ips: getLanIPv4() };
+  if (wss) return { code: pairingCode, port: PORT, ips: getLanIPv4(), input: describeInput() };
   if (!persistentAccessCode) throw new Error('Set a permanent access code on the Share this PC screen before starting to share.');
   pairingCode = persistentAccessCode;
   const server = new WebSocketServer({ host: '0.0.0.0', port: PORT, maxPayload: MAX_SIGNAL_BYTES });
@@ -383,7 +443,13 @@ async function startHost() {
       ? `Port ${PORT} is already in use. Close the other service and try again.`
       : `Could not start the LAN listener: ${error.message}`);
   }
-  return { code: pairingCode, port: PORT, ips: getLanIPv4() };
+  if (process.platform === 'darwin') {
+    // Shows the system prompt once; macOS needs it before remote clicks and keys work.
+    try { systemPreferences.isTrustedAccessibilityClient(true); } catch {}
+  }
+  // On Wayland this opens the desktop's one-time "allow remote control" prompt, so don't block on it.
+  if (inputBackend) inputBackend.start().catch((error) => console.warn('[mswnlink] Input backend failed to start:', error.message));
+  return { code: pairingCode, port: PORT, ips: getLanIPv4(), input: describeInput() };
 }
 
 function stopHost() {
@@ -393,6 +459,7 @@ function stopHost() {
   pendingSocket = null;
   if (activeSocket) closePeer('The host stopped sharing.');
   inputAllowed = false;
+  if (inputBackend) inputBackend.stop();
   const server = wss;
   wss = null;
   pairingCode = null;
@@ -403,69 +470,25 @@ function stopHost() {
   return { ok: true };
 }
 
-function mapKey(event) {
-  const code = String(event.code || '');
-  const named = {
-    Enter: 'enter', Escape: 'escape', Backspace: 'backspace', Tab: 'tab', Space: 'space',
-    ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down',
-    ShiftLeft: 'shift', ShiftRight: 'shift', ControlLeft: 'control', ControlRight: 'control',
-    AltLeft: 'alt', AltRight: 'alt', MetaLeft: 'command', MetaRight: 'command',
-    CapsLock: 'capslock', Delete: 'delete', Home: 'home', End: 'end', PageUp: 'pageup',
-    PageDown: 'pagedown', Insert: 'insert', Backquote: '`', Minus: '-', Equal: '=',
-    BracketLeft: '[', BracketRight: ']', Backslash: '\\', Semicolon: ';', Quote: "'",
-    Comma: ',', Period: '.', Slash: '/', NumpadAdd: 'add', NumpadSubtract: 'subtract',
-    NumpadMultiply: 'multiply', NumpadDivide: 'divide', NumpadDecimal: 'decimal',
-    NumpadEnter: 'enter', PrintScreen: 'printscreen', ScrollLock: 'scrolllock', Pause: 'pause'
-  };
-  if (named[code]) return named[code];
-  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
-  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
-  if (/^Numpad[0-9]$/.test(code)) return `numpad_${code.slice(6)}`;
-  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code.toLowerCase();
-  const key = String(event.key || '').toLowerCase();
-  if (/^[a-z0-9]$/.test(key)) return key;
-  return null;
+function inputReady() {
+  return Boolean(inputBackend && inputBackend.ready);
 }
 
 function injectInput(event) {
-  // Input only runs on a live, host-approved session and can be revoked by the host UI.
-  if (!robot || !activeSocket || !inputAllowed || !event || typeof event !== 'object') return { ok: false, reason: 'Control is not enabled.' };
+  // Input only runs on a live session whose control permission is on, and the host can revoke it at any time.
+  if (!inputReady() || !activeSocket || !inputAllowed || !event || typeof event !== 'object') return { ok: false, reason: 'Control is not enabled.' };
   try {
     if (event.kind === 'move') {
       const x = Math.max(0, Math.min(1, Number(event.x)));
       const y = Math.max(0, Math.min(1, Number(event.y)));
       if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false };
-      const size = robot.getScreenSize();
-      robot.moveMouse(Math.round(x * Math.max(0, size.width - 1)), Math.round(y * Math.max(0, size.height - 1)));
+      inputBackend.move(x, y);
     } else if (event.kind === 'mouse') {
-      const button = ({ 0: 'left', 1: 'middle', 2: 'right' })[Number(event.button)];
-      if (!button) return { ok: false };
-      if (event.action === 'down') {
-        robot.mouseToggle('down', button);
-        heldButtons.add(button);
-      } else if (event.action === 'up') {
-        robot.mouseToggle('up', button);
-        heldButtons.delete(button);
-      }
+      if (!inputBackend.mouse(Number(event.button), event.action)) return { ok: false };
     } else if (event.kind === 'wheel') {
-      // Preserve small high-resolution trackpad deltas instead of rounding them to zero.
-      wheelRemainderX += Math.max(-600, Math.min(600, Number(event.dx) || 0)) / 60;
-      wheelRemainderY += Math.max(-600, Math.min(600, Number(event.dy) || 0)) / 60;
-      const dx = Math.max(-10, Math.min(10, Math.trunc(wheelRemainderX)));
-      const dy = Math.max(-10, Math.min(10, Math.trunc(wheelRemainderY)));
-      wheelRemainderX -= dx;
-      wheelRemainderY -= dy;
-      if (dx || dy) robot.scrollMouse(dx, dy);
+      inputBackend.wheel(Math.max(-600, Math.min(600, Number(event.dx) || 0)), Math.max(-600, Math.min(600, Number(event.dy) || 0)));
     } else if (event.kind === 'key') {
-      const key = mapKey(event);
-      if (!key) return { ok: false, reason: 'Unsupported key.' };
-      if (event.action === 'down') {
-        robot.keyToggle(key, 'down');
-        heldKeys.add(key);
-      } else if (event.action === 'up') {
-        robot.keyToggle(key, 'up');
-        heldKeys.delete(key);
-      }
+      if (!inputBackend.key(event, event.action)) return { ok: false, reason: 'Unsupported key.' };
     } else if (event.kind === 'releaseAll') {
       clearNativeInput();
     }
@@ -478,6 +501,13 @@ function injectInput(event) {
 
 app.whenReady().then(async () => {
   persistentAccessCode = await loadSavedAccessCode();
+  await loadSettings();
+  inputBackend = createInputBackend({
+    resourcesPath: process.resourcesPath,
+    userDataPath: app.getPath('userData'),
+    devHelperDir: __dirname,
+    onStatus: (status) => sendToUI('input-status', status)
+  });
   session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
     try {
       const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 160, height: 100 } });
@@ -518,8 +548,26 @@ app.whenReady().then(async () => {
       Boolean(process.env.WAYLAND_DISPLAY)
     ),
     ips: getLanIPv4(),
-    inputAvailable: Boolean(robot)
+    inputAvailable: inputAvailable(),
+    input: describeInput(),
+    macScreenAccess: process.platform === 'darwin' ? systemPreferences.getMediaAccessStatus('screen') : null,
+    macAccessibility: process.platform === 'darwin' ? systemPreferences.isTrustedAccessibilityClient(false) : null
   }));
+
+  ipcMain.handle('get-settings', () => ({ autoAccept: settings.autoAccept, minCodeLength: AUTO_CONTROL_MIN_CODE, codeLength: persistentAccessCode ? persistentAccessCode.length : 0 }));
+
+  ipcMain.handle('save-settings', async (_event, value) => {
+    const next = value && typeof value === 'object' ? value.autoAccept : null;
+    if (!['off', 'view', 'control'].includes(next)) return { ok: false, error: 'Unknown option.' };
+    if (next !== 'off') {
+      if (!persistentAccessCode) return { ok: false, error: 'Save an access code first.' };
+      if (persistentAccessCode.length < AUTO_CONTROL_MIN_CODE) return { ok: false, error: `Connecting without approval needs an access code of at least ${AUTO_CONTROL_MIN_CODE} characters. Yours has ${persistentAccessCode.length}.` };
+    }
+    if (next === 'control' && !inputAvailable()) return { ok: false, error: describeInput().message || 'Remote control is not available on this PC.' };
+    settings.autoAccept = next;
+    try { await persistSettings(); } catch (error) { return { ok: false, error: `Could not save the setting: ${error.message}` }; }
+    return { ok: true, autoAccept: settings.autoAccept };
+  });
 
   ipcMain.handle('get-sources', async () => {
     try {
@@ -570,24 +618,7 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('host-start', async () => startHost());
   ipcMain.handle('host-stop', () => stopHost());
-  ipcMain.handle('host-resolve-join', (_event, mode) => {
-    if (!pendingSocket || pendingSocket.readyState !== WebSocket.OPEN) return { ok: false };
-    if (!['view', 'control', 'reject'].includes(mode)) return { ok: false };
-    const socket = pendingSocket;
-    pendingSocket = null;
-    if (mode === 'reject') {
-      sendSocket(socket, { type: 'rejected', reason: 'The request was declined on the host.' });
-      try { socket.close(); } catch {}
-      activePeer = null;
-      sendToUI('incoming-cancelled', {});
-      return { ok: true };
-    }
-    activeSocket = socket;
-    inputAllowed = mode === 'control' && Boolean(robot);
-    sendSocket(activeSocket, { type: 'accepted', mode: inputAllowed ? 'control' : 'view', hostName: os.hostname() });
-    sendToUI('peer-accepted', { peer: activePeer, mode: inputAllowed ? 'control' : 'view', inputAvailable: Boolean(robot) });
-    return { ok: true, mode: inputAllowed ? 'control' : 'view' };
-  });
+  ipcMain.handle('host-resolve-join', (_event, mode) => resolvePending(mode, false));
   ipcMain.handle('host-end-peer', (_event, reason) => {
     if (activeSocket) closePeer(typeof reason === 'string' ? reason.slice(0, 160) : 'The host ended the session.');
     return { ok: true };
@@ -601,13 +632,13 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('set-input-allowed', (_event, allowed) => {
     const hasLivePeer = Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
-    inputAllowed = Boolean(allowed && robot && hasLivePeer);
+    inputAllowed = Boolean(allowed && inputAvailable() && hasLivePeer);
     if (!inputAllowed) clearNativeInput();
     if (hasLivePeer) {
       sendSocket(activeSocket, { type: 'control-mode', allowed: inputAllowed });
-      sendToUI('input-mode-changed', { allowed: inputAllowed, inputAvailable: Boolean(robot) });
+      sendToUI('input-mode-changed', { allowed: inputAllowed, inputAvailable: inputAvailable() });
     }
-    return { allowed: inputAllowed, inputAvailable: Boolean(robot) };
+    return { allowed: inputAllowed, inputAvailable: inputAvailable() };
   });
   ipcMain.handle('inject-input', (_event, event) => injectInput(event));
 

@@ -3,135 +3,185 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self' ws: wss:;">
-  <title>mswnlink — Local remote desktop</title>
+  <title>mswnlink</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="app-shell">
-    <aside class="sidebar">
-      <div class="brand-lockup">
-        <div class="brand-mark"><span></span><span></span><span></span><span></span></div>
-        <div class="brand-name">mswn<span>link</span><small>LOCAL REMOTE DESKTOP</small></div>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="6" width="11" height="11" rx="3.5"/><rect x="10.5" y="7" width="11" height="11" rx="3.5"/></svg>
+        <span class="brand-name">mswnlink</span>
       </div>
-
-      <div class="nav-caption">WORKSPACE</div>
-      <nav class="nav-list" aria-label="Main navigation">
-        <button class="nav-item active" data-page="connect" type="button"><span class="nav-icon">↗</span><span>Connect</span><span class="nav-end">01</span></button>
-        <button class="nav-item" data-page="share" type="button"><span class="nav-icon">▣</span><span>Share this PC</span><span class="nav-end">02</span></button>
+      <nav class="tabs" aria-label="Main">
+        <button class="tab active" data-page="connect" type="button">Connect</button>
+        <button class="tab" data-page="share" type="button">Share this PC</button>
       </nav>
+      <div class="device"><span class="device-dot"></span><span id="sidebar-device-name">This device</span></div>
+    </header>
 
-      <div class="sidebar-fill"></div>
-      <div class="local-card">
-        <div class="local-card-top"><span class="pulse-dot"></span><span>PRIVATE NETWORK</span></div>
-        <p>Direct connection.<br>No cloud relay.</p>
-        <div class="tiny-lock"><span>◇</span> Your session stays on the LAN</div>
-      </div>
-      <div class="sidebar-footer"><div class="status-avatar">LL</div><div><strong id="sidebar-device-name">This device</strong><span>Ready when you are</span></div><span class="online-dot"></span></div>
-    </aside>
+    <main class="content">
+      <!-- Connect -->
+      <section class="page page-active" id="page-connect">
+        <div class="narrow">
+          <h1>Connect to another computer</h1>
+          <p class="lead">Enter the address and access code shown on the computer you want to use.</p>
 
-    <div class="main-area">
-      <header class="topbar">
-        <div class="breadcrumb"><span>WORKSPACE</span><i>/</i><strong id="breadcrumb-current">CONNECT</strong></div>
-        <div class="topbar-right"><div class="lan-indicator"><span class="pulse-dot"></span> LAN ONLY</div><div class="topbar-divider"></div><div class="avatar-small" id="top-avatar">LL</div></div>
-      </header>
-
-      <main class="content">
-        <section class="page page-active" id="page-connect">
-          <div class="page-heading">
-            <div class="eyebrow"><span class="eyebrow-line"></span> YOUR DEVICES, TOGETHER</div>
-            <h1>Connect without<br><em>the distance.</em></h1>
-            <p class="lead">Reach another desktop on your local network. Fast, direct, and always under your control.</p>
-          </div>
-
-          <div class="connect-layout">
-            <section class="panel connect-panel">
-              <div class="panel-heading"><div class="panel-icon purple">↗</div><div><h2>Connect to a device</h2><p>Enter the details shown on the computer you want to access.</p></div></div>
-              <form id="connect-form" autocomplete="off">
-                <label for="host-address">DEVICE ADDRESS</label>
-                <div class="input-wrap address-wrap"><span class="input-prefix">⌘</span><input id="host-address" name="host-address" placeholder="192.168.1.42" required spellcheck="false" autocomplete="off"><span class="input-suffix">LAN</span></div>
-                <div class="field-hint">Use the IP address shown in mswnlink on the remote PC.</div>
-
-                <label for="pairing-code">PERMANENT ACCESS CODE</label>
-                <div class="pin-input-wrap"><input id="pairing-code" name="pairing-code" type="password" minlength="8" maxlength="64" placeholder="Enter the saved access code" required spellcheck="false" autocomplete="current-password"><button class="pin-lock code-toggle-button" id="toggle-connect-code" type="button" aria-label="Show access code">Show</button></div>
-                <div class="field-hint">The same code stays on the host until its owner changes it. Every connection still needs host approval.</div>
-
-                <div class="form-error" id="connect-error" role="alert" hidden></div>
-                <button class="button button-primary button-full" id="connect-button" type="submit"><span>Connect to desktop</span><span class="button-arrow">↗</span></button>
-              </form>
-              <div class="panel-footnote"><span class="shield-icon">◇</span><span>Screen and input are shared only after the other computer approves.</span></div>
-            </section>
-
-            <aside class="right-rail">
-              <section class="panel network-panel">
-                <div class="network-orbit"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="orbit-core"><div class="brand-mark mini"><span></span><span></span><span></span><span></span></div></div><div class="orbit-node node-a"></div><div class="orbit-node node-b"></div><div class="orbit-node node-c"></div></div>
-                <div class="network-panel-copy"><div class="eyebrow muted">BUILT FOR YOUR LAN</div><h3>Close by.<br><em>Far more capable.</em></h3><p>mswnlink connects devices directly on your network. Your desktop stream doesn't pass through a public cloud server.</p></div>
-                <div class="mini-metrics"><div><strong>01</strong><span>Pair</span></div><div><strong>02</strong><span>Approve</span></div><div><strong>03</strong><span>Connect</span></div></div>
-              </section>
-              <section class="tip-row"><div class="tip-symbol">i</div><div><strong>First time here?</strong><p>Open <button class="text-button" data-page="share" type="button">Share this PC</button> on the other device to get its LAN address and permanent access code.</p></div></section>
-            </aside>
-          </div>
-          <div class="page-bottom"><span>BUILT FOR PRIVATE NETWORKS</span><span>NO ACCOUNT · NO CLOUD RELAY · NO TRACKING</span></div>
-        </section>
-
-        <section class="page" id="page-share">
-          <div class="page-heading compact-heading">
-            <div class="eyebrow"><span class="eyebrow-line"></span> SHARE THIS DEVICE</div>
-            <h1>Make this desktop<br><em>available to your LAN.</em></h1>
-            <p class="lead">Choose a display, tune the stream, then share your LAN address and permanent access code.</p>
-          </div>
-
-          <div class="share-layout">
-            <section class="panel share-main-panel">
-              <div class="panel-heading"><div class="panel-icon green">▣</div><div><h2>Your screen</h2><p>Choose which display mswnlink can share.</p></div><span class="status-pill" id="share-status-pill"><span class="status-pill-dot"></span> NOT SHARING</span></div>
-              <div class="source-grid" id="source-grid"><div class="source-loading"><span class="spinner"></span> Looking for displays…</div></div>
-              <div class="share-quality-row">
-                <div class="share-quality-copy"><strong>Stream quality</strong><span>Choose the balance that feels best on your LAN.</span></div>
-                <select id="share-quality" aria-label="Screen sharing quality">
-                  <option value="balanced">Balanced · 1080p / 30 FPS</option>
-                  <option value="smooth">Smooth · up to 60 FPS</option>
-                  <option value="sharp">Sharper · up to 1440p</option>
-                </select>
+          <form class="card form" id="connect-form" autocomplete="off">
+            <div class="field">
+              <label for="host-address">Computer address</label>
+              <input id="host-address" name="host-address" placeholder="192.168.1.42" required spellcheck="false" autocomplete="off" inputmode="url">
+              <p class="hint">You can find it on the other computer under Share this PC.</p>
+            </div>
+            <div class="field">
+              <label for="pairing-code">Access code</label>
+              <div class="input-row">
+                <input id="pairing-code" name="pairing-code" type="password" minlength="8" maxlength="64" placeholder="The code set on that computer" required spellcheck="false" autocomplete="current-password">
+                <button class="link-button code-toggle-button" id="toggle-connect-code" type="button" aria-label="Show access code">Show</button>
               </div>
-              <div class="share-actions"><div class="share-note"><span class="small-check">✓</span><span>Sharing is visible and can be stopped at any time.</span></div><button class="button button-green" id="share-toggle" type="button"><span id="share-toggle-label">Start sharing</span><span class="button-arrow">↗</span></button></div>
-              <div class="active-peer-bar" id="active-peer-bar" hidden><div class="active-peer-avatar">↔</div><div class="active-peer-copy"><strong id="active-peer-name">Connected device</strong><span id="active-peer-detail">View-only session</span></div><button class="button button-quiet peer-control-toggle" id="toggle-host-control" type="button">Allow control</button><button class="button button-danger peer-disconnect" id="end-host-peer" type="button">Disconnect</button></div>
-              <div class="host-error" id="share-error" role="alert" hidden></div>
-            </section>
+            </div>
+            <div class="notice notice-error" id="connect-error" role="alert" hidden></div>
+            <button class="button primary wide" id="connect-button" type="submit"><span>Connect</span></button>
+          </form>
+          <p class="footnote">Connections stay on your local network. Nothing goes through the internet.</p>
+        </div>
+      </section>
 
-            <aside class="panel share-code-panel">
-              <div class="code-panel-heading"><div class="panel-icon violet">⌁</div><div><h2>Permanent access code</h2><p>Choose it once. It stays the same until you change it.</p></div></div>
-              <div class="pairing-placeholder" id="pairing-placeholder"><div class="placeholder-lock">⌑</div><strong>Set your access code</strong><span>Choose a code below before starting screen sharing.</span></div>
-              <div class="pairing-active" id="pairing-active" hidden>
-                <div class="detail-label">THIS DEVICE'S ADDRESS</div><div class="ip-list" id="host-ip-list"></div>
-                <div class="detail-label code-label">PERMANENT ACCESS CODE</div>
-                <div class="host-code-row"><div class="code-display" id="host-pairing-code"></div><button class="copy-small copy-host-code" id="copy-host-code" type="button" title="Copy permanent access code" aria-label="Copy permanent access code">⧉</button></div>
-                <div class="code-foot"><span class="pulse-dot"></span><span>Saved on this PC. It does not rotate between sessions.</span></div>
-              </div>
-              <div class="permanent-code-editor">
-                <label for="persistent-access-code">SET OR CHANGE YOUR CODE</label>
-                <div class="permanent-code-input-wrap"><input id="persistent-access-code" type="password" minlength="8" maxlength="64" autocomplete="new-password" placeholder="Create a code · 8–64 characters" spellcheck="false"><button class="code-toggle-button" id="toggle-access-code-visibility" type="button" aria-label="Show passcode">Show</button></div>
-                <div class="permanent-code-actions"><button class="button button-quiet" id="save-access-code" type="button">Save permanent code</button><span id="access-code-status" role="status" aria-live="polite">Not configured yet.</span></div>
-                <p class="access-code-hint">Your code is stored using your operating system's secure storage. Use a strong passphrase and share it only with trusted people.</p>
-              </div>
-              <div class="share-warning"><span class="warning-icon">!</span><p><strong>Stay in control.</strong> Each incoming request needs your approval. You choose view-only or mouse and keyboard control.</p></div>
-            </aside>
+      <!-- Share -->
+      <section class="page" id="page-share">
+        <div class="narrow wide-ish">
+          <div class="title-row">
+            <div>
+              <h1>Share this PC</h1>
+              <p class="lead">Let a trusted computer on your network view and control this one.</p>
+            </div>
+            <span class="status-pill" id="share-status-pill"><span class="status-pill-dot"></span>Not sharing</span>
           </div>
-          <div class="page-bottom"><span>LOCAL NETWORK MODE</span><span>CONTROL PERMISSION IS OFF UNTIL YOU APPROVE IT</span></div>
-        </section>
 
-        <section class="page session-page" id="page-session">
-          <div class="session-header"><div class="session-title-wrap"><button class="back-button" id="back-from-session" type="button" aria-label="Back">←</button><div><div class="eyebrow muted">ACTIVE SESSION</div><h2 id="session-device-name">Remote desktop</h2></div></div><div class="session-header-actions"><span class="connection-pill" id="session-state"><span class="pulse-dot"></span> CONNECTING</span><button class="button button-quiet" id="fullscreen-button" type="button">⛶ Full screen</button><button class="button button-danger" id="disconnect-button" type="button">End session <span>×</span></button></div></div>
-          <div class="viewer-shell" id="viewer-shell"><div class="viewer-topline"><span><i class="viewer-dot"></i> LIVE DESKTOP</span><span id="viewer-resolution">Waiting for video…</span></div><div class="viewer-stage" id="viewer-stage"><video id="remote-video" autoplay playsinline tabindex="0" aria-label="Remote desktop video"></video><div class="viewer-placeholder" id="viewer-placeholder"><div class="viewer-loader"></div><strong>Connecting to the desktop</strong><span>Negotiating a direct connection on your local network…</span></div></div><button class="fullscreen-exit-overlay" id="fullscreen-exit-overlay" type="button" aria-label="Exit full screen" title="Exit full screen (Esc)">⤢ Exit full screen</button><div class="viewer-toolbar"><div class="viewer-legend"><span class="toolbar-led"></span><span id="control-status-label">View-only session</span></div><div class="viewer-shortcuts">Click the screen to focus keyboard input <span>·</span> <kbd>Esc</kbd> exits full screen</div><button class="icon-button" id="copy-address-button" type="button" title="Copy remote address">⧉</button></div></div>
-          <div class="session-bottom-grid"><div class="session-info-card"><span class="session-info-icon">◇</span><div><strong>Direct local connection</strong><p>Video is peer-to-peer over your LAN and encrypted by WebRTC.</p></div></div><div class="session-info-card"><span class="session-info-icon green">⌨</span><div><strong id="session-permission-title">View-only access</strong><p id="session-permission-copy">The host decides whether mouse and keyboard control is allowed.</p></div></div></div>
-          <div class="page-bottom"><span>MSWNLINK REMOTE VIEW</span><span id="session-footer-status">LOCAL NETWORK SESSION</span></div>
-        </section>
-      </main>
-    </div>
+          <div class="card ready-card" id="pairing-active" hidden>
+            <h2>Ready to connect</h2>
+            <p class="muted">On the other computer, open Connect and enter:</p>
+            <div class="kv">
+              <span class="kv-label">Address</span>
+              <div class="kv-value" id="host-ip-list"></div>
+            </div>
+            <div class="kv">
+              <span class="kv-label">Access code</span>
+              <div class="kv-value">
+                <div class="ip-row"><code id="host-pairing-code"></code><button class="copy-small" id="copy-host-code" type="button" title="Copy access code" aria-label="Copy access code">Copy</button></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card peer-card" id="active-peer-bar" hidden>
+            <div class="peer-info">
+              <strong id="active-peer-name">Connected device</strong>
+              <span id="active-peer-detail">View-only session</span>
+            </div>
+            <div class="peer-actions">
+              <button class="button" id="toggle-host-control" type="button">Allow control</button>
+              <button class="button danger" id="end-host-peer" type="button">Disconnect</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Screen</h2>
+            <div class="source-grid" id="source-grid"><div class="source-loading"><span class="spinner"></span>Looking for displays…</div></div>
+            <div class="row">
+              <label for="share-quality">Quality</label>
+              <select id="share-quality" aria-label="Screen sharing quality">
+                <option value="balanced">Balanced · 1080p, 30 fps</option>
+                <option value="smooth">Smooth · 1080p, up to 60 fps</option>
+                <option value="sharp">Sharper · up to 1440p</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Access code</h2>
+            <p class="muted" id="pairing-placeholder"><strong>Set your access code</strong> <span>Choose a code before you start sharing.</span></p>
+            <div class="field">
+              <label for="persistent-access-code">Code (8–64 characters)</label>
+              <div class="input-row">
+                <input id="persistent-access-code" type="password" minlength="8" maxlength="64" autocomplete="new-password" placeholder="Create a code" spellcheck="false">
+                <button class="link-button code-toggle-button" id="toggle-access-code-visibility" type="button" aria-label="Show passcode">Show</button>
+              </div>
+            </div>
+            <div class="row">
+              <button class="button" id="save-access-code" type="button">Save code</button>
+              <span class="status-text" id="access-code-status" role="status" aria-live="polite">Not saved yet.</span>
+            </div>
+          </div>
+
+          <div class="card">
+            <h2>Who can connect</h2>
+            <div class="field">
+              <label for="auto-accept">When someone enters the correct code</label>
+              <select id="auto-accept">
+                <option value="off">Ask me each time</option>
+                <option value="view">Connect automatically, view only</option>
+                <option value="control">Connect automatically, with full control</option>
+              </select>
+            </div>
+            <p class="hint" id="auto-accept-note">You choose view-only or control for every request.</p>
+          </div>
+
+          <div class="notice notice-error" id="share-error" role="alert" hidden></div>
+
+          <div class="action-bar">
+            <p class="status-text" id="input-status"></p>
+            <button class="button primary" id="share-toggle" type="button"><span id="share-toggle-label">Start sharing</span></button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Session -->
+      <section class="page session-page" id="page-session">
+        <div class="session-header">
+          <div class="session-title">
+            <button class="icon-button" id="back-from-session" type="button" aria-label="End session and go back">←</button>
+            <h2 id="session-device-name">Remote desktop</h2>
+            <span class="status-pill" id="session-state"><span class="status-pill-dot"></span>Connecting</span>
+          </div>
+          <div class="session-actions">
+            <button class="button" id="fullscreen-button" type="button">Full screen</button>
+            <button class="button danger" id="disconnect-button" type="button">End session</button>
+          </div>
+        </div>
+
+        <div class="viewer-shell" id="viewer-shell">
+          <div class="viewer-stage" id="viewer-stage">
+            <video id="remote-video" autoplay playsinline tabindex="0" aria-label="Remote desktop video"></video>
+            <div class="viewer-placeholder" id="viewer-placeholder"><div class="viewer-loader"></div><strong>Connecting</strong><span>Setting up a direct link on your network…</span></div>
+          </div>
+          <button class="fullscreen-exit-overlay" id="fullscreen-exit-overlay" type="button" aria-label="Exit full screen" title="Exit full screen (Esc)">Exit full screen</button>
+          <div class="viewer-toolbar">
+            <span class="viewer-legend"><span class="toolbar-led"></span><span id="control-status-label">View-only session</span></span>
+            <span class="viewer-hint">Click the screen to send keys. Press Esc to leave full screen.</span>
+            <span class="viewer-resolution" id="viewer-resolution">Waiting for video…</span>
+            <button class="link-button" id="copy-address-button" type="button" title="Copy remote address">Copy address</button>
+          </div>
+        </div>
+        <p class="session-note"><strong id="session-permission-title">View-only access</strong> <span id="session-permission-copy">The host decides whether mouse and keyboard control is allowed.</span></p>
+      </section>
+    </main>
   </div>
 
   <div class="modal-backdrop" id="incoming-modal" hidden>
     <section class="modal-card" role="dialog" aria-modal="true" aria-labelledby="incoming-title">
-      <div class="modal-glow"></div><div class="modal-icon">↗</div><div class="eyebrow"><span class="eyebrow-line"></span> INCOMING CONNECTION</div><h2 id="incoming-title">Someone wants to<br><em>connect to your desktop.</em></h2><div class="request-device"><div class="request-device-avatar" id="request-avatar">PC</div><div><strong id="request-device-name">Another device</strong><span id="request-device-ip">192.168.1.10</span></div><span class="request-live-dot"></span></div><p class="modal-explainer">Choose what this device is allowed to do. You can disconnect at any time.</p><div class="permission-options"><button class="permission-option" id="accept-view" type="button"><span class="permission-option-icon">◉</span><span><strong>View only</strong><small>Share your screen, no input control</small></span><span class="option-arrow">→</span></button><button class="permission-option permission-control" id="accept-control" type="button"><span class="permission-option-icon">⌨</span><span><strong>Allow control</strong><small>Share screen and allow mouse + keyboard</small></span><span class="option-arrow">→</span></button></div><button class="modal-reject" id="reject-connection" type="button">Decline request</button>
+      <h2 id="incoming-title">Someone wants to connect</h2>
+      <div class="request-device">
+        <div class="request-device-avatar" id="request-avatar">PC</div>
+        <div><strong id="request-device-name">Another device</strong><span id="request-device-ip">192.168.1.10</span></div>
+      </div>
+      <p class="muted">They entered the correct access code. Choose what they can do.</p>
+      <div class="permission-options">
+        <button class="permission-option" id="accept-view" type="button"><strong>View only</strong><small>They see your screen but can’t control it.</small></button>
+        <button class="permission-option" id="accept-control" type="button"><strong>Allow control</strong><small>They see your screen and use your mouse and keyboard.</small></button>
+      </div>
+      <button class="link-button modal-reject" id="reject-connection" type="button">Decline</button>
     </section>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>

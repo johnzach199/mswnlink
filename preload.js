@@ -10,12 +10,15 @@ const allowedEvents = new Set([
   'peer-disconnected',
   'host-stopped',
   'host-error',
-  'input-mode-changed'
+  'input-mode-changed',
+  'input-status'
 ]);
 
 contextBridge.exposeInMainWorld('lanAPI', {
   deviceInfo: () => ipcRenderer.invoke('device-info'),
   getAccessCode: () => ipcRenderer.invoke('get-access-code'),
+  getSettings: () => ipcRenderer.invoke('get-settings'),
+  saveSettings: (settings) => ipcRenderer.invoke('save-settings', settings),
   saveAccessCode: (code) => ipcRenderer.invoke('save-access-code', code),
   getSources: () => ipcRenderer.invoke('get-sources'),
   chooseSource: (id) => ipcRenderer.invoke('choose-source', id),
