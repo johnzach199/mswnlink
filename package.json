@@ -1,6 +1,6 @@
 {
   "name": "mswnlink",
-  "version": "0.1.0",
+  "version": "0.2.2",
   "description": "A simple local-network remote desktop with optional unattended access.",
   "main": "main.js",
   "author": "mswnlink contributors",
@@ -62,14 +62,12 @@
       "category": "public.app-category.utilities",
       "artifactName": "mswnlink-macos-${version}-${arch}.${ext}",
       "hardenedRuntime": true,
-      "notarize": true,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.inherit.plist",
       "extendInfo": {
         "NSScreenCaptureUsageDescription": "mswnlink shares your desktop with a device on your local network when you start a session.",
         "NSAccessibilityUsageDescription": "mswnlink uses accessibility input permissions to send mouse and keyboard events during an authorized remote-control session."
       },
-      "forceCodeSigning": true,
       "icon": "assets/mswnlink.icns"
     },
     "linux": {

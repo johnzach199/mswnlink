@@ -62,11 +62,19 @@ try {
 }
 
 function createWindow() {
+  // Size the initial window to the available work area. The UI has compact
+  // layouts down to small windows, so low-resolution displays are not clipped.
+  const workArea = screen.getPrimaryDisplay().workAreaSize;
+  const minWindowWidth = Math.min(520, Math.max(360, workArea.width - 24));
+  const minWindowHeight = Math.min(440, Math.max(320, workArea.height - 24));
+  const initialWidth = Math.min(1240, Math.max(minWindowWidth, workArea.width - 32));
+  const initialHeight = Math.min(820, Math.max(minWindowHeight, workArea.height - 32));
+
   mainWindow = new BrowserWindow({
-    width: 1240,
-    height: 820,
-    minWidth: 980,
-    minHeight: 680,
+    width: initialWidth,
+    height: initialHeight,
+    minWidth: minWindowWidth,
+    minHeight: minWindowHeight,
     backgroundColor: '#f6f8fb',
     title: 'mswnlink',
     // Replace the native title bar and default File/Edit/View menu with the

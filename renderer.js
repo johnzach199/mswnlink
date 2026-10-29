@@ -87,7 +87,7 @@ function applyTheme(theme, persist = false) {
 }
 
 function initializeTheme() {
-  let savedTheme = 'light';
+  let savedTheme = 'dark';
   try {
     const saved = localStorage.getItem(THEME_STORAGE_KEY);
     if (saved === 'dark' || saved === 'light') savedTheme = saved;
@@ -106,11 +106,57 @@ function initializeTheme() {
   }
 }
 
-function setPage(name) {
-  Object.entries(pages).forEach(([key, page]) => page.classList.toggle('page-active', key === name));
-  $$('.nav-item').forEach((button) => button.classList.toggle('active', button.dataset.page === (name === 'session' ? 'connect' : name)));
-  $('#breadcrumb-current').textContent = name === 'share' ? 'SHARE THIS PC' : name === 'session' ? 'ACTIVE SESSION' : 'CONNECT';
-  if (name === 'share') refreshSources();
+function setPage(name, options = {}) {
+  if (!Object.prototype.hasOwnProperty.call(pages, name)) {
+    console.warn(`[mswnlink] Ignoring unknown page: ${String(name)}`);
+    return false;
+  }
+
+  Object.entries(pages).forEach(([key, page]) => {
+    const active = key === name;
+    // Update both the class and the native hidden state. The class drives the
+    // transition styling; hidden/aria-hidden keep the result deterministic if
+    // other responsive CSS or an early init error affects layout.
+    page.classList.toggle('page-active', active);
+    page.hidden = !active;
+    page.setAttribute('aria-hidden', String(!active));
+  });
+  $$('.nav-item[data-page]').forEach((button) => {
+    const active = button.dataset.page === (name === 'session' ? 'connect' : name);
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-current', active ? 'page' : 'false');
+  });
+  const breadcrumb = $('#breadcrumb-current');
+  if (breadcrumb) breadcrumb.textContent = name === 'share' ? 'SHARE THIS PC' : name === 'session' ? 'ACTIVE SESSION' : 'CONNECT';
+  document.body.dataset.currentPage = name;
+  if (name === 'share' && options.refreshSources !== false) {
+    // Navigation must not fail merely because screen-source enumeration is
+    // unavailable (e.g. before a portal permission prompt on Linux).
+    Promise.resolve().then(() => refreshSources()).catch((error) => {
+      console.warn('[mswnlink] Could not refresh share sources after navigation:', error);
+    });
+  }
+  return true;
+}
+
+function initializePageNavigation() {
+  // Bind navigation synchronously before initialize() awaits IPC settings.
+  // Otherwise a slow/missing OS permission API can leave the initial Connect
+  // page visible but the Share this PC button inert.
+  for (const button of $$('[data-page]')) {
+    if (button.dataset.navigationBound === 'true') continue;
+    button.dataset.navigationBound = 'true';
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      const pageName = button.dataset.page;
+      if (!Object.prototype.hasOwnProperty.call(pages, pageName)) return;
+      if (clientConnected && pages.session.classList.contains('page-active') && pageName !== 'session') {
+        showToast('End the active remote session before leaving the viewer.');
+        return;
+      }
+      setPage(pageName);
+    });
+  }
 }
 
 function showToast(message) {
@@ -839,6 +885,10 @@ function setViewerQuality(profile) {
 async function refreshSources() {
   sourceLoadError = '';
   const grid = $('#source-grid');
+  if (!grid) {
+    console.warn('[mswnlink] Share source grid is missing from index.html.');
+    return;
+  }
   grid.replaceChildren();
   const loading = document.createElement('div');
   loading.className = 'source-loading';
@@ -1741,23 +1791,15 @@ async function initialize() {
   }
   const name = friendlyDeviceName(deviceInfo.name);
   $('#sidebar-device-name').textContent = name;
-  $('#top-avatar').textContent = name.slice(0, 2).toUpperCase();
+  const topAvatar = $('#top-avatar');
+  if (topAvatar) topAvatar.textContent = name.slice(0, 2).toUpperCase();
   if (!deviceInfo.inputAvailable) {
     $('#accept-control').disabled = true;
     $('#accept-control').title = 'Native mouse/keyboard control backend is unavailable on this build.';
     $('#accept-control').querySelector('small').textContent = 'Control backend unavailable in this build';
   }
   updateUnattendedAccessUI(deviceInfo.inputAvailable);
-  for (const button of $$('[data-page]')) {
-    button.addEventListener('click', () => {
-      const pageName = button.dataset.page;
-      if (clientConnected && pageName !== 'session') {
-        showToast('End the active remote session before leaving the viewer.');
-        return;
-      }
-      setPage(pageName);
-    });
-  }
+  // Page navigation is bound synchronously by initializePageNavigation().
   $('#refresh-devices-button').addEventListener('click', refreshDiscoveredDevices);
   window.lanAPI.on('discovered-devices', renderDiscoveredDevices);
   window.lanAPI.on('local-features-changed', (features) => {
@@ -2071,6 +2113,19 @@ function syncWindowMaximizeButton(maximized) {
   button.setAttribute('aria-label', maximized ? 'Restore window' : 'Maximize window');
 }
 
+// Bind core navigation before touching IPC-backed integrations. If a window
+// control or OS settings IPC call fails during startup, Share this PC still
+// remains reachable instead of leaving the renderer stuck on Connect.
+initializePageNavigation();
+setPage('connect', { refreshSources: false });
 initializeTheme();
-initializeWindowChrome();
-initialize();
+try {
+  initializeWindowChrome();
+} catch (error) {
+  console.warn('[mswnlink] Native window controls could not initialize:', error);
+}
+initialize().catch((error) => {
+  console.error('[mswnlink] Renderer initialization failed:', error);
+  // The primary navigation remains usable even if an OS integration fails.
+  showToast(`Some device features could not initialize: ${error.message || error}`);
+});

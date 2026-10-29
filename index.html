@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,13 +7,9 @@
   <title>mswnlink — Local remote desktop</title>
   <link rel="stylesheet" href="styles.css">
 </head>
-<body data-theme="light">
+<body data-theme="dark">
   <div class="window-chrome" role="toolbar" aria-label="Application window controls">
     <div class="window-chrome-drag">
-      <div class="window-chrome-brand">
-        <div class="brand-mark mini" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
-        <strong>mswn<span>link</span></strong>
-      </div>
       <span class="window-chrome-caption">LOCAL REMOTE DESKTOP</span>
     </div>
     <div class="window-controls">
@@ -36,63 +32,45 @@
       </nav>
 
       <div class="sidebar-fill"></div>
-      <div class="local-card">
-        <div class="local-card-top"><span class="pulse-dot"></span><span>PRIVATE NETWORK</span></div>
-        <p>Direct connection.<br>No cloud relay.</p>
-        <div class="tiny-lock"><span>◇</span> Your session stays on the LAN</div>
-      </div>
-      <div class="sidebar-footer"><div class="status-avatar">LL</div><div><strong id="sidebar-device-name">This device</strong><span>Ready when you are</span></div><span class="online-dot"></span></div>
+      <div class="sidebar-footer"><div class="status-avatar">LL</div><div><strong id="sidebar-device-name">This device</strong><span>Local device</span></div><span class="online-dot"></span></div>
     </aside>
 
     <div class="main-area">
       <header class="topbar">
         <div class="breadcrumb"><span>WORKSPACE</span><i>/</i><strong id="breadcrumb-current">CONNECT</strong></div>
-        <div class="topbar-right"><button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch to dark mode" aria-pressed="false" title="Switch to dark mode"><span class="theme-toggle-icon" id="theme-toggle-icon" aria-hidden="true">☾</span><span id="theme-toggle-label">Dark mode</span></button><div class="lan-indicator"><span class="pulse-dot"></span> LAN ONLY</div><div class="topbar-divider"></div><div class="avatar-small" id="top-avatar">LL</div></div>
+        <div class="topbar-right"><button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch to light mode" aria-pressed="true" title="Switch to light mode"><span class="theme-toggle-icon" id="theme-toggle-icon" aria-hidden="true">☀</span><span id="theme-toggle-label">Light mode</span></button><div class="lan-indicator"><span class="pulse-dot"></span> LAN ONLY</div></div>
       </header>
 
       <main class="content">
         <section class="page page-active" id="page-connect">
-          <div class="page-heading">
-            <div class="eyebrow"><span class="eyebrow-line"></span> YOUR DEVICES, TOGETHER</div>
-            <h1>Connect without<br><em>the distance.</em></h1>
-            <p class="lead">Reach another desktop on your local network. Fast, direct, and always under your control.</p>
+          <div class="page-heading compact-connect-heading">
+            <h1>Connect to a computer</h1>
           </div>
 
           <div class="connect-layout">
             <section class="panel connect-panel">
-              <div class="panel-heading"><div class="panel-icon purple">↗</div><div><h2>Connect to a device</h2><p>Enter the details shown on the computer you want to access.</p></div></div>
+              <div class="panel-heading"><div class="panel-icon purple">↗</div><div><h2>Connect to a device</h2><p>Enter the host address and permanent access code.</p></div></div>
               <form id="connect-form" autocomplete="off">
                 <label for="host-address">DEVICE ADDRESS</label>
                 <div class="input-wrap address-wrap"><span class="input-prefix">⌘</span><input id="host-address" name="host-address" placeholder="192.168.1.42" required spellcheck="false" autocomplete="off"><span class="input-suffix">LAN</span></div>
-                <div class="field-hint">Use the IP address shown in mswnlink on the remote PC.</div>
+                <div class="field-hint">Shown under Share this PC on the host.</div>
 
                 <label for="pairing-code">PERMANENT ACCESS CODE</label>
                 <div class="pin-input-wrap"><input id="pairing-code" name="pairing-code" type="password" minlength="8" maxlength="64" placeholder="Enter the saved access code" required spellcheck="false" autocomplete="current-password"><button class="pin-lock code-toggle-button" id="toggle-connect-code" type="button" aria-label="Show access code">Show</button></div>
-                <div class="field-hint">The same code stays on the host until its owner changes it. Host approval is the default. The host can optionally enable unattended access below.</div>
+                <div class="field-hint">Use the permanent code configured on the host.</div>
 
                 <div class="form-error" id="connect-error" role="alert" hidden></div>
                 <button class="button button-primary button-full" id="connect-button" type="submit"><span>Connect to desktop</span><span class="button-arrow">↗</span></button>
               </form>
-              <div class="panel-footnote"><span class="shield-icon">◇</span><span>The host chooses between approval for every connection and password-based unattended access.</span></div>
             </section>
-
-            <aside class="right-rail">
-              <section class="panel network-panel">
-                <div class="network-orbit"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="orbit-core"><div class="brand-mark mini"><span></span><span></span><span></span><span></span></div></div><div class="orbit-node node-a"></div><div class="orbit-node node-b"></div><div class="orbit-node node-c"></div></div>
-                <div class="network-panel-copy"><div class="eyebrow muted">BUILT FOR YOUR LAN</div><h3>Close by.<br><em>Far more capable.</em></h3><p>mswnlink connects devices directly on your network. Your desktop stream doesn't pass through a public cloud server.</p></div>
-                <div class="mini-metrics"><div><strong>01</strong><span>Enter code</span></div><div><strong>02</strong><span>Verify</span></div><div><strong>03</strong><span>Connect</span></div></div>
-              </section>
-              <section class="tip-row"><div class="tip-symbol">i</div><div><strong>First time here?</strong><p>Open <button class="text-button" data-page="share" type="button">Share this PC</button> on the other device to get its LAN address and permanent access code.</p></div></section>
-            </aside>
           </div>
           <section class="panel devices-panel" aria-labelledby="devices-panel-title">
             <div class="devices-panel-head">
-              <div class="panel-heading"><div class="panel-icon green">⌘</div><div><h2 id="devices-panel-title">Devices on your LAN</h2><p>Nearby mswnlink computers appear here automatically.</p></div></div>
+              <div class="panel-heading"><div class="panel-icon green">⌘</div><div><h2 id="devices-panel-title">Devices on your LAN</h2><p>Computers available on this network.</p></div></div>
               <button class="button button-quiet" id="refresh-devices-button" type="button">↻ Refresh</button>
             </div>
             <div id="discovered-devices" class="discovered-devices" aria-live="polite"><div class="devices-empty"><span class="spinner"></span> Looking for nearby devices…</div></div>
           </section>
-          <div class="page-bottom"><span>BUILT FOR PRIVATE NETWORKS</span><span>NO ACCOUNT · NO CLOUD RELAY · NO TRACKING</span></div>
         </section>
 
         <section class="page" id="page-share">
