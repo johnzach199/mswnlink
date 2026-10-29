@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Optional existing/new Git tag to attach the completed installers to (for example v1.3)
+        description: "Optional release tag to attach trusted builds to (for example v0.2.2). Leave blank for test artifacts only."
         required: false
         type: string
   push:
@@ -12,13 +12,13 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   package:
-    name: Build ${{ matrix.label }}
+    name: Build mswnlink for ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 70
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
@@ -32,11 +32,10 @@ jobs:
           - os: macos-15-intel
             script: dist:mac
             label: macos-intel-x64
-            mac: true
           - os: macos-15
             script: dist:mac
             label: macos-apple-silicon-arm64
-            mac: true
+
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -44,25 +43,38 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '22.12.0'
+          # This project intentionally has no package-lock.json. Disable automatic
+          # npm cache setup so setup-node doesn't fail looking for a lockfile.
+          package-manager-cache: false
 
-      - name: Require macOS signing and notarization credentials
+      - name: Determine macOS signing mode
+        id: mac_sign_mode
         if: runner.os == 'macOS'
+        shell: bash
         env:
           MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        shell: bash
         run: |
+          set -euo pipefail
+          names=(MAC_CSC_LINK MAC_CSC_KEY_PASSWORD APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER)
+          present=0
           missing=()
-          for name in MAC_CSC_LINK MAC_CSC_KEY_PASSWORD APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER; do
-            if [ -z "${!name}" ]; then missing+=("$name"); fi
+          for name in "${names[@]}"; do
+            if [ -n "${!name}" ]; then present=$((present + 1)); else missing+=("$name"); fi
           done
-          if [ ${#missing[@]} -gt 0 ]; then
-            printf 'Missing GitHub Actions secrets for signed/notarized macOS builds: %s\n' "${missing[*]}"
-            echo 'Add the Apple Developer ID certificate and App Store Connect API-key secrets. Unsigned DMGs are expected to be reported as damaged by Gatekeeper.'
+          if [ "$present" -eq 5 ]; then
+            echo "mode=signed" >> "$GITHUB_OUTPUT"
+            echo "Apple signing and notarization credentials found."
+          elif [ "$present" -eq 0 ]; then
+            echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+            echo "::warning::No Apple signing secrets found. Producing an unsigned test DMG only; Gatekeeper may block it."
+          else
+            printf 'Partial Apple signing configuration. Missing: %s\n' "${missing[*]}" >&2
+            echo 'Configure all five Apple secrets, or remove all five to produce an unsigned test artifact.' >&2
             exit 1
           fi
 
@@ -70,19 +82,25 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential python3 libxtst-dev libx11-dev libxext-dev libpng-dev libpng++-dev
+          sudo apt-get install -y build-essential python3 make g++ pkg-config libxtst-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxkbfile-dev libxfixes-dev libxdamage-dev libxrender-dev libxi-dev libpng-dev libpng++-dev
+
+      - name: Print build environment
+        run: |
+          node --version
+          npm --version
+          node -p "process.platform + ' ' + process.arch"
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Build RobotJS input backend
+      - name: Check JavaScript
+        run: npm run check
+
+      - name: Build native input backend
         run: npm run rebuild:native
 
-      - name: Validate JavaScript and native input backend
-        shell: bash
-        run: |
-          npm run check
-          node -e "require('robotjs'); console.log('RobotJS input backend loaded')"
+      - name: Verify native input backend
+        run: node -e "const r=require('robotjs'); if (!r || typeof r.moveMouse !== 'function' || typeof r.keyTap !== 'function') process.exit(1); console.log('RobotJS native input backend loaded')"
 
       - name: Package standalone application
         run: npm run ${{ matrix.script }}
@@ -92,22 +110,41 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ runner.os == 'macOS' && steps.mac_sign_mode.outputs.mode == 'unsigned' && 'false' || 'true' }}
 
-      - name: Verify macOS code signature and notarization ticket
-        if: runner.os == 'macOS'
+      - name: Verify signed macOS app and notarization
+        if: runner.os == 'macOS' && steps.mac_sign_mode.outputs.mode == 'signed'
         shell: bash
         run: |
           set -euo pipefail
           APP_PATH="$(find release -type d -name '*.app' -print -quit)"
-          if [ -z "$APP_PATH" ]; then
-            echo "No .app bundle was produced; refusing to publish this macOS build." >&2
-            exit 1
-          fi
+          DMG_PATH="$(find release -type f -name '*.dmg' -print -quit)"
+          test -n "$APP_PATH" || { echo 'No .app bundle produced.' >&2; exit 1; }
+          test -n "$DMG_PATH" || { echo 'No DMG produced.' >&2; exit 1; }
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           spctl --assess --verbose=4 --type execute "$APP_PATH"
-          xcrun stapler validate "$APP_PATH"
+          xcrun stapler validate "$DMG_PATH"
 
-      - name: Upload standalone artifact
+      - name: Label unsigned macOS test artifact
+        if: runner.os == 'macOS' && steps.mac_sign_mode.outputs.mode == 'unsigned'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release/*.dmg)
+          if [ "${#files[@]}" -eq 0 ]; then echo 'No DMG produced.' >&2; exit 1; fi
+          for file in "${files[@]}"; do mv "$file" "${file%.dmg}-UNSIGNED-TEST-ONLY.dmg"; done
+          cat > release/UNSIGNED-MACOS-WARNING.txt <<'NOTICE'
+          UNSIGNED TEST BUILD — Apple code signing and notarization were not configured.
+          macOS Gatekeeper may block this app. Do not distribute this as a trusted public release.
+          Configure MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID and APPLE_API_ISSUER to produce a signed and notarized release.
+          NOTICE
+
+      - name: List generated output files
+        shell: bash
+        run: find release -maxdepth 2 -type f -printf '%p (%s bytes)\n' || ls -lah release
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: mswnlink-${{ matrix.label }}
@@ -115,11 +152,12 @@ jobs:
             release/*.AppImage
             release/*.exe
             release/*.dmg
+            release/UNSIGNED-MACOS-WARNING.txt
           if-no-files-found: error
           retention-days: 30
 
   publish-release:
-    name: Publish release assets
+    name: Publish release assets (unsigned Mac DMGs excluded)
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: package
     runs-on: ubuntu-latest
@@ -135,16 +173,41 @@ jobs:
         run: |
           if [ -n "$INPUT_TAG" ]; then echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"; else echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"; fi
 
-      - name: Download platform builds
+      - name: Download platform artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: mswnlink-*
           path: release-assets
           merge-multiple: true
 
-      - name: Publish GitHub Release
+      - name: Exclude unsigned macOS builds from public release
+        shell: bash
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          unsigned=(release-assets/*UNSIGNED-TEST-ONLY.dmg)
+          for file in "${unsigned[@]}"; do rm -f "$file"; done
+          rm -f release-assets/UNSIGNED-MACOS-WARNING.txt
+          if [ -n "${MAC_CSC_LINK}" ] && [ -n "${MAC_CSC_KEY_PASSWORD}" ] && [ -n "${APPLE_API_KEY}" ] && [ -n "${APPLE_API_KEY_ID}" ] && [ -n "${APPLE_API_ISSUER}" ]; then
+            echo 'Apple credentials are configured; signed/notarized macOS builds can be included if present.'
+          elif [ "${#unsigned[@]}" -gt 0 ]; then
+            echo 'Unsigned macOS DMGs have been removed from public release assets; they remain in workflow artifacts.'
+          fi
+          ls -lah release-assets
+          compgen -G 'release-assets/*.AppImage' >/dev/null || compgen -G 'release-assets/*.exe' >/dev/null || { echo 'No Linux or Windows release artifacts found.' >&2; exit 1; }
+
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: main
           files: release-assets/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
