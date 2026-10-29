@@ -57,7 +57,7 @@ const ALL_DISPLAY_ID = '__all_displays__';
 const pendingFileTransfers = new Map();
 const pendingClipboardRequests = new Map();
 const clipboardBaselineByChannel = new WeakMap();
-const CLIPBOARD_SYNC_INTERVAL_MS = 400;
+const CLIPBOARD_SYNC_INTERVAL_MS = 180;
 const CLIPBOARD_SYNC_MAX_CHARS = 1_000_000;
 const CLIPBOARD_FRAGMENT_CHARS = 4500;
 const incomingClipboardFragments = new Map();
@@ -329,9 +329,9 @@ function updateSessionFeatureUI() {
         ? 'Live clipboard sync active · files ready. Copy and paste normally on either PC.'
         : 'Live clipboard sync active · copy and paste normally on either PC.';
     } else if (fileEnabled && remoteFeaturePreferences.fileTransfer) {
-      status.textContent = 'File transfer ready. Enable clipboard on both PCs for instant copy/paste.';
+      status.textContent = 'File transfer ready. Enable live clipboard sync on both devices for instant copy/paste.';
     } else {
-      status.textContent = 'Enable clipboard on both PCs for instant copy/paste; files are optional.';
+      status.textContent = 'Live clipboard sync is off on one or both devices. Enable it on both to copy/paste normally.';
     }
   }
   updateShareUI();
@@ -1965,18 +1965,35 @@ function handlePointerMove(event) {
 
 function handleRemoteKey(event, action) {
   if (!clientConnected || !controlGranted || !pages.session.classList.contains('page-active')) return;
-  if (action === 'down' && event.repeat) return;
   const target = event.target;
   if (target && (target.isContentEditable || (target.closest && target.closest('input, textarea, select, [contenteditable="true"]')))) return;
-  // Escape must remain local so users can leave fullscreen. For the remote
-  // session, route normal keyboard input even if Linux/window-manager focus has
-  // shifted from the video to the viewer shell; this was causing keyboard
-  // control to silently stop after fullscreen/toolbar interactions.
+  // Escape must stay local so users can leave fullscreen. Keep Alt+Tab and
+  // Ctrl+Alt+Delete local as OS-level shortcuts that remote injection cannot
+  // safely override.
   if (event.key === 'Escape' || event.code === 'Escape') return;
-  // Never consume OS/window-manager shortcuts that cannot safely be forwarded.
   if ((event.altKey && event.code === 'Tab') || (event.ctrlKey && event.altKey && event.code === 'Delete')) return;
+  const key = String(event.key || '');
+  const printableAscii = key.length === 1 && /^[\x20-\x7e]$/.test(key);
+  const textInput = printableAscii && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey;
+  // Native held keys only need one keydown per press; printable text is sent
+  // character-wise on Windows, so preserve auto-repeat for held letters.
+  if (action === 'down' && event.repeat && !textInput) return;
   event.preventDefault();
-  sendInput({ kind: 'key', action, code: event.code, key: event.key });
+  const sent = sendInput({
+    kind: 'key', action, code: event.code, key,
+    textInput,
+    shiftKey: Boolean(event.shiftKey), ctrlKey: Boolean(event.ctrlKey),
+    altKey: Boolean(event.altKey), metaKey: Boolean(event.metaKey),
+    location: Number(event.location) || 0
+  });
+  if (!sent) console.debug('[mswnlink] Keyboard event was not sent; the remote data channel is not ready.');
+}
+
+function installRemoteKeyboardCapture() {
+  // Install once at renderer startup, not during each connection. This avoids
+  // lost/duplicated key handlers after reconnecting or recreating a peer.
+  window.addEventListener('keydown', event => handleRemoteKey(event, 'down'), true);
+  window.addEventListener('keyup', event => handleRemoteKey(event, 'up'), true);
 }
 
 function copyRemoteAddress() {
@@ -2264,11 +2281,6 @@ async function initialize() {
     sendInput({ kind: 'wheel', dx: event.deltaX, dy: event.deltaY });
   }, { passive: false });
   $('#remote-video').addEventListener('contextmenu', event => event.preventDefault());
-  // Capture-phase handlers keep ordinary typing/shortcuts from being consumed
-  // by app controls first, while the input guard in handleRemoteKey leaves form
-  // fields editable. This fixes lost keyboard events on Windows viewer windows.
-  window.addEventListener('keydown', event => handleRemoteKey(event, 'down'), true);
-  window.addEventListener('keyup', event => handleRemoteKey(event, 'up'), true);
   window.addEventListener('blur', releaseRemoteInput);
   window.addEventListener('pagehide', releaseRemoteInput);
   document.addEventListener('visibilitychange', () => { if (document.hidden) releaseRemoteInput(); });
@@ -2350,6 +2362,9 @@ function syncWindowMaximizeButton(maximized) {
   button.title = maximized ? 'Restore window' : 'Maximize window';
   button.setAttribute('aria-label', maximized ? 'Restore window' : 'Maximize window');
 }
+
+// Install keyboard forwarding once, independent of peer creation/reconnection.
+installRemoteKeyboardCapture();
 
 // Bind core navigation before touching IPC-backed integrations. If a window
 // control or OS settings IPC call fails during startup, Share this PC still

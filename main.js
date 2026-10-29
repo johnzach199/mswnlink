@@ -48,10 +48,40 @@ const localDeviceId = crypto.randomUUID();
 let discoverySocket = null;
 let discoveryTimer = null;
 const discoveredDevices = new Map();
-const localFeaturePreferences = { clipboard: false, fileTransfer: false, monitorSwitching: false };
+// Clipboard sync is enabled by default as requested; users can disable it in the UI.
+// Feature preferences are persisted so the settings survive app restarts.
+let localFeaturePreferences = { clipboard: true, fileTransfer: false, monitorSwitching: true };
 const incomingFileHandles = new Map();
 let viewerSessionActive = false;
 let sessionPowerSaveBlockerId = null;
+
+function featurePreferencesPath() {
+  return path.join(app.getPath('userData'), 'feature-preferences.json');
+}
+
+async function loadLocalFeaturePreferences() {
+  const defaults = { clipboard: true, fileTransfer: false, monitorSwitching: true };
+  try {
+    const raw = await fs.readFile(featurePreferencesPath(), 'utf8');
+    const stored = JSON.parse(raw);
+    for (const key of Object.keys(defaults)) {
+      if (typeof stored[key] === 'boolean') defaults[key] = stored[key];
+    }
+  } catch (error) {
+    if (!error || error.code !== 'ENOENT') {
+      console.warn('[mswnlink] Could not load feature preferences; using defaults:', error && error.message ? error.message : error);
+    }
+  }
+  localFeaturePreferences = defaults;
+}
+
+async function saveLocalFeaturePreferences() {
+  const filePath = featurePreferencesPath();
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.tmp-${process.pid}`;
+  await fs.writeFile(temporaryPath, JSON.stringify(localFeaturePreferences, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await fs.rename(temporaryPath, filePath);
+}
 
 try {
   // Use the native input backend when built for this Electron/OS combination.
@@ -762,8 +792,23 @@ async function injectInput(event) {
       wheelRemainderY -= dy;
       if (dx || dy) robot.scrollMouse(dx, dy);
     } else if (event.kind === 'key') {
+      // Windows remote typing is more reliable when printable, unmodified
+      // characters are emitted as characters: physical keycodes otherwise get
+      // interpreted using the host's keyboard layout (and can silently differ
+      // from the viewer's layout). Modifier shortcuts and non-printable keys
+      // still use keyToggle so Ctrl+C/V, arrows, function keys, and held keys
+      // retain their native down/up lifecycle.
+      if (process.platform === 'win32' && event.textInput === true) {
+        if (event.action === 'down') {
+          const character = String(event.key || '');
+          if (!/^[\x20-\x7e]$/.test(character)) return { ok: false, reason: 'Unsupported printable character.' };
+          if (typeof robot.typeString !== 'function') throw new Error('This Windows input backend does not support character injection. Rebuild the native RobotJS backend.');
+          robot.typeString(character);
+        }
+        return { ok: true };
+      }
       const key = mapKey(event);
-      if (!key) return { ok: false, reason: 'Unsupported key.' };
+      if (!key) return { ok: false, reason: `Unsupported keyboard key (${String(event.code || event.key || 'unknown')}).` };
       if (event.action === 'down') { robot.keyToggle(key, 'down'); heldKeys.add(key); }
       else if (event.action === 'up') { robot.keyToggle(key, 'up'); heldKeys.delete(key); }
     }
@@ -800,6 +845,7 @@ app.whenReady().then(async () => {
     return true;
   });
 
+  await loadLocalFeaturePreferences();
   persistentAccessCode = await loadSavedAccessCode();
   await loadUnattendedAccessSetting();
   waylandRestoreToken = await loadWaylandRestoreToken();
@@ -989,9 +1035,16 @@ app.whenReady().then(async () => {
     return getDiscoveredDevices();
   });
   ipcMain.handle('get-local-features', () => ({ ...localFeaturePreferences }));
-  ipcMain.handle('set-local-feature', (_event, feature, enabled) => {
+  ipcMain.handle('set-local-feature', async (_event, feature, enabled) => {
     if (!['clipboard', 'fileTransfer', 'monitorSwitching'].includes(feature)) return { ok: false, error: 'Unknown local sharing feature.' };
+    const previous = { ...localFeaturePreferences };
     localFeaturePreferences[feature] = Boolean(enabled);
+    try {
+      await saveLocalFeaturePreferences();
+    } catch (error) {
+      localFeaturePreferences = previous;
+      return { ok: false, error: error && error.message ? error.message : 'Could not save feature preferences.' };
+    }
     sendToUI('local-features-changed', { ...localFeaturePreferences });
     return { ok: true, features: { ...localFeaturePreferences } };
   });

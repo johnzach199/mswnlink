@@ -1,6 +1,6 @@
 {
   "name": "mswnlink",
-  "version": "0.2.4",
+  "version": "0.2.6",
   "description": "A simple local-network remote desktop with optional unattended access.",
   "main": "main.js",
   "author": "mswnlink contributors",
