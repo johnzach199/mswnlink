@@ -101,7 +101,7 @@ jobs:
         if: runner.os != 'macOS'
         run: npm run ${{ matrix.script }}
 
-      - name: Package macOS app (signed if possible, keep a labelled test DMG otherwise)
+      - name: Package macOS app (signed if possible; unsigned test DMG otherwise)
         id: package_macos
         if: runner.os == 'macOS'
         shell: bash
@@ -113,23 +113,57 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
+
           package_unsigned() {
             rm -rf release
             mkdir -p release
-            echo "Building unsigned test DMG with all signing variables explicitly cleared."
-            if ! env CSC_LINK='' CSC_KEY_PASSWORD='' APPLE_API_KEY='' APPLE_API_KEY_ID='' APPLE_API_ISSUER='' CSC_IDENTITY_AUTO_DISCOVERY=false npm run dist:mac; then
-              echo 'Unsigned macOS package step also failed; see electron-builder output above.' >&2
+            echo "Building unsigned test DMG with code signing explicitly disabled."
+
+            # IMPORTANT: don't set CSC_LINK='' — some electron-builder versions resolve
+            # an empty certificate path to the current workspace directory, causing
+            # errors such as '/Users/runner/work/mswnlink/mswnlink not a file'.
+            local package_backup
+            package_backup="$(mktemp)" || return 1
+            cp package.json "$package_backup" || { rm -f "$package_backup"; return 1; }
+
+            if ! node -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync("package.json","utf8")); p.build=p.build||{}; p.build.mac=p.build.mac||{}; p.build.mac.identity=null; p.build.mac.hardenedRuntime=false; delete p.build.mac.notarize; fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n");'; then
+              cp "$package_backup" package.json
+              rm -f "$package_backup"
+              echo 'Could not apply unsigned macOS build configuration.' >&2
               return 1
             fi
+
+            unset CSC_LINK CSC_KEY_PASSWORD CSC_NAME CSC_INSTALLER_LINK CSC_INSTALLER_KEY_PASSWORD
+            unset MAC_CSC_LINK MAC_CSC_KEY_PASSWORD
+            unset APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER APPLE_PASSWORD APPLE_ID APPLE_TEAM_ID
+            unset CSC_IDENTITY_AUTO_DISCOVERY
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+
+            local build_status=0
+            if npm run dist:mac; then
+              build_status=0
+            else
+              build_status=$?
+            fi
+            cp "$package_backup" package.json
+            rm -f "$package_backup"
+            if [ "$build_status" -ne 0 ]; then
+              echo 'Unsigned macOS package step failed; see electron-builder output above.' >&2
+              return "$build_status"
+            fi
+
             shopt -s nullglob
-            files=(release/*.dmg)
-            if [ "${#files[@]}" -eq 0 ]; then echo 'electron-builder completed but no DMG was created.' >&2; return 1; fi
+            local files=(release/*.dmg)
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo 'electron-builder completed but no DMG was created.' >&2
+              return 1
+            fi
             for file in "${files[@]}"; do mv "$file" "${file%.dmg}-UNSIGNED-TEST-ONLY.dmg"; done
             cat > release/UNSIGNED-MACOS-WARNING.txt <<'NOTICE'
           UNSIGNED TEST BUILD — Apple Developer ID signing and notarization did not complete.
-          Gatekeeper may block the app. This file is included for local testing and is not a trusted public build.
-          Configure MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, and APPLE_API_ISSUER for a signed and notarized release.
+          Gatekeeper may block this app. This file is included for local testing and is not a trusted public build.
+          Configure MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, and APPLE_API_ISSUER for trusted distribution.
           NOTICE
             echo "mode=unsigned" >> "$GITHUB_OUTPUT"
           }
@@ -137,48 +171,28 @@ jobs:
           if [ "${SIGN_MODE:-unsigned}" = "signed" ]; then
             echo "Attempting signed and notarized macOS build."
             if env CSC_LINK="$MAC_CSC_LINK" CSC_KEY_PASSWORD="$MAC_CSC_KEY_PASSWORD" APPLE_API_KEY="$APPLE_API_KEY" APPLE_API_KEY_ID="$APPLE_API_KEY_ID" APPLE_API_ISSUER="$APPLE_API_ISSUER" CSC_IDENTITY_AUTO_DISCOVERY=true npm run dist:mac; then
-              echo "mode=signed" >> "$GITHUB_OUTPUT"
+              APP_PATH="$(find release -type d -name '*.app' -print -quit)"
+              DMG_PATH="$(find release -type f -name '*.dmg' -print -quit)"
+              if [ -n "$APP_PATH" ] && [ -n "$DMG_PATH" ]; then
+                if codesign --verify --deep --strict --verbose=2 "$APP_PATH" && \
+                   spctl --assess --verbose=4 --type execute "$APP_PATH" && \
+                   xcrun stapler validate "$DMG_PATH"; then
+                  echo "mode=signed" >> "$GITHUB_OUTPUT"
+                else
+                  echo "::warning::Signed app verification failed. Retrying as an unsigned test DMG."
+                  package_unsigned || exit 1
+                fi
+              else
+                echo "::warning::Signed build produced no app or DMG. Retrying as an unsigned test DMG."
+                package_unsigned || exit 1
+              fi
             else
-              echo "::warning::Signed macOS build failed (often caused by an invalid certificate/API-key secret or workspace path). Retrying as an unsigned test DMG so the artifact is not silently omitted."
+              echo "::warning::Signed macOS build failed. Retrying with signing explicitly disabled so a test DMG can still be produced."
               package_unsigned || exit 1
             fi
           else
             package_unsigned || exit 1
           fi
-
-      - name: Verify signed macOS app and notarization
-        id: verify_mac
-        if: runner.os == 'macOS' && steps.package_macos.outputs.mode == 'signed'
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          APP_PATH="$(find release -type d -name '*.app' -print -quit)"
-          DMG_PATH="$(find release -type f -name '*.dmg' -print -quit)"
-          test -n "$APP_PATH" || { echo 'No .app bundle produced.' >&2; exit 1; }
-          test -n "$DMG_PATH" || { echo 'No DMG produced.' >&2; exit 1; }
-          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
-          spctl --assess --verbose=4 --type execute "$APP_PATH"
-          xcrun stapler validate "$DMG_PATH"
-
-      - name: Fallback to unsigned test DMG if signature validation failed
-        if: runner.os == 'macOS' && steps.verify_mac.outcome == 'failure'
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo '::warning::The signed app failed codesign/Gatekeeper/notarization validation. Rebuilding a labelled unsigned test DMG so the Mac download is not silently skipped.'
-          rm -rf release
-          mkdir -p release
-          env CSC_LINK='' CSC_KEY_PASSWORD='' APPLE_API_KEY='' APPLE_API_KEY_ID='' APPLE_API_ISSUER='' CSC_IDENTITY_AUTO_DISCOVERY=false npm run dist:mac
-          shopt -s nullglob
-          files=(release/*.dmg)
-          if [ "${#files[@]}" -eq 0 ]; then echo 'Could not create fallback DMG after signature verification failed.' >&2; exit 1; fi
-          for file in "${files[@]}"; do mv "$file" "${file%.dmg}-UNSIGNED-TEST-ONLY.dmg"; done
-          cat > release/UNSIGNED-MACOS-WARNING.txt <<'NOTICE'
-          UNSIGNED TEST BUILD — the signed/notarized build failed validation.
-          macOS Gatekeeper may block this app. This artifact is retained for local testing only.
-          Configure valid Developer ID signing and notarization credentials for a trusted release.
-          NOTICE
 
       - name: List generated output files
         shell: bash
