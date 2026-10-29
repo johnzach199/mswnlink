@@ -1,24 +1,24 @@
 name: Build and Publish mswnlink Executables
 
-"on":
-  push:
-    tags:
-      - "v*"
+on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Optional release tag to attach the builds to. Leave blank for workflow artifacts only."
+        description: Optional existing/new Git tag to attach the completed installers to (for example v1.3)
         required: false
         type: string
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: write
 
 jobs:
   package:
-    name: Build mswnlink for ${{ matrix.label }}
+    name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 70
     strategy:
       fail-fast: false
       matrix:
@@ -32,76 +32,83 @@ jobs:
           - os: macos-15-intel
             script: dist:mac
             label: macos-intel-x64
+            mac: true
           - os: macos-15
             script: dist:mac
             label: macos-apple-silicon-arm64
+            mac: true
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
+      - name: Check out source
+        uses: actions/checkout@v4
 
       - name: Set up Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@v4
         with:
-          node-version: "22"
-          package-manager-cache: false
+          node-version: '22'
+
+      - name: Require macOS signing and notarization credentials
+        if: runner.os == 'macOS'
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        shell: bash
+        run: |
+          missing=()
+          for name in MAC_CSC_LINK MAC_CSC_KEY_PASSWORD APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            if [ -z "${!name}" ]; then missing+=("$name"); fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf 'Missing GitHub Actions secrets for signed/notarized macOS builds: %s\n' "${missing[*]}"
+            echo 'Add the Apple Developer ID certificate and App Store Connect API-key secrets. Unsigned DMGs are expected to be reported as damaged by Gatekeeper.'
+            exit 1
+          fi
 
       - name: Install Linux native build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential python3 pkg-config libxtst-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxkbfile-dev libpng-dev libpng++-dev
+          sudo apt-get install -y build-essential python3 libxtst-dev libx11-dev libxext-dev libpng-dev libpng++-dev
 
-      - name: Print toolchain versions
-        run: |
-          node --version
-          npm --version
-          node -p "process.platform + ' ' + process.arch"
-
-      - name: Install Node dependencies
+      - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Check source JavaScript
-        run: npm run check
+      - name: Build RobotJS input backend
+        run: npm run rebuild:native
 
-      - name: Verify native input backend is available
+      - name: Validate JavaScript and native input backend
         shell: bash
-        run: node -e "const r = require('robotjs'); if (!r || typeof r.moveMouse !== 'function') process.exit(1); console.log('RobotJS input backend loaded successfully')"
+        run: |
+          npm run check
+          node -e "require('robotjs'); console.log('RobotJS input backend loaded')"
 
       - name: Package standalone application
         run: npm run ${{ matrix.script }}
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
 
-      - name: Verify macOS app signature inside the DMG
+      - name: Verify macOS code signature and notarization ticket
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          dmgs=(release/*.dmg)
-          if [ ${#dmgs[@]} -eq 0 ]; then
-            echo "No DMG was produced."
+          APP_PATH="$(find release -type d -name '*.app' -print -quit)"
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app bundle was produced; refusing to publish this macOS build." >&2
             exit 1
           fi
-          for dmg in "${dmgs[@]}"; do
-            echo "Checking $dmg"
-            mount_dir="$(mktemp -d)"
-            hdiutil attach "$dmg" -mountpoint "$mount_dir" -nobrowse -quiet
-            app_path="$(find "$mount_dir" -maxdepth 1 -name '*.app' -print -quit)"
-            if [ -z "$app_path" ]; then
-              hdiutil detach "$mount_dir" -quiet || true
-              echo "No .app bundle found inside $dmg"
-              exit 1
-            fi
-            codesign --verify --deep --strict --verbose=2 "$app_path"
-            hdiutil detach "$mount_dir" -quiet
-            rmdir "$mount_dir" || true
-          done
-
-      - name: List generated installers
-        shell: bash
-        run: ls -lah release
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --verbose=4 --type execute "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
 
       - name: Upload standalone artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: mswnlink-${{ matrix.label }}
           path: |
@@ -112,24 +119,32 @@ jobs:
           retention-days: 30
 
   publish-release:
-    name: Attach builds to GitHub Release
-    if: >-
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    name: Publish release assets
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"; else echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"; fi
+
       - name: Download platform builds
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           pattern: mswnlink-*
           path: release-assets
           merge-multiple: true
 
-      - name: Attach files to GitHub Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.tag }}
           files: release-assets/*
+          generate_release_notes: true
