@@ -3,89 +3,28 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>mswnlink · Browser edition</title>
+<meta name="color-scheme" content="dark">
+<title>mswnlink — Browser Edition</title>
 <style>
-:root{color-scheme:light dark;--bg:#f3f4f6;--surface:#fff;--surface2:#f7f8fa;--ink:#14171c;--muted:#5f6673;--line:#dde0e6;--accent:#2456e6;--accent-hover:#1a45c4;--accent-ink:#fff;--ok:#15803d;--ok-bg:#e6f4ea;--danger:#c42b2b;--danger-bg:#fdecec;--warn:#8a5a00;--warn-bg:#fff4dc;--stage:#0d0f13;--font:system-ui,-apple-system,"Segoe UI","Noto Sans",Cantarell,"Helvetica Neue",Arial,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
-@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--surface:#171a20;--surface2:#1d2128;--ink:#eceff4;--muted:#9aa3b2;--line:#2a2f39;--accent:#6d94ff;--accent-hover:#86a6ff;--accent-ink:#0a1128;--ok:#4ade80;--ok-bg:#123122;--danger:#ff8080;--danger-bg:#3a1b1b;--warn:#f5c26b;--warn-bg:#36290f;--stage:#000}}
-*{box-sizing:border-box}[hidden],.hidden{display:none!important}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 var(--font);-webkit-font-smoothing:antialiased;min-height:100vh}
-h1,h2,p{margin:0}b,strong{font-weight:600}
-button,input,textarea{font:inherit;color:inherit}
-button,label.ghost{cursor:pointer;display:inline-flex;align-items:center;justify-content:center;min-height:40px;padding:0 16px;border-radius:8px;border:1px solid var(--line);background:var(--surface);font-weight:600;transition:background-color .12s,border-color .12s}
-button:hover:not(:disabled),label.ghost:hover{background:var(--surface2);border-color:var(--muted)}
-button:disabled{opacity:.5;cursor:not-allowed}
-button:focus-visible,textarea:focus-visible,a:focus-visible,label.ghost:focus-within{outline:2px solid var(--accent);outline-offset:2px}
-.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
-.primary:hover:not(:disabled){background:var(--accent-hover);border-color:var(--accent-hover)}
-.danger{color:var(--danger)}.danger:hover:not(:disabled){background:var(--danger-bg);border-color:var(--danger)}
-.ghost,.secondary{background:var(--surface)}
-.wrap{max-width:1080px;margin:0 auto;padding:24px 24px 48px}
-.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:36px;padding-bottom:16px;border-bottom:1px solid var(--line)}
-.brand{display:flex;gap:10px;align-items:center}
-.logo{width:28px;height:28px;border-radius:8px;background:var(--accent);color:var(--accent-ink);display:grid;place-items:center;font-weight:700}
-.brand-name{font-weight:700;font-size:16px;letter-spacing:-.01em;line-height:1.1}
-.edition{font-size:12px;color:var(--muted)}
-.badge{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--ok)}
-.hero{margin-bottom:20px}
-.hero h1{font-size:26px;line-height:1.2;font-weight:650;letter-spacing:-.01em}
-.hero p{color:var(--muted);margin-top:8px;max-width:64ch}
-.eyebrow{display:none}
-.notice{display:flex;gap:10px;padding:10px 14px;margin-bottom:20px;border-radius:8px;background:var(--warn-bg);color:var(--warn);font-size:14px}
-.notice strong{font-weight:600}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
-.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:20px;display:flex;flex-direction:column;gap:14px}
-.card h2{font-size:16px;font-weight:650}
-.card p{color:var(--muted);font-size:14px}
-.card-top{display:flex;gap:12px;align-items:center}
-.card-icon{display:none}
-.sub{font-size:13px;color:var(--muted)}
-.actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-.field-label{display:flex;justify-content:space-between;gap:8px;align-items:baseline;font-size:13px;font-weight:600;margin-bottom:-6px}
-.helper{font-weight:400;color:var(--muted)}
-.field,textarea{width:100%;min-height:96px;resize:vertical;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface);font:12px/1.4 var(--mono)}
-.small-field{min-height:72px}
-.field:focus{border-color:var(--accent)}
-.file-input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
-.status{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--muted)}
-.status .indicator{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none}
-.status.live{color:var(--ok)}.status.live .indicator{background:var(--ok)}
-.status.warn{color:var(--warn)}.status.warn .indicator{background:var(--warn)}
-.steps{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:8px;font-size:13px;color:var(--muted)}
-.steps li{display:flex;gap:10px;align-items:flex-start}
-.num{flex:none;width:20px;height:20px;border-radius:50%;background:var(--surface2);border:1px solid var(--line);display:grid;place-items:center;font-size:12px;font-weight:600;color:var(--ink)}
-.viewer{display:flex;flex-direction:column;gap:10px}
-.pill{padding:2px 10px;border-radius:999px;background:var(--surface2);border:1px solid var(--line);font-size:12px;font-weight:600;color:var(--muted)}
-.video-shell{position:relative;aspect-ratio:16/10;background:var(--stage);border-radius:8px;overflow:hidden;display:flex;align-items:center;justify-content:center}
-.video-shell video{width:100%;height:100%;object-fit:contain;background:var(--stage)}
-.video-placeholder{position:absolute;inset:0;display:flex;flex-direction:column;gap:6px;align-items:center;justify-content:center;text-align:center;color:#c9ced8;padding:16px}
-.video-placeholder span{font-size:13px;color:#8d95a5}
-.video-placeholder .screen-icon{display:none}
-.video-overlay-controls{position:absolute;top:10px;right:10px;z-index:2}
-.fullscreen-btn{min-height:32px;padding:0 12px;background:rgba(15,17,21,.78);border-color:rgba(255,255,255,.25);color:#fff;font-size:13px}
-.fullscreen-btn:hover{background:rgba(15,17,21,.95)!important}
-.video-shell:fullscreen,.video-shell:-webkit-full-screen{width:100vw;height:100vh;aspect-ratio:auto;border-radius:0}
-.video-shell:fullscreen::backdrop,.video-shell:-webkit-full-screen::backdrop{background:#000}
-.footer{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;margin-top:28px;padding-top:16px;border-top:1px solid var(--line);font-size:13px;color:var(--muted)}
-.foot-links{display:flex;gap:16px}.foot-links a{color:var(--accent);text-decoration:none;font-weight:600}.foot-links a:hover{text-decoration:underline}
-.toast{position:fixed;left:50%;bottom:24px;transform:translate(-50%,12px);max-width:min(520px,calc(100vw - 32px));padding:10px 16px;border-radius:8px;background:var(--ink);color:var(--bg);font-size:14px;opacity:0;pointer-events:none;transition:opacity .18s,transform .18s;z-index:30}
-.toast.show{opacity:1;transform:translate(-50%,0)}
-@media(max-width:800px){.grid{grid-template-columns:1fr}.wrap{padding:16px 14px 40px}}
-@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+:root{--bg:#0a0d14;--panel:#111722;--panel2:#151d2a;--line:#273244;--muted:#93a1b5;--text:#f2f5fa;--accent:#7c9cff;--accent2:#9b8cff;--green:#64dfb4;--red:#ff8d9a;--amber:#ffd27a;--radius:22px;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 500px at 10% -10%,#202c51 0%,transparent 62%),radial-gradient(800px 520px at 100% 0%,#252044 0%,transparent 55%),var(--bg);color:var(--text);min-height:100vh}
+button,input,textarea{font:inherit}button{cursor:pointer;border:0;border-radius:12px;padding:12px 15px;font-weight:700;transition:transform .15s ease,opacity .15s ease,background .15s ease}button:hover{transform:translateY(-1px)}button:disabled{opacity:.45;cursor:not-allowed;transform:none}.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#0b1020}.secondary{background:#202b3d;color:var(--text);border:1px solid #344157}.ghost{background:transparent;color:#d3dcec;border:1px solid var(--line)}.danger{background:#3b202a;color:#ffbec6;border:1px solid #653542}
+.wrap{max-width:1180px;margin:0 auto;padding:30px 22px 54px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:44px}.brand{display:flex;gap:12px;align-items:center}.logo{height:43px;width:43px;border-radius:14px;background:linear-gradient(145deg,#8ca7ff,#a994ff);display:grid;place-items:center;color:#0d1221;font-weight:950;font-size:22px;box-shadow:0 12px 30px #738aff35}.brand-name{font-weight:850;letter-spacing:-.04em;font-size:21px}.edition{font-size:11px;text-transform:uppercase;letter-spacing:.13em;color:var(--muted);margin-top:3px}.badge{display:inline-flex;align-items:center;gap:8px;border:1px solid #294339;background:#10251f;color:#9cf0d2;padding:8px 12px;border-radius:999px;font-size:12px;font-weight:750}.dot{width:7px;height:7px;background:var(--green);border-radius:50%;box-shadow:0 0 0 4px #64dfb41a}.hero{max-width:760px;margin-bottom:28px}.eyebrow{font-size:12px;letter-spacing:.15em;color:#aebdff;text-transform:uppercase;font-weight:800}.hero h1{font-size:clamp(34px,5vw,58px);line-height:1.04;letter-spacing:-.055em;margin:13px 0 15px}.gradient{background:linear-gradient(95deg,#f7f9ff 20%,#a9baff 65%,#c2a7ff);-webkit-background-clip:text;background-clip:text;color:transparent}.hero p{max-width:690px;color:#a6b1c4;font-size:16px;line-height:1.7;margin:0}.notice{margin:24px 0 28px;border:1px solid #4b432d;background:#241f16;color:#e9d5a3;border-radius:15px;padding:14px 16px;display:flex;gap:11px;line-height:1.55;font-size:13px}.notice strong{color:#fff0c8}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.card{background:linear-gradient(155deg,#141c29ee,#0f141dee);border:1px solid #293447;border-radius:var(--radius);padding:23px;box-shadow:0 24px 80px #0002;min-width:0}.card-top{display:flex;align-items:center;gap:13px;margin-bottom:17px}.card-icon{width:46px;height:46px;border-radius:15px;display:grid;place-items:center;background:#1d2d4a;color:#9fb7ff;font-size:22px}.card-icon.purple{background:#2a2345;color:#c4b4ff}.card h2{font-size:20px;letter-spacing:-.03em;margin:0 0 4px}.sub{color:var(--muted);font-size:13px}.card p{color:#a6b2c4;font-size:13px;line-height:1.65}.field-label{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:12px;font-weight:800;color:#dce4f2;margin:17px 0 8px}.helper{font-size:11px;color:#8190a6;font-weight:500}.actions{display:flex;flex-wrap:wrap;gap:9px;margin:14px 0}.field{width:100%;min-height:134px;resize:vertical;background:#090e17;color:#dce8ff;border:1px solid #2d3a4e;border-radius:13px;padding:13px;font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;outline:none}.field:focus{border-color:#829bff;box-shadow:0 0 0 3px #829bff20}.small-field{min-height:94px}.steps{margin:16px 0 0;padding:0;list-style:none;display:grid;gap:9px}.steps li{display:flex;gap:10px;align-items:flex-start;color:#9daabe;font-size:12px;line-height:1.55}.num{flex:0 0 22px;height:22px;border-radius:8px;display:grid;place-items:center;background:#202c40;color:#bccaff;font-size:11px;font-weight:800}.status{display:flex;align-items:center;gap:9px;background:#0b111b;border:1px solid #253146;border-radius:11px;padding:10px 12px;color:#aab8cd;font-size:12px;margin-top:12px;min-height:40px}.status .indicator{width:8px;height:8px;border-radius:50%;background:#6f7b90;flex:0 0 auto}.status.live .indicator{background:var(--green);box-shadow:0 0 0 4px #64dfb41b}.status.warn .indicator{background:var(--amber)}.viewer{margin-top:18px}.video-shell{background:#05070b;border:1px solid #2b3547;border-radius:17px;min-height:250px;aspect-ratio:16/9;display:grid;place-items:center;overflow:hidden;position:relative;isolation:isolate}.video-shell video{position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:contain;background:#05070b;z-index:0}.video-shell:fullscreen{position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;height:100dvh!important;min-width:0!important;min-height:0!important;max-width:none!important;max-height:none!important;aspect-ratio:auto!important;margin:0!important;padding:0!important;box-sizing:border-box!important;border:0!important;border-radius:0!important;display:block!important;overflow:hidden!important;background:#05070b!important;z-index:2147483647!important}.video-shell:fullscreen::backdrop{background:#05070b}.video-shell:fullscreen video{position:absolute!important;inset:0!important;display:block!important;width:100%!important;height:100%!important;min-width:0!important;min-height:0!important;max-width:100%!important;max-height:100%!important;object-fit:contain!important;object-position:center center!important;background:#05070b!important}.video-overlay-controls{position:absolute;z-index:5;top:12px;right:12px;display:flex;gap:8px}.fullscreen-btn{background:#141c2ddd;color:#f4f7ff;border:1px solid #64718a;padding:10px 13px;box-shadow:0 6px 22px #0006;backdrop-filter:blur(10px)}.fullscreen-btn:hover{background:#263651}.video-shell:fullscreen .video-overlay-controls{top:20px;right:20px}.video-shell:fullscreen .video-overlay-controls{top:20px;right:20px}.video-shell:-webkit-full-screen{position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;height:100dvh!important;min-width:0!important;min-height:0!important;max-width:none!important;max-height:none!important;aspect-ratio:auto!important;margin:0!important;padding:0!important;box-sizing:border-box!important;border:0!important;border-radius:0!important;display:block!important;overflow:hidden!important;background:#05070b!important;z-index:2147483647!important}.video-shell:-webkit-full-screen video{position:absolute!important;inset:0!important;display:block!important;width:100%!important;height:100%!important;min-width:0!important;min-height:0!important;max-width:100%!important;max-height:100%!important;object-fit:contain!important;object-position:center center!important;background:#05070b!important}.video-shell:-webkit-full-screen .video-overlay-controls{top:20px;right:20px}.video-placeholder{position:relative;z-index:1;max-width:340px;padding:24px;text-align:center;color:#75839a}.video-placeholder .screen-icon{font-size:34px;margin-bottom:12px}.video-placeholder b{display:block;color:#bdc8da;margin-bottom:7px}.video-placeholder span{font-size:12px;line-height:1.6}.footer{margin-top:24px;display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap;color:#718096;font-size:11px;line-height:1.6}.hidden{display:none!important}.foot-links{display:flex;gap:16px}.foot-links a{color:#9eafd1;text-decoration:none}.foot-links a:hover{text-decoration:underline}.file-input{display:none}.toast{position:fixed;bottom:22px;left:50%;transform:translate(-50%,20px);opacity:0;pointer-events:none;background:#e7edff;color:#101626;padding:12px 16px;border-radius:12px;font-size:13px;font-weight:700;box-shadow:0 12px 50px #0007;transition:.2s;z-index:20}.toast.show{transform:translate(-50%,0);opacity:1}.pill{display:inline-flex;border:1px solid #343d53;border-radius:99px;padding:5px 9px;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#b5c2da;font-weight:800}
+@media(max-width:800px){.grid{grid-template-columns:1fr}.top{margin-bottom:30px}.wrap{padding:20px 14px 40px}.card{padding:19px}.hero h1{font-size:39px}.badge{font-size:10px}.top{align-items:flex-start}}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header class="top">
-    <div class="brand"><div class="logo">m</div><div><div class="brand-name">mswnlink</div><div class="edition">Browser edition, no install</div></div></div>
-    <div class="badge"><span class="dot"></span> Direct on your network</div>
+    <div class="brand"><div class="logo">m</div><div><div class="brand-name">mswnlink</div><div class="edition">Browser edition · no install</div></div></div>
+    <div class="badge"><span class="dot"></span> Direct LAN · No relay</div>
   </header>
   <section class="hero">
-    <h1>Share a screen on your local network</h1>
+    <div class="eyebrow">Your devices, connected</div>
+    <h1><span class="gradient">Share a screen.</span><br>Keep it local.</h1>
     <p>Share a desktop directly between modern browsers on the same local network. No app installation, account, signaling server, or public relay is required. You exchange a short connection file or text between the two devices to pair them.</p>
   </section>
-  <div class="notice"><div><strong>Browser-only limitation:</strong> this version streams video in view-only mode. Browsers do not let websites control the operating system's mouse or keyboard. Full remote control still requires the desktop app or a native helper. Keep offer/answer text private; it contains connection details for your local network.</div></div>
+  <div class="notice"><span>ⓘ</span><div><strong>Browser-only limitation:</strong> this version streams video in view-only mode. Browsers do not let websites control the operating system's mouse or keyboard. Full remote control still requires the desktop app or a native helper. Keep offer/answer text private; it contains connection details for your local network.</div></div>
   <main class="grid">
     <section class="card" aria-labelledby="share-heading">
       <div class="card-top"><div class="card-icon">▣</div><div><h2 id="share-heading">Share this screen</h2><div class="sub">Use this on the computer being viewed</div></div></div>
@@ -94,7 +33,7 @@ button:focus-visible,textarea:focus-visible,a:focus-visible,label.ghost:focus-wi
       <div class="status" id="host-status"><span class="indicator"></span><span id="host-status-text">Not sharing · waiting for you</span></div>
       <div class="field-label"><label for="offer-out">1 · Connection offer</label><span class="helper">Send to the viewer</span></div>
       <textarea id="offer-out" class="field" spellcheck="false" placeholder="Click Start sharing to create an offer…"></textarea>
-      <div class="actions"><button id="copy-offer" class="secondary" disabled>Copy offer</button><button id="download-offer" class="ghost" disabled>Save offer file</button><label class="ghost" for="load-answer-file">Load answer file</label><input id="load-answer-file" class="file-input" type="file" accept=".json,.txt,application/json,text/plain"></div>
+      <div class="actions"><button id="copy-offer" class="secondary" disabled>Copy offer</button><button id="download-offer" class="ghost" disabled>Save offer file</button><label class="ghost" style="display:inline-flex;align-items:center;border-radius:12px;padding:12px 15px;font-weight:700;cursor:pointer" for="load-answer-file">Load answer file</label><input id="load-answer-file" class="file-input" type="file" accept=".json,.txt,application/json,text/plain"></div>
       <div class="field-label"><label for="answer-in">2 · Answer from viewer</label><span class="helper">Paste or load the returned answer</span></div>
       <textarea id="answer-in" class="field small-field" spellcheck="false" placeholder="Paste the viewer's answer here…"></textarea>
       <div class="actions"><button id="apply-answer" class="primary" disabled>Connect viewer</button><button id="clear-answer" class="ghost">Clear</button></div>
@@ -105,14 +44,14 @@ button:focus-visible,textarea:focus-visible,a:focus-visible,label.ghost:focus-wi
       <p>Paste or load the offer from the shared computer. The browser builds an answer and waits for the host to complete the connection.</p>
       <div class="field-label"><label for="offer-in">1 · Offer from host</label><span class="helper">Paste or load file</span></div>
       <textarea id="offer-in" class="field" spellcheck="false" placeholder="Paste the host's offer here…"></textarea>
-      <div class="actions"><label class="ghost" for="load-offer-file">Load offer file</label><input id="load-offer-file" class="file-input" type="file" accept=".json,.txt,application/json,text/plain"><button id="make-answer" class="primary">Create answer</button><button id="end-view" class="danger" disabled>Disconnect</button></div>
+      <div class="actions"><label class="ghost" style="display:inline-flex;align-items:center;border-radius:12px;padding:12px 15px;font-weight:700;cursor:pointer" for="load-offer-file">Load offer file</label><input id="load-offer-file" class="file-input" type="file" accept=".json,.txt,application/json,text/plain"><button id="make-answer" class="primary">Create answer</button><button id="end-view" class="danger" disabled>Disconnect</button></div>
       <div class="status" id="viewer-status"><span class="indicator"></span><span id="viewer-status-text">Not connected · waiting for an offer</span></div>
       <div class="field-label"><label for="answer-out">2 · Connection answer</label><span class="helper">Return this to the host</span></div>
       <textarea id="answer-out" class="field small-field" spellcheck="false" placeholder="Paste or save this answer and return it to the host…"></textarea>
       <div class="actions"><button id="copy-answer" class="secondary" disabled>Copy answer</button><button id="download-answer" class="ghost" disabled>Save answer file</button></div>
       <div class="viewer">
         <div class="field-label"><span>Live screen</span><span class="pill">View only</span></div>
-        <div class="video-shell" id="video-shell"><video id="remote-video" autoplay playsinline></video><div class="video-placeholder" id="video-placeholder"><div class="screen-icon">▣</div><b>The remote screen will appear here</b><span>Paste the host offer and create an answer to start a direct LAN stream.</span></div><div class="video-overlay-controls"><button id="fullscreen-view" class="fullscreen-btn" type="button" disabled aria-label="Show live screen in fullscreen" title="Fullscreen live screen">⛶ Fullscreen</button></div></div>
+        <div class="video-shell" id="video-shell"><video id="remote-video" autoplay playsinline></video><div class="video-placeholder" id="video-placeholder"><div class="screen-icon">▣</div><b>The remote screen will appear here</b><span>Paste the host offer and create an answer to start a direct LAN stream.</span></div><div class="video-overlay-controls"><button id="fullscreen-view" class="fullscreen-btn" type="button" disabled aria-label="Show live screen in fullscreen" title="Fullscreen live screen"><span aria-hidden="true">⛶</span> Fullscreen</button></div></div>
       </div>
       <ol class="steps"><li><span class="num">1</span><span>Load/paste the host's offer and click <b>Create answer</b>.</span></li><li><span class="num">2</span><span>Copy or save the answer and transfer it back to the host.</span></li><li><span class="num">3</span><span>Ask the host to apply the answer. Your video should appear here.</span></li></ol>
     </section>
@@ -210,6 +149,14 @@ button:focus-visible,textarea:focus-visible,a:focus-visible,label.ghost:focus-wi
     } catch (error) { toast(`Could not read file: ${error.message}`); }
     input.value = '';
   }
+  function syncFullscreenButton() {
+    const activeFullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
+    const isFullscreen = activeFullscreenElement === el.videoShell;
+    el.fullscreen.textContent = isFullscreen ? '⤢ Exit fullscreen' : '⛶ Fullscreen';
+    el.fullscreen.setAttribute('aria-label', isFullscreen ? 'Exit fullscreen' : 'Show live screen in fullscreen');
+    el.fullscreen.title = isFullscreen ? 'Exit fullscreen (or press Esc)' : 'View live screen fullscreen';
+    el.fullscreen.disabled = !el.video.srcObject;
+  }
   function setControls() {
     const sharing = !!hostStream;
     el.start.disabled = sharing;
@@ -222,15 +169,6 @@ button:focus-visible,textarea:focus-visible,a:focus-visible,label.ghost:focus-wi
     el.copyAnswer.disabled = !el.answerOut.value.trim();
     el.downloadAnswer.disabled = !el.answerOut.value.trim();
     syncFullscreenButton();
-  }
-  function syncFullscreenButton() {
-    if (!el.fullscreen || !el.videoShell) return;
-    const active = document.fullscreenElement || document.webkitFullscreenElement;
-    const isFullscreen = active === el.videoShell;
-    el.fullscreen.textContent = isFullscreen ? '⤢ Exit fullscreen' : '⛶ Fullscreen';
-    el.fullscreen.setAttribute('aria-label', isFullscreen ? 'Exit fullscreen' : 'Show live screen in fullscreen');
-    el.fullscreen.title = isFullscreen ? 'Exit fullscreen (or press Esc)' : 'View live screen fullscreen';
-    el.fullscreen.disabled = !el.video.srcObject;
   }
   function setPcStatus(which, pc) {
     const update = () => {
@@ -257,6 +195,13 @@ button:focus-visible,textarea:focus-visible,a:focus-visible,label.ghost:focus-wi
     setControls();
   }
   async function endViewer() {
+    const activeFullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
+    if (activeFullscreenElement === el.videoShell) {
+      try {
+        if (document.exitFullscreen) await document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      } catch {}
+    }
     if (viewerPc) { try { viewerPc.close(); } catch {} }
     viewerPc = null;
     el.video.srcObject = null;
@@ -338,28 +283,24 @@ button:focus-visible,textarea:focus-visible,a:focus-visible,label.ghost:focus-wi
       status('viewer', error.message || String(error), 'warn');
     } finally { setControls(); }
   });
-  if (el.fullscreen) {
-    el.fullscreen.addEventListener('click', async () => {
-      try {
-        const active = document.fullscreenElement || document.webkitFullscreenElement;
-        if (active === el.videoShell) {
-          if (document.exitFullscreen) await document.exitFullscreen();
-          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-        } else if (el.videoShell.requestFullscreen) {
-          await el.videoShell.requestFullscreen();
-        } else if (el.videoShell.webkitRequestFullscreen) {
-          el.videoShell.webkitRequestFullscreen();
-        } else throw new Error('Fullscreen is not supported by this browser.');
-      } catch (error) { toast(`Could not enter fullscreen: ${error.message || error}`); }
-    });
-    document.addEventListener('fullscreenchange', syncFullscreenButton);
-    document.addEventListener('webkitfullscreenchange', syncFullscreenButton);
-    el.video.addEventListener('dblclick', () => {
-      if (el.video.srcObject && !document.fullscreenElement && el.videoShell.requestFullscreen) {
-        el.videoShell.requestFullscreen().catch(() => {});
+  el.fullscreen.addEventListener('click', async () => {
+    try {
+      const activeFullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
+      if (activeFullscreenElement === el.videoShell) {
+        if (document.exitFullscreen) await document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        else toast('Press Esc to exit fullscreen.');
+        return;
       }
-    });
-  }
+      if (el.videoShell.requestFullscreen) await el.videoShell.requestFullscreen();
+      else if (el.videoShell.webkitRequestFullscreen) el.videoShell.webkitRequestFullscreen();
+      else throw new Error('Fullscreen is not supported by this browser.');
+    } catch (error) {
+      toast(`Could not enter fullscreen: ${error.message || error}`);
+    }
+  });
+  document.addEventListener('fullscreenchange', syncFullscreenButton);
+  document.addEventListener('webkitfullscreenchange', syncFullscreenButton);
   el.endView.addEventListener('click', async () => { await endViewer(); toast('Disconnected.'); });
   el.copyAnswer.addEventListener('click', () => copyText(el.answerOut, 'answer'));
   el.downloadAnswer.addEventListener('click', () => downloadText(el.answerOut.value, 'mswnlink-answer.json'));

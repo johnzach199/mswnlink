@@ -1,7 +1,7 @@
 {
   "name": "mswnlink",
-  "version": "0.2.0",
-  "description": "A simple remote desktop for computers on your local network.",
+  "version": "0.1.0",
+  "description": "A simple local-network remote desktop with optional unattended access.",
   "main": "main.js",
   "author": "mswnlink contributors",
   "license": "MIT",
@@ -13,10 +13,11 @@
     "dist:win": "electron-builder --win portable --publish never",
     "dist:mac": "electron-builder --mac dmg --publish never",
     "dist": "electron-builder --publish never",
-    "check": "node --check launch.js && node --check main.js && node --check preload.js && node --check renderer.js && node --check input-backend.js && node --check scripts/after-pack.cjs && python3 -m py_compile native/wayland-input.py"
+    "check": "node --check launch.js && node --check main.js && node --check preload.js && node --check renderer.js && node --check scripts/after-pack.cjs && node --check linux-wayland-input.js"
   },
   "dependencies": {
-    "ws": "^8.18.3"
+    "ws": "^8.18.3",
+    "dbus-next": "^0.10.2"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.1",
@@ -35,11 +36,13 @@
       "main.js",
       "preload.js",
       "renderer.js",
-      "input-backend.js",
       "index.html",
       "styles.css",
       "assets/**/*",
-      "package.json"
+      "package.json",
+      "linux-wayland-input.js",
+      "build/entitlements.mac.plist",
+      "build/entitlements.mac.inherit.plist"
     ],
     "directories": {
       "output": "release"
@@ -49,7 +52,8 @@
       "target": [
         "portable"
       ],
-      "artifactName": "mswnlink-windows-${version}-${arch}.${ext}"
+      "artifactName": "mswnlink-windows-${version}-${arch}.${ext}",
+      "icon": "assets/mswnlink.ico"
     },
     "mac": {
       "target": [
@@ -57,11 +61,16 @@
       ],
       "category": "public.app-category.utilities",
       "artifactName": "mswnlink-macos-${version}-${arch}.${ext}",
-      "hardenedRuntime": false,
+      "hardenedRuntime": true,
+      "notarize": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
       "extendInfo": {
-        "NSScreenCaptureUsageDescription": "mswnlink shares your screen with computers you allow on your network."
+        "NSScreenCaptureUsageDescription": "mswnlink shares your desktop with a device on your local network when you start a session.",
+        "NSAccessibilityUsageDescription": "mswnlink uses accessibility input permissions to send mouse and keyboard events during an authorized remote-control session."
       },
-      "gatekeeperAssess": false
+      "forceCodeSigning": true,
+      "icon": "assets/mswnlink.icns"
     },
     "linux": {
       "target": [
@@ -69,7 +78,8 @@
       ],
       "category": "Network",
       "executableName": "mswnlink",
-      "artifactName": "mswnlink-fedora-${version}-${arch}.${ext}"
+      "artifactName": "mswnlink-fedora-${version}-${arch}.${ext}",
+      "icon": "assets/mswnlink.png"
     },
     "afterPack": "scripts/after-pack.cjs",
     "portable": {
@@ -77,13 +87,7 @@
     },
     "toolsets": {
       "appimage": "1.0.3"
-    },
-    "extraResources": [
-      {
-        "from": "native/wayland-input.py",
-        "to": "wayland-input.py"
-      }
-    ]
+    }
   },
   "optionalDependencies": {
     "robotjs": "^0.9.1"
