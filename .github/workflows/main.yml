@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Optional release tag to publish successful builds to (for example v0.2.3). Leave blank for test artifacts only."
+        description: "Optional release tag to attach builds to (for example v2.8). Leave blank for test artifacts only."
         required: false
         type: string
   push:
@@ -18,7 +18,7 @@ jobs:
   package:
     name: Build mswnlink for ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -62,30 +62,14 @@ jobs:
           present=0
           missing=()
           for name in "${names[@]}"; do
-            if [ -n "${!name:-}" ]; then present=$((present + 1)); else missing+=("$name"); fi
+            if [ -n "${!name}" ]; then present=$((present + 1)); else missing+=("$name"); fi
           done
-
-          # A runner workspace path is not a signing certificate or API key.
-          # The prior failure showed the workspace directory being treated as a file.
-          bad_path=0
-          for value in "$MAC_CSC_LINK" "$APPLE_API_KEY"; do
-            if [ "$value" = "$GITHUB_WORKSPACE" ] || [[ "$value" == "$GITHUB_WORKSPACE/"* ]] || [[ "$value" == "$RUNNER_WORKSPACE/"* ]] || [[ "$value" == /Users/runner/work/*/mswnlink ]]; then
-              bad_path=1
-            fi
-          done
-
-          if [ "$present" -eq 5 ] && [ "$bad_path" -eq 0 ]; then
+          if [ "$present" -eq 5 ]; then
             echo "mode=signed" >> "$GITHUB_OUTPUT"
-            echo "All signing secrets are present. Signed/notarized build selected."
+            echo "All Apple signing/notarization secrets are present. The workflow will try a signed build first."
           else
             echo "mode=unsigned" >> "$GITHUB_OUTPUT"
-            if [ "$bad_path" -eq 1 ]; then
-              echo "::warning::A signing secret contains the runner workspace path instead of a key/certificate. Building an unsigned test DMG; fix MAC_CSC_LINK and APPLE_API_KEY values to enable trusted releases."
-            elif [ "$present" -eq 0 ]; then
-              echo "::warning::No Apple signing secrets configured. Building an unsigned test DMG; Gatekeeper may block it."
-            else
-              echo "::warning::Apple signing secrets are incomplete (${missing[*]}). Building an unsigned test DMG; incomplete secrets will not be passed to electron-builder."
-            fi
+            echo "::warning::Apple signing secrets are incomplete (missing: ${missing[*]}). An unsigned, clearly labelled test DMG will be produced and retained as a release asset."
           fi
 
       - name: Install Linux native build dependencies
@@ -94,7 +78,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential python3 make g++ pkg-config libxtst-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxkbfile-dev libxfixes-dev libxdamage-dev libxrender-dev libxi-dev libpng-dev libpng++-dev
 
-      - name: Print toolchain versions
+      - name: Print build environment
+        shell: bash
         run: |
           node --version
           npm --version
@@ -103,90 +88,68 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
-      - name: Check source JavaScript
+      - name: Check JavaScript
         run: npm run check
 
-      - name: Verify RobotJS input backend
-        run: node -e "const r=require('robotjs'); if (!r || typeof r.moveMouse !== 'function' || typeof r.keyTap !== 'function') process.exit(1); console.log('RobotJS input backend loaded')"
+      - name: Build native input backend
+        run: npm run rebuild:native
 
-      # Keep the signed and unsigned macOS paths separate. In the unsigned path,
-      # explicitly blank CSC_* variables so a stale repository/runner variable
-      # cannot turn the workspace directory into a fake certificate path.
-      - name: Configure unsigned macOS test build
-        if: runner.os == 'macOS' && steps.mac_sign_mode.outputs.mode == 'unsigned'
-        shell: bash
-        run: |
-          set -euo pipefail
-          node <<'NODE'
-          const fs = require('node:fs');
-          const file = 'package.json';
-          const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
-          pkg.build = pkg.build || {};
-          pkg.build.mac = pkg.build.mac || {};
-          pkg.build.mac.identity = null;
-          pkg.build.mac.forceCodeSigning = false;
-          pkg.build.mac.hardenedRuntime = false;
-          pkg.build.mac.notarize = false;
-          delete pkg.build.mac.sign;
-          fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n');
-          console.log('Configured explicitly unsigned macOS test build.');
-          NODE
+      - name: Verify native input backend
+        run: node -e "const r=require('robotjs'); if (!r || typeof r.moveMouse !== 'function' || typeof r.keyToggle !== 'function') process.exit(1); console.log('RobotJS native input backend loaded')"
 
-      - name: Configure signed macOS build
-        if: runner.os == 'macOS' && steps.mac_sign_mode.outputs.mode == 'signed'
-        shell: bash
-        run: |
-          set -euo pipefail
-          node <<'NODE'
-          const fs = require('node:fs');
-          const file = 'package.json';
-          const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
-          pkg.build = pkg.build || {};
-          pkg.build.mac = pkg.build.mac || {};
-          delete pkg.build.mac.identity;
-          pkg.build.mac.forceCodeSigning = true;
-          pkg.build.mac.hardenedRuntime = true;
-          pkg.build.mac.notarize = true;
-          delete pkg.build.mac.sign;
-          fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n');
-          console.log('Configured required signing and notarization.');
-          NODE
-
-      - name: Package Linux/Windows application
+      - name: Package Linux or Windows application
         if: runner.os != 'macOS'
         run: npm run ${{ matrix.script }}
-        env:
-          CSC_LINK: ''
-          CSC_KEY_PASSWORD: ''
-          APPLE_API_KEY: ''
-          APPLE_API_KEY_ID: ''
-          APPLE_API_ISSUER: ''
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
-      - name: Package unsigned macOS test DMG
-        if: runner.os == 'macOS' && steps.mac_sign_mode.outputs.mode == 'unsigned'
-        run: npm run dist:mac
+      - name: Package macOS app (signed if possible, keep a labelled test DMG otherwise)
+        id: package_macos
+        if: runner.os == 'macOS'
+        shell: bash
         env:
-          CSC_LINK: ''
-          CSC_KEY_PASSWORD: ''
-          APPLE_API_KEY: ''
-          APPLE_API_KEY_ID: ''
-          APPLE_API_ISSUER: ''
-          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-
-      - name: Package signed and notarized macOS DMG
-        if: runner.os == 'macOS' && steps.mac_sign_mode.outputs.mode == 'signed'
-        run: npm run dist:mac
-        env:
-          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
-          CSC_IDENTITY_AUTO_DISCOVERY: 'true'
+          SIGN_MODE: ${{ steps.mac_sign_mode.outputs.mode }}
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -uo pipefail
+          package_unsigned() {
+            rm -rf release
+            mkdir -p release
+            echo "Building unsigned test DMG with all signing variables explicitly cleared."
+            if ! env CSC_LINK='' CSC_KEY_PASSWORD='' APPLE_API_KEY='' APPLE_API_KEY_ID='' APPLE_API_ISSUER='' CSC_IDENTITY_AUTO_DISCOVERY=false npm run dist:mac; then
+              echo 'Unsigned macOS package step also failed; see electron-builder output above.' >&2
+              return 1
+            fi
+            shopt -s nullglob
+            files=(release/*.dmg)
+            if [ "${#files[@]}" -eq 0 ]; then echo 'electron-builder completed but no DMG was created.' >&2; return 1; fi
+            for file in "${files[@]}"; do mv "$file" "${file%.dmg}-UNSIGNED-TEST-ONLY.dmg"; done
+            cat > release/UNSIGNED-MACOS-WARNING.txt <<'NOTICE'
+          UNSIGNED TEST BUILD — Apple Developer ID signing and notarization did not complete.
+          Gatekeeper may block the app. This file is included for local testing and is not a trusted public build.
+          Configure MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, and APPLE_API_ISSUER for a signed and notarized release.
+          NOTICE
+            echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+          }
+
+          if [ "${SIGN_MODE:-unsigned}" = "signed" ]; then
+            echo "Attempting signed and notarized macOS build."
+            if env CSC_LINK="$MAC_CSC_LINK" CSC_KEY_PASSWORD="$MAC_CSC_KEY_PASSWORD" APPLE_API_KEY="$APPLE_API_KEY" APPLE_API_KEY_ID="$APPLE_API_KEY_ID" APPLE_API_ISSUER="$APPLE_API_ISSUER" CSC_IDENTITY_AUTO_DISCOVERY=true npm run dist:mac; then
+              echo "mode=signed" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Signed macOS build failed (often caused by an invalid certificate/API-key secret or workspace path). Retrying as an unsigned test DMG so the artifact is not silently omitted."
+              package_unsigned || exit 1
+            fi
+          else
+            package_unsigned || exit 1
+          fi
 
       - name: Verify signed macOS app and notarization
-        if: runner.os == 'macOS' && steps.mac_sign_mode.outputs.mode == 'signed'
+        id: verify_mac
+        if: runner.os == 'macOS' && steps.package_macos.outputs.mode == 'signed'
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -198,24 +161,30 @@ jobs:
           spctl --assess --verbose=4 --type execute "$APP_PATH"
           xcrun stapler validate "$DMG_PATH"
 
-      - name: Label unsigned macOS test artifact
-        if: runner.os == 'macOS' && steps.mac_sign_mode.outputs.mode == 'unsigned'
+      - name: Fallback to unsigned test DMG if signature validation failed
+        if: runner.os == 'macOS' && steps.verify_mac.outcome == 'failure'
         shell: bash
         run: |
           set -euo pipefail
+          echo '::warning::The signed app failed codesign/Gatekeeper/notarization validation. Rebuilding a labelled unsigned test DMG so the Mac download is not silently skipped.'
+          rm -rf release
+          mkdir -p release
+          env CSC_LINK='' CSC_KEY_PASSWORD='' APPLE_API_KEY='' APPLE_API_KEY_ID='' APPLE_API_ISSUER='' CSC_IDENTITY_AUTO_DISCOVERY=false npm run dist:mac
           shopt -s nullglob
           files=(release/*.dmg)
-          if [ "${#files[@]}" -eq 0 ]; then echo 'No DMG produced.' >&2; exit 1; fi
+          if [ "${#files[@]}" -eq 0 ]; then echo 'Could not create fallback DMG after signature verification failed.' >&2; exit 1; fi
           for file in "${files[@]}"; do mv "$file" "${file%.dmg}-UNSIGNED-TEST-ONLY.dmg"; done
           cat > release/UNSIGNED-MACOS-WARNING.txt <<'NOTICE'
-          UNSIGNED TEST BUILD — Apple signing and notarization were not configured or the configured secrets were invalid.
-          Gatekeeper may block this app. Do not distribute this as a trusted public release.
-          To produce a trusted Mac release, configure MAC_CSC_LINK as the base64 content of a Developer ID Application .p12, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY as the base64 content of the App Store Connect .p8 key, APPLE_API_KEY_ID and APPLE_API_ISSUER.
+          UNSIGNED TEST BUILD — the signed/notarized build failed validation.
+          macOS Gatekeeper may block this app. This artifact is retained for local testing only.
+          Configure valid Developer ID signing and notarization credentials for a trusted release.
           NOTICE
 
       - name: List generated output files
         shell: bash
-        run: ls -lah release
+        run: |
+          ls -lah release
+          find release -maxdepth 1 -type f -print
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
@@ -230,7 +199,7 @@ jobs:
           retention-days: 30
 
   publish-release:
-    name: Publish release assets (unsigned Mac DMGs excluded)
+    name: Publish release assets (retain clearly labelled unsigned Mac tests)
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: package
     runs-on: ubuntu-latest
@@ -247,29 +216,33 @@ jobs:
           set -euo pipefail
           if [ -n "$INPUT_TAG" ]; then echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"; else echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"; fi
 
-      - name: Download platform artifacts
+      - name: Download all platform artifacts
         uses: actions/download-artifact@v8
         with:
           pattern: mswnlink-*
           path: release-assets
           merge-multiple: true
 
-      - name: Remove unsigned macOS test builds from public release
+      - name: Verify and prepare release assets (do not skip DMGs)
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          unsigned=(release-assets/*UNSIGNED-TEST-ONLY.dmg)
-          for file in "${unsigned[@]}"; do rm -f "$file"; done
-          rm -f release-assets/UNSIGNED-MACOS-WARNING.txt
-          echo 'Release assets after excluding unsigned Mac test DMGs:'
+          linux_files=(release-assets/*.AppImage)
+          windows_files=(release-assets/*.exe)
+          dmg_files=(release-assets/*.dmg)
+          if [ "${#linux_files[@]}" -lt 1 ]; then echo 'No Fedora/Linux AppImage was downloaded from build artifacts.' >&2; exit 1; fi
+          if [ "${#windows_files[@]}" -lt 1 ]; then echo 'No Windows executable was downloaded from build artifacts.' >&2; exit 1; fi
+          if [ "${#dmg_files[@]}" -lt 2 ]; then echo "Expected Intel and Apple Silicon DMGs, found ${#dmg_files[@]}." >&2; ls -lah release-assets; exit 1; fi
+          if compgen -G 'release-assets/*UNSIGNED-TEST-ONLY.dmg' >/dev/null; then
+            echo '::warning::One or more macOS DMGs are unsigned test builds. They are being retained, with an explicit filename label and warning text, rather than silently skipped.'
+          fi
           ls -lah release-assets
-          compgen -G 'release-assets/*.AppImage' >/dev/null || compgen -G 'release-assets/*.exe' >/dev/null || { echo 'No Linux or Windows release artifacts found.' >&2; exit 1; }
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: main
           files: release-assets/*
           generate_release_notes: true
