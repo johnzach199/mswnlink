@@ -1,0 +1,135 @@
+name: Build and Publish mswnlink Executables
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional release tag to attach the builds to. Leave blank for workflow artifacts only."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Build mswnlink for ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            script: dist:fedora
+            label: fedora-x64
+          - os: windows-latest
+            script: dist:win
+            label: windows-x64
+          - os: macos-15-intel
+            script: dist:mac
+            label: macos-intel-x64
+          - os: macos-15
+            script: dist:mac
+            label: macos-apple-silicon-arm64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Install Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 pkg-config libxtst-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev libxkbfile-dev libpng-dev libpng++-dev
+
+      - name: Print toolchain versions
+        run: |
+          node --version
+          npm --version
+          node -p "process.platform + ' ' + process.arch"
+
+      - name: Install Node dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Check source JavaScript
+        run: npm run check
+
+      - name: Verify native input backend is available
+        shell: bash
+        run: node -e "const r = require('robotjs'); if (!r || typeof r.moveMouse !== 'function') process.exit(1); console.log('RobotJS input backend loaded successfully')"
+
+      - name: Package standalone application
+        run: npm run ${{ matrix.script }}
+
+      - name: Verify macOS app signature inside the DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(release/*.dmg)
+          if [ ${#dmgs[@]} -eq 0 ]; then
+            echo "No DMG was produced."
+            exit 1
+          fi
+          for dmg in "${dmgs[@]}"; do
+            echo "Checking $dmg"
+            mount_dir="$(mktemp -d)"
+            hdiutil attach "$dmg" -mountpoint "$mount_dir" -nobrowse -quiet
+            app_path="$(find "$mount_dir" -maxdepth 1 -name '*.app' -print -quit)"
+            if [ -z "$app_path" ]; then
+              hdiutil detach "$mount_dir" -quiet || true
+              echo "No .app bundle found inside $dmg"
+              exit 1
+            fi
+            codesign --verify --deep --strict --verbose=2 "$app_path"
+            hdiutil detach "$mount_dir" -quiet
+            rmdir "$mount_dir" || true
+          done
+
+      - name: List generated installers
+        shell: bash
+        run: ls -lah release
+
+      - name: Upload standalone artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mswnlink-${{ matrix.label }}
+          path: |
+            release/*.AppImage
+            release/*.exe
+            release/*.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    name: Attach builds to GitHub Release
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mswnlink-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Attach files to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          files: release-assets/*
