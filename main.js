@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, desktopCapturer, session, shell, safeStorage, clipboard, dialog, screen, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, session, shell, safeStorage, clipboard, dialog, screen, Menu, powerSaveBlocker } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('path');
 const os = require('os');
@@ -51,6 +51,7 @@ const discoveredDevices = new Map();
 const localFeaturePreferences = { clipboard: false, fileTransfer: false, monitorSwitching: false };
 const incomingFileHandles = new Map();
 let viewerSessionActive = false;
+let sessionPowerSaveBlockerId = null;
 
 try {
   // Use the native input backend when built for this Electron/OS combination.
@@ -104,6 +105,7 @@ function createWindow() {
     if (url.startsWith('https://')) shell.openExternal(url);
     return { action: 'deny' };
   });
+  mainWindow.on('blur', () => { if (inputAllowed) clearNativeInput(); });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
@@ -238,6 +240,24 @@ function stopDeviceDiscovery() {
 
 function hasActiveSession() {
   return viewerSessionActive || Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
+}
+
+function updateSessionPowerSaveBlocker() {
+  // Keep long remote sessions from being suspended or having the display blanked
+  // mid-session (a common source of apparent fullscreen freezes). Release it as
+  // soon as both the viewer session and host peer are inactive.
+  const active = viewerSessionActive || Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
+  try {
+    if (active && sessionPowerSaveBlockerId === null) {
+      sessionPowerSaveBlockerId = powerSaveBlocker.start('prevent-display-sleep');
+      console.info('[mswnlink] Power-save blocker enabled for active remote session.');
+    } else if (!active && sessionPowerSaveBlockerId !== null) {
+      if (powerSaveBlocker.isStarted(sessionPowerSaveBlockerId)) powerSaveBlocker.stop(sessionPowerSaveBlockerId);
+      sessionPowerSaveBlockerId = null;
+    }
+  } catch (error) {
+    console.warn('[mswnlink] Could not update session power-save blocker:', error.message || error);
+  }
 }
 
 function safeTransferFileName(value) {
@@ -496,6 +516,7 @@ function closePeer(reason = 'Disconnected') {
   activePeer = null;
   inputAllowed = false;
   clearNativeInput();
+  updateSessionPowerSaveBlocker();
   if (oldSocket && oldSocket.readyState === WebSocket.OPEN) {
     try { sendSocket(oldSocket, { type: 'hangup', reason }); } catch {}
     try { oldSocket.close(); } catch {}
@@ -513,7 +534,7 @@ function bindConnection(socket, req) {
   let authenticated = false;
   socket.authNonce = crypto.randomBytes(32).toString('hex');
   sendSocket(socket, { type: 'challenge', nonce: socket.authNonce });
-  socket.on('message', (raw) => {
+  socket.on('message', async (raw) => {
     const msg = parseMessage(raw);
     if (!msg) {
       try { socket.close(1003, 'Invalid message'); } catch {}
@@ -530,18 +551,18 @@ function bindConnection(socket, req) {
       const now = Date.now();
       const previous = badAttempts.get(remoteIp) || { count: 0, time: now };
       if (now - previous.time > 60_000) { previous.count = 0; previous.time = now; }
-      if (previous.count >= 5) {
-        sendSocket(socket, { type: 'rejected', reason: 'Too many attempts. Try again in one minute.' });
-        socket.close(1008, 'Rate limited');
-        return;
-      }
       const derivedKey = derivePairKey(pairingCode || '', socket.authNonce);
       const expectedProof = pairingProof(derivedKey, socket.authNonce);
       if (!safeEqualHex(msg.proof, expectedProof)) {
-        previous.count += 1;
+        // Never permanently lock out a LAN user after a fixed number of typos.
+        // A small capped delay still makes blind guessing less attractive while
+        // allowing the owner to keep correcting an incorrect passphrase.
+        previous.count = Math.min(20, previous.count + 1);
         previous.time = now;
         badAttempts.set(remoteIp, previous);
-        sendSocket(socket, { type: 'rejected', reason: 'That permanent access code is not correct.' });
+        const responseDelayMs = Math.min(600, previous.count * 35);
+        if (responseDelayMs > 0) await new Promise(resolve => setTimeout(resolve, responseDelayMs));
+        sendSocket(socket, { type: 'rejected', reason: 'That permanent access code is not correct. You can try again immediately.' });
         socket.close(1008, 'Incorrect access code');
         return;
       }
@@ -564,6 +585,7 @@ function bindConnection(socket, req) {
           return;
         }
         activeSocket = socket;
+        updateSessionPowerSaveBlocker();
         socket.unattendedAccess = true;
         inputAllowed = true;
         sendSocket(activeSocket, { type: 'accepted', mode: 'control', hostName: os.hostname(), unattended: true });
@@ -600,6 +622,7 @@ function bindConnection(socket, req) {
       activePeer = null;
       inputAllowed = false;
       clearNativeInput();
+      updateSessionPowerSaveBlocker();
       sendToUI('peer-disconnected', { reason: 'The other device disconnected.' });
     }
   });
@@ -669,14 +692,14 @@ function mapKey(event) {
   const named = {
     Enter: 'enter', Escape: 'escape', Backspace: 'backspace', Tab: 'tab', Space: 'space',
     ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down',
-    ShiftLeft: 'shift', ShiftRight: 'shift', ControlLeft: 'control', ControlRight: 'control',
-    AltLeft: 'alt', AltRight: 'alt', MetaLeft: 'command', MetaRight: 'command',
+    ShiftLeft: 'shift', ShiftRight: 'right_shift', ControlLeft: 'left_control', ControlRight: 'right_control',
+    AltLeft: 'alt', AltRight: 'right_alt', MetaLeft: 'command', MetaRight: 'command',
     CapsLock: 'capslock', Delete: 'delete', Home: 'home', End: 'end', PageUp: 'pageup',
     PageDown: 'pagedown', Insert: 'insert', Backquote: '`', Minus: '-', Equal: '=',
     BracketLeft: '[', BracketRight: ']', Backslash: '\\', Semicolon: ';', Quote: "'",
-    Comma: ',', Period: '.', Slash: '/', NumpadAdd: 'add', NumpadSubtract: 'subtract',
-    NumpadMultiply: 'multiply', NumpadDivide: 'divide', NumpadDecimal: 'decimal',
-    NumpadEnter: 'enter', PrintScreen: 'printscreen', ScrollLock: 'scrolllock', Pause: 'pause'
+    Comma: ',', Period: '.', Slash: '/', NumpadAdd: 'numpad_+', NumpadSubtract: 'numpad_-',
+    NumpadMultiply: 'numpad_*', NumpadDivide: 'numpad_/', NumpadDecimal: 'numpad_.',
+    NumpadEnter: 'enter', PrintScreen: 'printscreen', ScrollLock: 'scroll_lock'
   };
   if (named[code]) return named[code];
   if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
@@ -689,7 +712,11 @@ function mapKey(event) {
 }
 
 async function injectInput(event) {
-  if (!hasInputBackend() || !activeSocket || !inputAllowed || !event || typeof event !== 'object') {
+  if (!event || typeof event !== 'object') return { ok: false, reason: 'Invalid input event.' };
+  // Release events are always honored, including after a focus loss or control
+  // revocation, to prevent a stuck mouse button or modifier key.
+  if (event.kind === 'releaseAll') { clearNativeInput(); return { ok: true }; }
+  if (!hasInputBackend() || !activeSocket || !inputAllowed) {
     return { ok: false, reason: 'Control is not enabled.' };
   }
   try {
@@ -715,8 +742,11 @@ async function injectInput(event) {
           Math.round(bounds.y + y * Math.max(0, bounds.height - 1))
         );
       } else {
-        const size = robot.getScreenSize();
-        robot.moveMouse(Math.round(x * Math.max(0, size.width - 1)), Math.round(y * Math.max(0, size.height - 1)));
+        const bounds = screen.getPrimaryDisplay().bounds;
+        robot.moveMouse(
+          Math.round(bounds.x + x * Math.max(0, bounds.width - 1)),
+          Math.round(bounds.y + y * Math.max(0, bounds.height - 1))
+        );
       }
     } else if (event.kind === 'mouse') {
       const button = ({ 0: 'left', 1: 'middle', 2: 'right' })[Number(event.button)];
@@ -736,9 +766,12 @@ async function injectInput(event) {
       if (!key) return { ok: false, reason: 'Unsupported key.' };
       if (event.action === 'down') { robot.keyToggle(key, 'down'); heldKeys.add(key); }
       else if (event.action === 'up') { robot.keyToggle(key, 'up'); heldKeys.delete(key); }
-    } else if (event.kind === 'releaseAll') clearNativeInput();
+    }
     return { ok: true };
   } catch (error) {
+    // If an OS rejects an event (e.g. focus/integrity changes on Windows),
+    // reset every held key/button so the pointer can recover on the next input.
+    clearNativeInput();
     console.warn('[mswnlink] Could not inject input:', error.message);
     return { ok: false, reason: error.message };
   }
@@ -834,9 +867,20 @@ app.whenReady().then(async () => {
       });
       const nativeDisplays = screen.getAllDisplays();
       return sources.map((source, index) => {
-        const display = source.display_id
+        let display = source.display_id
           ? nativeDisplays.find(item => String(item.id) === String(source.display_id))
           : null;
+        // Some Electron backends (notably older X11/Windows capture paths) omit
+        // or mismatch display_id. Use the documented source label when possible,
+        // otherwise use array order only if there is a one-to-one source/display list.
+        if (!display && nativeDisplays.length === sources.length) {
+          const match = String(source.name || '').match(/(?:screen|display|monitor)\s*#?\s*(\d+)/i);
+          if (match) {
+            const labelIndex = Number(match[1]) - 1;
+            if (Number.isInteger(labelIndex) && labelIndex >= 0 && labelIndex < nativeDisplays.length) display = nativeDisplays[labelIndex];
+          }
+          if (!display) display = nativeDisplays[index] || null;
+        }
         return {
           id: source.id,
           name: source.name || `Display ${index + 1}`,
@@ -907,6 +951,7 @@ app.whenReady().then(async () => {
     }
     pendingSocket = null;
     activeSocket = socket;
+    updateSessionPowerSaveBlocker();
     activeSocket.unattendedAccess = false;
     inputAllowed = mode === 'control' && hasInputBackend();
     sendSocket(activeSocket, { type: 'accepted', mode: inputAllowed ? 'control' : 'view', hostName: os.hostname(), unattended: false });
@@ -952,6 +997,7 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('set-viewer-session-active', (_event, active) => {
     viewerSessionActive = Boolean(active);
+    updateSessionPowerSaveBlocker();
     return { ok: true };
   });
   ipcMain.handle('read-local-clipboard', () => {
@@ -1036,6 +1082,10 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   stopDeviceDiscovery();
+  if (sessionPowerSaveBlockerId !== null) {
+    try { if (powerSaveBlocker.isStarted(sessionPowerSaveBlockerId)) powerSaveBlocker.stop(sessionPowerSaveBlockerId); } catch {}
+    sessionPowerSaveBlockerId = null;
+  }
   for (const [token, transfer] of incomingFileHandles) {
     incomingFileHandles.delete(token);
     transfer.handle.close().catch(() => {});

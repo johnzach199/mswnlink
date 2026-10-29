@@ -56,10 +56,23 @@ let lastCompositeDisplayId = null;
 const ALL_DISPLAY_ID = '__all_displays__';
 const pendingFileTransfers = new Map();
 const pendingClipboardRequests = new Map();
+const clipboardBaselineByChannel = new WeakMap();
+const CLIPBOARD_SYNC_INTERVAL_MS = 400;
+const CLIPBOARD_SYNC_MAX_CHARS = 1_000_000;
+const CLIPBOARD_FRAGMENT_CHARS = 4500;
+const incomingClipboardFragments = new Map();
+let clipboardSyncTimer = null;
+let clipboardSyncInFlight = false;
+let videoWatchdogTimer = null;
+let videoWatchdogGeneration = 0;
+let lastRemoteVideoFrameAt = 0;
+let clientDisconnectTimer = null;
+const pressedRemoteButtons = new Set();
 const MAX_TRANSFER_BYTES = 100 * 1024 * 1024;
 const FILE_CHUNK_BYTES = 64 * 1024;
 let remoteDisplays = [];
 let adaptiveQualityTimer = null;
+let adaptiveQualityInFlight = false;
 let previousInboundVideoStats = null;
 let lastAutoQualityProfile = '';
 
@@ -311,10 +324,15 @@ function updateSessionFeatureUI() {
   if ($('#viewer-quality-select')) $('#viewer-quality-select').disabled = !connected;
   const status = $('#transfer-status');
   if (status && !status.dataset.busy) {
-    const allowed = [];
-    if (clipboardEnabled && remoteFeaturePreferences.clipboard) allowed.push('clipboard');
-    if (fileEnabled && remoteFeaturePreferences.fileTransfer) allowed.push('files');
-    status.textContent = allowed.length ? `Ready: ${allowed.join(' and ')} enabled on both devices.` : 'Clipboard and file transfers require both devices to enable the feature.';
+    if (clipboardEnabled && remoteFeaturePreferences.clipboard) {
+      status.textContent = fileEnabled && remoteFeaturePreferences.fileTransfer
+        ? 'Live clipboard sync active · files ready. Copy and paste normally on either PC.'
+        : 'Live clipboard sync active · copy and paste normally on either PC.';
+    } else if (fileEnabled && remoteFeaturePreferences.fileTransfer) {
+      status.textContent = 'File transfer ready. Enable clipboard on both PCs for instant copy/paste.';
+    } else {
+      status.textContent = 'Enable clipboard on both PCs for instant copy/paste; files are optional.';
+    }
   }
   updateShareUI();
 }
@@ -324,7 +342,95 @@ async function setLocalFeaturePreference(feature, enabled) {
   if (!result || !result.ok) throw new Error(result && result.error ? result.error : 'Could not update the feature permission.');
   localFeaturePreferences = { ...localFeaturePreferences, ...result.features };
   broadcastLocalFeatureHello();
-  showToast(`${feature === 'clipboard' ? 'Clipboard sharing' : feature === 'fileTransfer' ? 'File transfers' : 'Monitor switching'} ${enabled ? 'enabled' : 'disabled'} on this device.`);
+  if (feature === 'clipboard' && enabled) {
+    for (const channel of activeChannels()) await primeClipboardBaseline(channel);
+  }
+  showToast(`${feature === 'clipboard' ? (enabled ? 'Live clipboard sync' : 'Clipboard sync') : feature === 'fileTransfer' ? 'File transfers' : 'Monitor switching'} ${enabled ? 'enabled' : 'disabled'} on this device.`);
+}
+
+async function primeClipboardBaseline(channel) {
+  if (!channel || channel.readyState !== 'open' || !localFeaturePreferences.clipboard || !remoteFeaturePreferences.clipboard) return;
+  try {
+    const result = await window.lanAPI.readLocalClipboard();
+    if (result && result.ok) clipboardBaselineByChannel.set(channel, String(result.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS));
+  } catch (error) { console.debug('[mswnlink] Could not prime clipboard sync:', error.message || error); }
+}
+
+function splitClipboardText(text) {
+  const chunks = [];
+  for (let offset = 0; offset < text.length;) {
+    let end = Math.min(text.length, offset + CLIPBOARD_FRAGMENT_CHARS);
+    // Do not split a UTF-16 surrogate pair at a fragment boundary.
+    if (end < text.length && end > offset && /[\uD800-\uDBFF]/.test(text[end - 1]) && /[\uDC00-\uDFFF]/.test(text[end])) end -= 1;
+    if (end <= offset) end = Math.min(text.length, offset + CLIPBOARD_FRAGMENT_CHARS + 1);
+    chunks.push(text.slice(offset, end));
+    offset = end;
+  }
+  return chunks;
+}
+
+async function sendAutomaticClipboard(channel, text) {
+  if (!channel || channel.readyState !== 'open') return false;
+  if (text.length <= CLIPBOARD_FRAGMENT_CHARS) return sendChannelMessage(channel, { kind: 'clipboard-auto', text });
+  const id = crypto.randomUUID();
+  const chunks = splitClipboardText(text);
+  if (chunks.length > 256) throw new Error('Clipboard text is too large to sync.');
+  if (!sendChannelMessage(channel, { kind: 'clipboard-auto-start', id, total: chunks.length, length: text.length })) return false;
+  for (let index = 0; index < chunks.length; index += 1) {
+    if (channel.readyState !== 'open') return false;
+    if (channel.bufferedAmount > 128 * 1024) await waitForChannelBuffer(channel, 512 * 1024);
+    if (!sendChannelMessage(channel, { kind: 'clipboard-auto-chunk', id, index, total: chunks.length, text: chunks[index] })) return false;
+  }
+  return true;
+}
+
+function clearClipboardFragments(channel) {
+  const pending = incomingClipboardFragments.get(channel);
+  if (pending && pending.timer) clearTimeout(pending.timer);
+  incomingClipboardFragments.delete(channel);
+}
+
+async function applyAutomaticClipboardText(channel, value) {
+  if (!localFeaturePreferences.clipboard || !remoteFeaturePreferences.clipboard) return false;
+  const text = String(value || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+  clipboardBaselineByChannel.set(channel, text);
+  const existing = await window.lanAPI.readLocalClipboard();
+  if (existing && existing.ok && String(existing.text || '') === text) return true;
+  const result = await window.lanAPI.writeLocalClipboard(text);
+  if (!result || !result.ok) {
+    showToast(result && result.error ? result.error : 'Could not sync clipboard text.');
+    return false;
+  }
+  clipboardBaselineByChannel.set(channel, text);
+  return true;
+}
+
+async function clipboardSyncTick() {
+  if (clipboardSyncInFlight) return;
+  const channels = activeChannels().filter(channel => channel.readyState === 'open' && localFeaturePreferences.clipboard && remoteFeaturePreferences.clipboard);
+  if (!channels.length) return;
+  clipboardSyncInFlight = true;
+  try {
+    for (const channel of channels) {
+      if (channel.bufferedAmount > 512 * 1024) continue;
+      const result = await window.lanAPI.readLocalClipboard();
+      if (!result || !result.ok) continue;
+      const text = String(result.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+      if (!clipboardBaselineByChannel.has(channel)) {
+        clipboardBaselineByChannel.set(channel, text);
+        continue; // Don't copy an existing clipboard merely because a session opened.
+      }
+      if (clipboardBaselineByChannel.get(channel) !== text) {
+        if (await sendAutomaticClipboard(channel, text)) clipboardBaselineByChannel.set(channel, text);
+      }
+    }
+  } catch (error) { console.debug('[mswnlink] Live clipboard polling failed:', error.message || error); }
+  finally { clipboardSyncInFlight = false; }
+}
+
+function startClipboardSyncMonitor() {
+  if (clipboardSyncTimer) return;
+  clipboardSyncTimer = setInterval(() => { clipboardSyncTick().catch(error => console.debug('[mswnlink] Clipboard monitor error:', error.message || error)); }, CLIPBOARD_SYNC_INTERVAL_MS);
 }
 
 function updateRemoteFeaturePreferences(features = {}) {
@@ -503,6 +609,42 @@ async function handleSessionDataMessage(side, channel, data) {
   if (data.kind === 'mswnlink-hello') {
     updateRemoteFeaturePreferences(data.features || {});
     if (side === 'client' && data.displays) sendChannelMessage(channel, { kind: 'display-list-request' });
+    await primeClipboardBaseline(channel);
+    return true;
+  }
+  if (data.kind === 'clipboard-auto') {
+    await applyAutomaticClipboardText(channel, String(data.text || ''));
+    return true;
+  }
+  if (data.kind === 'clipboard-auto-start') {
+    if (!localFeaturePreferences.clipboard || !remoteFeaturePreferences.clipboard) return true;
+    const id = String(data.id || '');
+    const total = Number(data.total);
+    const length = Number(data.length);
+    if (!id || id.length > 100 || !Number.isInteger(total) || total < 1 || total > 256 || !Number.isInteger(length) || length < 0 || length > CLIPBOARD_SYNC_MAX_CHARS) return true;
+    clearClipboardFragments(channel);
+    const entry = { id, total, length, chunks: new Array(total), received: 0, receivedParts: 0, timer: null };
+    entry.timer = setTimeout(() => { clearClipboardFragments(channel); }, 12000);
+    incomingClipboardFragments.set(channel, entry);
+    return true;
+  }
+  if (data.kind === 'clipboard-auto-chunk') {
+    const pending = incomingClipboardFragments.get(channel);
+    if (!pending || pending.id !== String(data.id || '') || Number(data.total) !== pending.total) return true;
+    const index = Number(data.index);
+    if (!Number.isInteger(index) || index < 0 || index >= pending.total || typeof data.text !== 'string') return true;
+    if (pending.chunks[index] === undefined) {
+      pending.chunks[index] = data.text;
+      pending.receivedParts += 1;
+      pending.received += data.text.length;
+      if (pending.received > pending.length || pending.received > CLIPBOARD_SYNC_MAX_CHARS) { clearClipboardFragments(channel); return true; }
+    }
+    if (pending.receivedParts === pending.total) {
+      const text = pending.chunks.join('');
+      const expectedLength = pending.length;
+      clearClipboardFragments(channel);
+      if (text.length === expectedLength) await applyAutomaticClipboardText(channel, text);
+    }
     return true;
   }
   if (data.kind === 'quality-profile' && side === 'host') {
@@ -719,13 +861,21 @@ async function createAllDisplaysComposite(displays, profile) {
       positions.push({ video, source: displays[index], x, y: Math.floor((canvas.height - h) / 2), w, h });
       x += w;
     });
-    const draw = () => {
+    const targetFps = Math.max(15, Math.min(60, Number(profile.maxFramerate) || 30));
+    const frameInterval = 1000 / targetFps;
+    let lastDrawAt = 0;
+    const draw = (timestamp = performance.now()) => {
       if (stopped) return;
-      ctx.fillStyle = '#111827';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      for (const item of positions) {
-        if (item.video.readyState >= 2) {
-          try { ctx.drawImage(item.video, item.x, item.y, item.w, item.h); } catch {}
+      // A display compositor running at the monitor's full refresh rate can peg
+      // a CPU for minutes in fullscreen. Cap it to the selected capture profile.
+      if (timestamp - lastDrawAt >= frameInterval) {
+        lastDrawAt = timestamp;
+        ctx.fillStyle = '#111827';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        for (const item of positions) {
+          if (item.video.readyState >= 2) {
+            try { ctx.drawImage(item.video, item.x, item.y, item.w, item.h); } catch {}
+          }
         }
       }
       animationFrame = requestAnimationFrame(draw);
@@ -839,7 +989,8 @@ function startAdaptiveQualityMonitor() {
   previousInboundVideoStats = null;
   lastAutoQualityProfile = '';
   adaptiveQualityTimer = setInterval(async () => {
-    if (!clientPeer || !clientConnected || $('#viewer-quality-select').value !== 'auto') return;
+    if (adaptiveQualityInFlight || !clientPeer || !clientConnected || $('#viewer-quality-select').value !== 'auto') return;
+    adaptiveQualityInFlight = true;
     try {
       const stats = await clientPeer.getStats();
       let video = null;
@@ -865,6 +1016,7 @@ function startAdaptiveQualityMonitor() {
         sendChannelMessage(clientChannel, { kind: 'quality-profile', profile: next });
       }
     } catch (error) { console.debug('[mswnlink] Auto quality stats are temporarily unavailable:', error.message); }
+    finally { adaptiveQualityInFlight = false; }
   }, 3000);
   if (adaptiveQualityTimer && adaptiveQualityTimer.unref) adaptiveQualityTimer.unref();
 }
@@ -1192,6 +1344,11 @@ async function createHostPeer() {
       } else if (activeCompositeCapture && (data.kind === 'mouse' || data.kind === 'wheel')) {
         if (!lastCompositeDisplayId) return;
         prepared = { ...data, displayId: lastCompositeDisplayId };
+      } else if (['move', 'mouse', 'wheel'].includes(data.kind) && selectedSourceId) {
+        // Preserve the selected monitor through pointer, click and wheel events;
+        // on Windows/X11 this prevents every click being sent to the primary screen.
+        const activeSource = sources.find(item => item.id === selectedSourceId);
+        if (activeSource && activeSource.displayId) prepared = { ...data, displayId: activeSource.displayId };
       }
       reportInputResult(await window.lanAPI.injectInput(prepared));
     };
@@ -1213,6 +1370,7 @@ async function createHostPeer() {
     channel.onopen = () => {
       if (hostDataChannel === channel) hostDataChannel = channel;
       sendLocalFeatureHello(channel);
+      primeClipboardBaseline(channel).catch(() => {});
       updateSessionFeatureUI();
     };
     channel.onmessage = (messageEvent) => {
@@ -1243,6 +1401,7 @@ async function createHostPeer() {
     };
     channel.onclose = () => {
       if (hostDataChannel === channel) hostDataChannel = null;
+      clearClipboardFragments(channel);
       const transfer = incomingFileTransfers.get(channel);
       if (transfer) {
         incomingFileTransfers.delete(channel);
@@ -1393,6 +1552,46 @@ function showSession(name, address) {
   setPage('session');
 }
 
+function stopRemoteVideoWatchdog() {
+  videoWatchdogGeneration += 1;
+  if (videoWatchdogTimer) clearInterval(videoWatchdogTimer);
+  videoWatchdogTimer = null;
+}
+
+function startRemoteVideoWatchdog() {
+  stopRemoteVideoWatchdog();
+  const generation = videoWatchdogGeneration;
+  const video = $('#remote-video');
+  lastRemoteVideoFrameAt = performance.now();
+  if (typeof video.requestVideoFrameCallback === 'function') {
+    const onFrame = () => {
+      if (generation !== videoWatchdogGeneration) return;
+      lastRemoteVideoFrameAt = performance.now();
+      video.requestVideoFrameCallback(onFrame);
+    };
+    video.requestVideoFrameCallback(onFrame);
+  }
+  videoWatchdogTimer = setInterval(async () => {
+    if (generation !== videoWatchdogGeneration || !clientConnected || !video.srcObject) return;
+    if (video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      try { await video.play(); } catch (error) { console.debug('[mswnlink] Video playback resume deferred:', error.message || error); }
+    }
+    // Recover the HTML video decoder if frames stop arriving while WebRTC is
+    // still connected (e.g. after fullscreen/display power transitions).
+    if (typeof video.requestVideoFrameCallback === 'function' && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && performance.now() - lastRemoteVideoFrameAt > 15000) {
+      const liveTracks = video.srcObject.getVideoTracks().filter(track => track.readyState === 'live');
+      if (liveTracks.length) {
+        try {
+          video.srcObject = new MediaStream(liveTracks);
+          await video.play();
+          console.warn('[mswnlink] Restarted the stalled remote video element.');
+        } catch (error) { console.warn('[mswnlink] Could not recover stalled remote video:', error.message || error); }
+      }
+      lastRemoteVideoFrameAt = performance.now();
+    }
+  }, 4000);
+}
+
 async function startClientPeer() {
   if (clientPeer) return;
   const peer = new RTCPeerConnection({ iceServers: [] });
@@ -1407,6 +1606,7 @@ async function startClientPeer() {
     // essential messages and leave discovery/clipboard/files disabled.
     sendLocalFeatureHello(channel);
     sendChannelMessage(channel, { kind: 'display-list-request' });
+    primeClipboardBaseline(channel).catch(() => {});
     updateSessionFeatureUI();
     if (controlGranted && clientConnected) {
       try { $('#remote-video').focus({ preventScroll: true }); }
@@ -1428,6 +1628,7 @@ async function startClientPeer() {
   };
   channel.onclose = () => {
     if (clientChannel === channel) clientChannel = null;
+    clearClipboardFragments(channel);
     const transfer = incomingFileTransfers.get(channel);
     if (transfer) {
       incomingFileTransfers.delete(channel);
@@ -1454,6 +1655,7 @@ async function startClientPeer() {
     $('#session-state').innerHTML = '<span class="pulse-dot"></span> CONNECTED';
     $('#viewer-resolution').textContent = 'Live stream';
     clientConnected = true;
+    startRemoteVideoWatchdog();
     clearConnectTimer();
     updateClientControlUI();
     updateSessionFeatureUI();
@@ -1468,12 +1670,24 @@ async function startClientPeer() {
   };
   peer.onconnectionstatechange = () => {
     if (peer.connectionState === 'connected') {
+      if (clientDisconnectTimer) clearTimeout(clientDisconnectTimer);
+      clientDisconnectTimer = null;
       clearConnectTimer();
       $('#session-state').innerHTML = '<span class="pulse-dot"></span> CONNECTED';
+      const video = $('#remote-video');
+      if (video.paused && video.srcObject) video.play().catch(() => {});
     } else if (peer.connectionState === 'failed') {
+      if (clientDisconnectTimer) clearTimeout(clientDisconnectTimer);
+      clientDisconnectTimer = null;
       failClientNegotiation('The direct connection failed. Check that both devices are on the same LAN and that the host firewall allows mswnlink on TCP port 49382 and the negotiated WebRTC traffic.');
     } else if (peer.connectionState === 'disconnected') {
       $('#session-state').innerHTML = '<span class="pulse-dot"></span> RECONNECTING';
+      if (clientDisconnectTimer) clearTimeout(clientDisconnectTimer);
+      clientDisconnectTimer = setTimeout(() => {
+        if (clientPeer === peer && peer.connectionState === 'disconnected') {
+          failClientNegotiation('The remote connection did not recover within 25 seconds. Reconnect to continue.');
+        }
+      }, 25000);
     }
   };
   const offer = await peer.createOffer();
@@ -1581,6 +1795,10 @@ function cleanupClient(sendHangup = false) {
   inputErrorToastShown = false;
   clearConnectTimer();
   stopAdaptiveQualityMonitor();
+  stopRemoteVideoWatchdog();
+  if (clientDisconnectTimer) clearTimeout(clientDisconnectTimer);
+  clientDisconnectTimer = null;
+  pressedRemoteButtons.clear();
   window.lanAPI.setViewerSessionActive(false).catch(() => {});
   const socketToClose = clientSocket;
   if (sendHangup && socketToClose && socketToClose.readyState === WebSocket.OPEN && clientPairKey && clientNonce) {
@@ -1739,7 +1957,7 @@ function getNormalizedPointer(event) {
 function handlePointerMove(event) {
   if (!clientConnected || !controlGranted) return;
   const now = performance.now();
-  if (now - lastPointerSend < 10) return;
+  if (now - lastPointerSend < 16) return;
   lastPointerSend = now;
   const point = getNormalizedPointer(event);
   if (point) sendInput({ kind: 'move', ...point });
@@ -1808,6 +2026,7 @@ async function initialize() {
   });
   refreshDiscoveredDevices();
   setInterval(refreshDiscoveredDevices, 5000);
+  startClipboardSyncMonitor();
 
   const wireFeatureToggle = (id, feature) => {
     const toggle = $(`#${id}`);
@@ -1988,8 +2207,14 @@ async function initialize() {
   }
   fullscreenButton.addEventListener('click', toggleViewerFullscreen);
   fullscreenExitOverlay.addEventListener('click', toggleViewerFullscreen);
-  document.addEventListener('fullscreenchange', syncFullscreenButton);
-  document.addEventListener('webkitfullscreenchange', syncFullscreenButton);
+  const resumeViewerVideo = () => {
+    const video = $('#remote-video');
+    if (video && video.srcObject && video.paused) video.play().catch(error => console.debug('[mswnlink] Viewer playback resume deferred:', error.message || error));
+    syncFullscreenButton();
+  };
+  document.addEventListener('fullscreenchange', resumeViewerVideo);
+  document.addEventListener('webkitfullscreenchange', resumeViewerVideo);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) resumeViewerVideo(); });
   syncFullscreenButton();
   $('#copy-address-button').addEventListener('click', copyRemoteAddress);
   $('#toggle-host-control').addEventListener('click', async () => {
@@ -2014,26 +2239,39 @@ async function initialize() {
   $('#remote-video').addEventListener('pointerdown', (event) => {
     if (!clientConnected || !controlGranted) return;
     event.preventDefault();
-    $('#remote-video').focus();
+    $('#remote-video').focus({ preventScroll: true });
     try { $('#remote-video').setPointerCapture(event.pointerId); } catch {}
     const point = getNormalizedPointer(event);
     if (point) sendInput({ kind: 'move', ...point });
+    pressedRemoteButtons.add(event.button);
     sendInput({ kind: 'mouse', action: 'down', button: event.button });
   });
   $('#remote-video').addEventListener('pointerup', (event) => {
     if (!clientConnected || !controlGranted) return;
     event.preventDefault();
+    pressedRemoteButtons.delete(event.button);
     sendInput({ kind: 'mouse', action: 'up', button: event.button });
   });
+  const releaseRemoteInput = () => {
+    pressedRemoteButtons.clear();
+    sendInput({ kind: 'releaseAll' });
+  };
+  $('#remote-video').addEventListener('pointercancel', releaseRemoteInput);
+  $('#remote-video').addEventListener('lostpointercapture', releaseRemoteInput);
   $('#remote-video').addEventListener('wheel', (event) => {
     if (!clientConnected || !controlGranted) return;
     event.preventDefault();
     sendInput({ kind: 'wheel', dx: event.deltaX, dy: event.deltaY });
   }, { passive: false });
   $('#remote-video').addEventListener('contextmenu', event => event.preventDefault());
-  document.addEventListener('keydown', event => handleRemoteKey(event, 'down'));
-  document.addEventListener('keyup', event => handleRemoteKey(event, 'up'));
-  window.addEventListener('blur', () => sendInput({ kind: 'releaseAll' }));
+  // Capture-phase handlers keep ordinary typing/shortcuts from being consumed
+  // by app controls first, while the input guard in handleRemoteKey leaves form
+  // fields editable. This fixes lost keyboard events on Windows viewer windows.
+  window.addEventListener('keydown', event => handleRemoteKey(event, 'down'), true);
+  window.addEventListener('keyup', event => handleRemoteKey(event, 'up'), true);
+  window.addEventListener('blur', releaseRemoteInput);
+  window.addEventListener('pagehide', releaseRemoteInput);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseRemoteInput(); });
   window.addEventListener('beforeunload', () => {
     cleanupClient(true);
     if (hostInfo) window.lanAPI.stopHost();
