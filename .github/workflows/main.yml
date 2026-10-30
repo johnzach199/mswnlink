@@ -69,7 +69,7 @@ jobs:
             echo "All Apple signing/notarization secrets are present. The workflow will try a signed build first."
           else
             echo "mode=unsigned" >> "$GITHUB_OUTPUT"
-            echo "::warning::Apple signing secrets are incomplete (missing: ${missing[*]}). The DMG will be signed ad hoc (users approve it once or use scripts/install-mac.sh)."
+            echo "::warning::Apple signing secrets are incomplete (missing: ${missing[*]}). An unsigned, clearly labelled test DMG will be produced and retained as a release asset."
           fi
 
       - name: Install Linux native build dependencies
@@ -101,7 +101,7 @@ jobs:
         if: runner.os != 'macOS'
         run: npm run ${{ matrix.script }}
 
-      - name: Package macOS app (Developer ID if configured, ad-hoc signed otherwise)
+      - name: Package macOS app (signed if possible; unsigned test DMG otherwise)
         id: package_macos
         if: runner.os == 'macOS'
         shell: bash
@@ -118,7 +118,7 @@ jobs:
           package_unsigned() {
             rm -rf release
             mkdir -p release
-            echo "Building a DMG without Apple credentials; scripts/after-pack.cjs signs it ad hoc."
+            echo "Building unsigned test DMG with code signing explicitly disabled."
 
             # IMPORTANT: don't set CSC_LINK='' — some electron-builder versions resolve
             # an empty certificate path to the current workspace directory, causing
@@ -159,6 +159,12 @@ jobs:
               echo 'electron-builder completed but no DMG was created.' >&2
               return 1
             fi
+            for file in "${files[@]}"; do mv "$file" "${file%.dmg}-UNSIGNED-TEST-ONLY.dmg"; done
+            cat > release/UNSIGNED-MACOS-WARNING.txt <<'NOTICE'
+          UNSIGNED TEST BUILD — Apple Developer ID signing and notarization did not complete.
+          Gatekeeper may block this app. This file is included for local testing and is not a trusted public build.
+          Configure MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, and APPLE_API_ISSUER for trusted distribution.
+          NOTICE
             echo "mode=unsigned" >> "$GITHUB_OUTPUT"
           }
 
@@ -173,11 +179,11 @@ jobs:
                    xcrun stapler validate "$DMG_PATH"; then
                   echo "mode=signed" >> "$GITHUB_OUTPUT"
                 else
-                  echo "::warning::Signed app verification failed. Retrying with an ad-hoc signature."
+                  echo "::warning::Signed app verification failed. Retrying as an unsigned test DMG."
                   package_unsigned || exit 1
                 fi
               else
-                echo "::warning::Signed build produced no app or DMG. Retrying with an ad-hoc signature."
+                echo "::warning::Signed build produced no app or DMG. Retrying as an unsigned test DMG."
                 package_unsigned || exit 1
               fi
             else
@@ -187,23 +193,6 @@ jobs:
           else
             package_unsigned || exit 1
           fi
-
-      # An invalid signature is what makes macOS call an app "damaged". Fail here instead of publishing it.
-      - name: Verify the app signature inside every DMG
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          for dmg in release/*.dmg; do
-            echo "Checking $dmg"
-            MOUNT="$(mktemp -d)"
-            hdiutil attach "$dmg" -mountpoint "$MOUNT" -nobrowse -quiet
-            APP="$(find "$MOUNT" -maxdepth 1 -name '*.app' -print -quit)"
-            test -n "$APP" || { echo "No .app inside $dmg" >&2; exit 1; }
-            codesign --verify --deep --strict --verbose=2 "$APP"
-            hdiutil detach "$MOUNT" -quiet
-          done
 
       - name: List generated output files
         shell: bash
@@ -219,11 +208,12 @@ jobs:
             release/*.AppImage
             release/*.exe
             release/*.dmg
+            release/UNSIGNED-MACOS-WARNING.txt
           if-no-files-found: error
           retention-days: 30
 
   publish-release:
-    name: Publish release assets
+    name: Publish release assets (retain clearly labelled unsigned Mac tests)
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     needs: package
     runs-on: ubuntu-latest
@@ -258,6 +248,9 @@ jobs:
           if [ "${#linux_files[@]}" -lt 1 ]; then echo 'No Fedora/Linux AppImage was downloaded from build artifacts.' >&2; exit 1; fi
           if [ "${#windows_files[@]}" -lt 1 ]; then echo 'No Windows executable was downloaded from build artifacts.' >&2; exit 1; fi
           if [ "${#dmg_files[@]}" -lt 2 ]; then echo "Expected Intel and Apple Silicon DMGs, found ${#dmg_files[@]}." >&2; ls -lah release-assets; exit 1; fi
+          if compgen -G 'release-assets/*UNSIGNED-TEST-ONLY.dmg' >/dev/null; then
+            echo '::warning::One or more macOS DMGs are unsigned test builds. They are being retained, with an explicit filename label and warning text, rather than silently skipped.'
+          fi
           ls -lah release-assets
 
       - name: Publish GitHub release
@@ -267,12 +260,5 @@ jobs:
           target_commitish: main
           files: release-assets/*
           generate_release_notes: true
-          body: |
-            ### Install on a Mac without the "Apple could not verify..." warning
-            Paste this once into Terminal (it downloads with curl, so macOS never flags the app):
-            ```
-            curl -fsSL https://raw.githubusercontent.com/johnzach199/mswnlink/main/scripts/install-mac.sh | bash
-            ```
-            Or open the DMG normally and, when macOS blocks it, go to System Settings > Privacy & Security and choose Open Anyway.
           fail_on_unmatched_files: true
           token: ${{ secrets.GITHUB_TOKEN }}
