@@ -51,7 +51,7 @@ button,input,textarea{font:inherit}button{cursor:pointer;border:0;border-radius:
       <div class="actions"><button id="copy-answer" class="secondary" disabled>Copy answer</button><button id="download-answer" class="ghost" disabled>Save answer file</button></div>
       <div class="viewer">
         <div class="field-label"><span>Live screen</span><span class="pill">View only</span></div>
-        <div class="video-shell" id="video-shell"><video id="remote-video" autoplay playsinline></video><div class="video-placeholder" id="video-placeholder"><div class="screen-icon">▣</div><b>The remote screen will appear here</b><span>Paste the host offer and create an answer to start a direct LAN stream.</span></div><div class="video-overlay-controls"><button id="fullscreen-view" class="fullscreen-btn" type="button" disabled aria-label="Show live screen in fullscreen" title="Fullscreen live screen"><span aria-hidden="true">⛶</span> Fullscreen</button></div></div>
+        <div class="video-shell" id="video-shell"><video id="remote-video" autoplay muted playsinline></video><div class="video-placeholder" id="video-placeholder"><div class="screen-icon">▣</div><b>The remote screen will appear here</b><span>Paste the host offer and create an answer to start a direct LAN stream.</span></div><div class="video-overlay-controls"><button id="fullscreen-view" class="fullscreen-btn" type="button" disabled aria-label="Show live screen in fullscreen" title="Fullscreen live screen"><span aria-hidden="true">⛶</span> Fullscreen</button></div></div>
       </div>
       <ol class="steps"><li><span class="num">1</span><span>Load/paste the host's offer and click <b>Create answer</b>.</span></li><li><span class="num">2</span><span>Copy or save the answer and transfer it back to the host.</span></li><li><span class="num">3</span><span>Ask the host to apply the answer. Your video should appear here.</span></li></ol>
     </section>
@@ -267,6 +267,7 @@ button,input,textarea{font:inherit}button{cursor:pointer;border:0;border-radius:
       viewerPc.addEventListener('track', event => {
         const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
         el.video.srcObject = stream;
+        el.video.muted = true;
         el.placeholder.classList.add('hidden');
         setControls();
         el.video.play().catch(() => {});

@@ -1,6 +1,6 @@
 {
   "name": "mswnlink",
-  "version": "0.3.1",
+  "version": "3.3.0",
   "description": "A simple local-network remote desktop with optional unattended access.",
   "main": "main.js",
   "author": "mswnlink contributors",
@@ -14,7 +14,7 @@
     "dist:win": "electron-builder --win portable --publish never",
     "dist:mac": "electron-builder --mac dmg --publish never",
     "dist": "electron-builder --publish never",
-    "check": "node --check launch.js && node --check main.js && node --check preload.js && node --check renderer.js && node --check theme-init.js && node --check scripts/after-pack.cjs && node --check linux-wayland-input.js && node --check win32-input.js && node --check lib/input-protocol.js"
+    "check": "node --check launch.js && node --check main.js && node --check preload.js && node --check renderer.js && node --check theme-init.js && node --check input-backend.js && node --check linux-wayland-input.js && node --check win32-input.js && node --check lib/input-protocol.js && node --check scripts/after-pack.cjs && node --check scripts/verify-win32-worker.cjs && node --check test/input-protocol.test.js"
   },
   "dependencies": {
     "ws": "^8.18.3",
@@ -56,7 +56,7 @@
       "target": [
         "portable"
       ],
-      "artifactName": "mswnlink-windows-${version}-${arch}.${ext}",
+      "artifactName": "mswnlink-windows-3.3-${arch}.${ext}",
       "icon": "assets/mswnlink.ico"
     },
     "mac": {
@@ -64,7 +64,7 @@
         "dmg"
       ],
       "category": "public.app-category.utilities",
-      "artifactName": "mswnlink-macos-${version}-${arch}.${ext}",
+      "artifactName": "mswnlink-macos-3.3-${arch}.${ext}",
       "hardenedRuntime": true,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.inherit.plist",
@@ -80,7 +80,7 @@
       ],
       "category": "Network",
       "executableName": "mswnlink",
-      "artifactName": "mswnlink-fedora-${version}-${arch}.${ext}",
+      "artifactName": "mswnlink-fedora-3.3-${arch}.${ext}",
       "icon": "assets/mswnlink.png"
     },
     "afterPack": "scripts/after-pack.cjs",

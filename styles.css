@@ -284,7 +284,8 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
 .viewer-loader { width: 28px; height: 28px; margin-bottom: 8px; border-radius: 50%; border: 3px solid #26302d; border-top-color: #5ce0c6; animation: spin 0.9s linear infinite; }
 .viewer-toolbar { display: flex; align-items: center; gap: 14px; padding: 6px 12px; background: var(--surface); border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
 .viewer-legend { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 600; white-space: nowrap; }
-.toolbar-led { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.toolbar-led { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background-color 0.2s, box-shadow 0.2s; }
+.toolbar-led.active { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
 .viewer-hint { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .viewer-resolution { white-space: nowrap; }
 .fullscreen-exit-overlay { display: none; position: absolute; top: 14px; right: 14px; z-index: 3; padding: 8px 14px; border: 1px solid rgba(255, 255, 255, 0.25); border-radius: var(--radius-s); background: rgba(10, 13, 12, 0.78); color: #fff; font-weight: 600; backdrop-filter: blur(8px); }

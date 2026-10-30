@@ -69,6 +69,7 @@ let videoWatchdogTimer = null;
 let videoWatchdogGeneration = 0;
 let lastRemoteVideoFrameAt = 0;
 let clientDisconnectTimer = null;
+let hostDisconnectTimer = null;
 const pressedRemoteButtons = new Set();
 const MAX_TRANSFER_BYTES = 100 * 1024 * 1024;
 const FILE_CHUNK_BYTES = 64 * 1024;
@@ -505,12 +506,14 @@ async function sendLocalClipboard(channel) {
   const result = await window.lanAPI.readLocalClipboard();
   if (!result || !result.ok) throw new Error(result && result.error ? result.error : 'Could not read the local clipboard.');
   const id = crypto.randomUUID();
+  const textToSend = String(result.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
   setPendingClipboard(id, 'send', channel);
-  if (!sendChannelMessage(channel, { kind: 'clipboard-set', id, text: String(result.text || '').slice(0, 200000) })) {
+  if (!sendChannelMessage(channel, { kind: 'clipboard-set', id, text: textToSend })) {
     const pending = pendingClipboardRequests.get(id); if (pending) clearTimeout(pending.timer);
     pendingClipboardRequests.delete(id);
     throw new Error('Could not send clipboard text.');
   }
+  clipboardBaselineByChannel.set(channel, textToSend);
   showToast('Sending clipboard text to the remote computer…');
 }
 
@@ -760,7 +763,9 @@ async function handleSessionDataMessage(side, channel, data) {
       sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: false, reason: 'Clipboard sharing is disabled on the receiving device.' });
       return true;
     }
-    const result = await window.lanAPI.writeLocalClipboard(String(data.text || '').slice(0, 200000));
+    const incomingText = String(data.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+    clipboardBaselineByChannel.set(channel, incomingText);
+    const result = await window.lanAPI.writeLocalClipboard(incomingText);
     sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: Boolean(result && result.ok), reason: result && result.error ? result.error : '' });
     return true;
   }
@@ -771,7 +776,7 @@ async function handleSessionDataMessage(side, channel, data) {
     }
     const result = await window.lanAPI.readLocalClipboard();
     if (!result || !result.ok) sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: false, reason: result && result.error ? result.error : 'Could not read clipboard.' });
-    else sendChannelMessage(channel, { kind: 'clipboard-value', id: data.id, text: String(result.text || '').slice(0, 200000) });
+    else sendChannelMessage(channel, { kind: 'clipboard-value', id: data.id, text: String(result.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS) });
     return true;
   }
   if (data.kind === 'clipboard-value') {
@@ -779,7 +784,9 @@ async function handleSessionDataMessage(side, channel, data) {
     if (!pending || pending.mode !== 'get') return true;
     clearTimeout(pending.timer); pendingClipboardRequests.delete(String(data.id));
     if (!localFeaturePreferences.clipboard) { showToast('Enable Allow clipboard to receive clipboard text.'); return true; }
-    const result = await window.lanAPI.writeLocalClipboard(String(data.text || '').slice(0, 200000));
+    const receivedText = String(data.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+    clipboardBaselineByChannel.set(channel, receivedText);
+    const result = await window.lanAPI.writeLocalClipboard(receivedText);
     if (!result || !result.ok) showToast(result && result.error ? result.error : 'Could not update the local clipboard.');
     else showToast('Remote clipboard copied to this device.');
     return true;
@@ -1426,12 +1433,16 @@ function normalizeIceCandidate(value) {
 }
 
 function closeHostPeer() {
+  if (hostDisconnectTimer) {
+    clearTimeout(hostDisconnectTimer);
+    hostDisconnectTimer = null;
+  }
   const hadPeer = Boolean(hostPeer);
   hostDataChannel = null;
   hostEnqueueInput = null;
   remoteFeaturePreferences = { clipboard: false, fileTransfer: false, monitorSwitching: false };
   if (hostPeer) {
-    try { hostPeer.ontrack = null; hostPeer.onicecandidate = null; hostPeer.ondatachannel = null; hostPeer.close(); } catch {}
+    try { hostPeer.ontrack = null; hostPeer.onicecandidate = null; hostPeer.ondatachannel = null; hostPeer.onconnectionstatechange = null; hostPeer.close(); } catch {}
   }
   hostPeer = null;
   hostRemoteCandidates = [];
@@ -1578,11 +1589,25 @@ async function createHostPeer() {
     };
   };
   peer.onconnectionstatechange = () => {
-    if (peer.connectionState === 'failed' || peer.connectionState === 'closed' || peer.connectionState === 'disconnected') {
-      if (hostPeer === peer) {
-        closeHostPeer();
-        window.lanAPI.setInputAllowed(false).catch(() => {});
+    if (hostPeer !== peer) return;
+    if (peer.connectionState === 'connected') {
+      if (hostDisconnectTimer) {
+        clearTimeout(hostDisconnectTimer);
+        hostDisconnectTimer = null;
       }
+    } else if (peer.connectionState === 'disconnected') {
+      // Match the viewer's 25-second grace period so brief Wi-Fi/LAN packet drops recover cleanly.
+      window.lanAPI.injectInput({ kind: 'releaseAll' }).catch(() => {});
+      if (hostDisconnectTimer) clearTimeout(hostDisconnectTimer);
+      hostDisconnectTimer = setTimeout(() => {
+        if (hostPeer === peer && peer.connectionState === 'disconnected') {
+          closeHostPeer();
+          window.lanAPI.setInputAllowed(false).catch(() => {});
+        }
+      }, 25000);
+    } else if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
+      closeHostPeer();
+      window.lanAPI.setInputAllowed(false).catch(() => {});
     }
   };
   return peer;
@@ -1693,6 +1718,8 @@ async function sendClientSignal(message) {
 
 function updateClientControlUI() {
   $('#control-status-label').textContent = controlGranted ? 'Mouse & keyboard control enabled' : 'View-only session';
+  const toolbarLed = $('.toolbar-led');
+  if (toolbarLed) toolbarLed.classList.toggle('active', controlGranted);
   $('#session-permission-title').textContent = controlGranted ? 'Mouse and keyboard enabled' : 'View-only access';
   $('#session-permission-copy').textContent = controlGranted
     ? (clientUnattended ? 'Connected using the host’s unattended-access setting. The host can disable access or disconnect at any time.' : 'The host has approved remote input for this session. The host can revoke it at any time.')
@@ -2199,15 +2226,16 @@ function handleRemoteKey(event, action) {
   }
 
   const key = String(event.key || '');
-  const printableNonControl = key.length >= 1 && key.length <= 2 && !/[\u0000-\u001f\u007f]/.test(key) && !/^[A-Za-z]{2,}$/.test(key);
-  const textInput = printableNonControl && !event.ctrlKey && !event.altKey && !event.metaKey && (!event.shiftKey || !/^[a-zA-Z0-9]$/.test(key));
-  // Native held keys only need one keydown per press; printable text is sent
-  // character-wise on Windows, so preserve auto-repeat for held letters.
+  const isSpaceKey = event.code === 'Space' || key === ' ';
+  const printableNonControl = !isSpaceKey && key.length >= 1 && key.length <= 2 && !/[\u0000-\u001f\u007f]/.test(key) && !/^[A-Za-z]{2,}$/.test(key);
+  const textInput = Boolean(printableNonControl && !event.ctrlKey && !event.altKey && !event.metaKey);
+  // Native held keys (including Spacebar for UI button/checkbox activation) need
+  // real VK keydown/keyup; printable characters use Unicode text injection on Windows.
   if (action === 'down' && event.repeat && !textInput) return;
   event.preventDefault();
   const sent = sendInput({
     kind: 'key', action, code: event.code, key,
-    textInput: Boolean(key.length === 1 && !event.ctrlKey && !event.altKey && !event.metaKey),
+    textInput,
     shiftKey: Boolean(event.shiftKey), ctrlKey: Boolean(event.ctrlKey),
     altKey: Boolean(event.altKey), metaKey: Boolean(event.metaKey),
     location: Number(event.location) || 0
@@ -2536,6 +2564,13 @@ async function initialize() {
     showToast('Remote device disconnected. Screen sharing remains active.');
   });
   $('#pairing-code').addEventListener('input', () => { $('#pairing-code').value = $('#pairing-code').value.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 64); });
+  $('#persistent-access-code').addEventListener('input', () => { $('#persistent-access-code').value = $('#persistent-access-code').value.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 64); });
+  $('#persistent-access-code').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      $('#save-access-code').click();
+    }
+  });
   // Keep the resolution label current when the host switches monitor or quality.
   $('#remote-video').addEventListener('resize', () => {
     const video = $('#remote-video');

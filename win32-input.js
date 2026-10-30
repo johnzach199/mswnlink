@@ -43,12 +43,8 @@ $ErrorActionPreference = 'Stop'
 
 $code = @"
 using System;
-using System.IO;
-using System.IO.Pipes;
-using System.Runtime.InteropServices;
-using System.Security.Principal;
-using System.Text;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 
 public static class MswnlinkWin32Worker {
     [StructLayout(LayoutKind.Sequential)]
@@ -154,7 +150,10 @@ public static class MswnlinkWin32Worker {
     [DllImport("user32.dll")]
     public static extern bool SetProcessDPIAware();
 
-    private static HashSet<int> heldButtons = new HashSet<int>();
+    [DllImport("shell32.dll")]
+    public static extern bool IsUserAnAdmin();
+
+    private static Dictionary<int, bool> heldButtons = new Dictionary<int, bool>();
     private static Dictionary<ushort, bool> heldKeys = new Dictionary<ushort, bool>();
     private static int lastTargetX = 0;
     private static int lastTargetY = 0;
@@ -168,10 +167,7 @@ public static class MswnlinkWin32Worker {
 
     public static bool IsElevated() {
         try {
-            using (WindowsIdentity id = WindowsIdentity.GetCurrent()) {
-                WindowsPrincipal principal = new WindowsPrincipal(id);
-                return principal.IsInRole(WindowsBuiltInRole.Administrator);
-            }
+            return IsUserAnAdmin();
         } catch {
             return false;
         }
@@ -184,20 +180,24 @@ public static class MswnlinkWin32Worker {
     }
 
     private static void EscapeElevatedForeground() {
-        IntPtr tray = FindWindow("Shell_TrayWnd", null);
-        if (tray == IntPtr.Zero) return;
+        IntPtr target = FindWindow("Shell_TrayWnd", null);
+        if (target == IntPtr.Zero) target = FindWindow("Progman", null);
+        if (target == IntPtr.Zero) return;
         IntPtr fg = GetForegroundWindow();
         uint dummy = 0;
         uint curThread = GetCurrentThreadId();
-        uint trayThread = GetWindowThreadProcessId(tray, out dummy);
+        uint targetThread = GetWindowThreadProcessId(target, out dummy);
         uint fgThread = fg != IntPtr.Zero ? GetWindowThreadProcessId(fg, out dummy) : 0;
         try {
             if (fgThread != 0 && fgThread != curThread) AttachThreadInput(curThread, fgThread, true);
-            if (trayThread != 0 && trayThread != curThread) AttachThreadInput(curThread, trayThread, true);
-            SetForegroundWindow(tray);
+            if (targetThread != 0 && targetThread != curThread) AttachThreadInput(curThread, targetThread, true);
+            if (!SetForegroundWindow(target)) {
+                IntPtr progman = FindWindow("Progman", null);
+                if (progman != IntPtr.Zero && progman != target) SetForegroundWindow(progman);
+            }
         } catch {}
         finally {
-            try { if (trayThread != 0 && trayThread != curThread) AttachThreadInput(curThread, trayThread, false); } catch {}
+            try { if (targetThread != 0 && targetThread != curThread) AttachThreadInput(curThread, targetThread, false); } catch {}
             try { if (fgThread != 0 && fgThread != curThread) AttachThreadInput(curThread, fgThread, false); } catch {}
         }
     }
@@ -250,7 +250,7 @@ public static class MswnlinkWin32Worker {
         inp[0].type = INPUT_MOUSE;
         inp[0].U.mi.dwFlags = flag;
         uint sent = SendInput(1, inp, Marshal.SizeOf(typeof(INPUT)));
-        if (down && sent > 0) heldButtons.Add(button);
+        if (down && sent > 0) heldButtons[button] = true;
         else heldButtons.Remove(button);
 
         if (sent == 0 && !down) {
@@ -330,6 +330,13 @@ public static class MswnlinkWin32Worker {
             item.U.ki.dwFlags = (isDown ? 0u : KEYEVENTF_KEYUP) | (item.U.ki.wScan != 0 ? KEYEVENTF_SCANCODE : 0u);
             seq.Add(item);
         };
+        // Clear held Alt or unintended Shift so Ctrl+C / Ctrl+V / Ctrl+Y fire cleanly.
+        addKey(0xA4, false); // VK_LMENU up
+        addKey(0xA5, false); // VK_RMENU up
+        if (!withShift) {
+            addKey(0xA0, false); // VK_LSHIFT up
+            addKey(0xA1, false); // VK_RSHIFT up
+        }
         addKey(0xA2, true); // VK_LCONTROL down
         if (withShift) addKey(0xA0, true); // VK_LSHIFT down
         addKey(vk, true);
@@ -345,7 +352,7 @@ public static class MswnlinkWin32Worker {
             try { KeyToggle(kv.Key, kv.Value, false); } catch {}
         }
         heldKeys.Clear();
-        foreach (int b in new List<int>(heldButtons)) {
+        foreach (int b in new List<int>(heldButtons.Keys)) {
             try {
                 uint flag = b == 0 ? MOUSEEVENTF_LEFTUP : (b == 1 ? MOUSEEVENTF_MIDDLEUP : MOUSEEVENTF_RIGHTUP);
                 INPUT[] inp = new INPUT[1];
@@ -584,18 +591,26 @@ class WindowsInputBackend {
     // Electron's screen.getAllDisplays() reports DIPs; convert to physical pixels
     // matching our Per-Monitor DPI-Aware v2 worker.
     let physBounds = null;
-    if (typeof this.screen.dipToScreenPoint === 'function') {
+    if (typeof this.screen.dipToScreenRect === 'function') {
+      try {
+        const rect = this.screen.dipToScreenRect(null, bounds);
+        if (rect && rect.width > 0 && rect.height > 0) {
+          physBounds = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+        }
+      } catch {}
+    }
+    if (!physBounds && typeof this.screen.dipToScreenPoint === 'function') {
       try {
         const topLeft = this.screen.dipToScreenPoint({ x: bounds.x, y: bounds.y });
         const bottomRight = this.screen.dipToScreenPoint({
-          x: bounds.x + Math.max(0, bounds.width - 1),
-          y: bounds.y + Math.max(0, bounds.height - 1)
+          x: bounds.x + Math.max(1, bounds.width),
+          y: bounds.y + Math.max(1, bounds.height)
         });
         physBounds = {
           x: topLeft.x,
           y: topLeft.y,
-          width: Math.max(1, bottomRight.x - topLeft.x + 1),
-          height: Math.max(1, bottomRight.y - topLeft.y + 1)
+          width: Math.max(1, bottomRight.x - topLeft.x),
+          height: Math.max(1, bottomRight.y - topLeft.y)
         };
       } catch {}
     }

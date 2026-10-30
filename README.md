@@ -1,4 +1,4 @@
-# mswnlink
+# mswnlink 3.3
 
 A simple remote desktop for computers on your local network. One computer shares its screen, another views and controls it, directly over the LAN. No account, no cloud, no relay.
 
@@ -64,7 +64,7 @@ RobotJS (input on macOS and X11) is optional; Windows uses the built-in Win32 `S
 
 ## Build the apps
 
-Push a tag like `v0.3.1` (or run the workflow from the **Actions** tab) to build every platform on GitHub and attach the files to a release. Locally: `npm run dist:fedora`, `dist:win`, `dist:mac`.
+Push a tag like `v3.3` (or run the workflow from the **Actions** tab) to build every platform on GitHub and attach the files to a release. Locally: `npm run dist:fedora`, `dist:win`, `dist:mac`.
 
 ## Security notes
 

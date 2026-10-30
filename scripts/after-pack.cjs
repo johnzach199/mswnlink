@@ -44,31 +44,79 @@ exec "$APP_DIR/${executableName}-electron" "$@"
   fs.chmodSync(original, 0o755);
 };
 
-/**
- * macOS without an Apple Developer ID: repackaging Electron breaks its original
- * signature, and an app with a broken signature is reported as "damaged" or as
- * malware by Gatekeeper (worst on Apple Silicon). Re-signing the whole bundle
- * "ad hoc" (free, no Apple account) gives it a valid signature. macOS still asks
- * the user to approve a downloaded, non-notarized app once; installing with
- * scripts/install-mac.sh avoids even that prompt.
- *
- * When real credentials are present (CSC_LINK) electron-builder signs and
- * notarizes the app itself and this step is skipped.
- */
 function run(command, args) {
   execFileSync(command, args, { stdio: 'inherit' });
 }
 
-function findNativeFiles(directory, found = []) {
+const MACHO_SINGLE_MAGICS = new Set([
+  0xfeedface, // MH_MAGIC (32-bit)
+  0xcefaedfe, // MH_CIGAM
+  0xfeedfacf, // MH_MAGIC_64 (x86_64 / arm64)
+  0xcffaedfe  // MH_CIGAM_64
+]);
+
+const MACHO_FAT_MAGICS = new Set([
+  0xcafebabe, // FAT_MAGIC (universal binary)
+  0xbebafeca, // FAT_CIGAM
+  0xcafebabf, // FAT_MAGIC_64
+  0xbfbafeca  // FAT_CIGAM_64
+]);
+
+function isMachOBinary(filePath) {
+  let fd = null;
+  try {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.size < 8) return false;
+    fd = fs.openSync(filePath, 'r');
+    const header = Buffer.alloc(8);
+    const bytesRead = fs.readSync(fd, header, 0, 8, 0);
+    if (bytesRead < 8) return false;
+    const magic = header.readUInt32BE(0);
+    if (MACHO_SINGLE_MAGICS.has(magic)) return true;
+    if (MACHO_FAT_MAGICS.has(magic)) {
+      const nfatArch =
+        magic === 0xcafebabe || magic === 0xcafebabf
+          ? header.readUInt32BE(4)
+          : header.readUInt32LE(4);
+      return nfatArch >= 1 && nfatArch <= 8;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function collectMachOFiles(directory, { skipBundles = false } = {}, found = []) {
+  if (!fs.existsSync(directory)) return found;
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-    const full = path.join(directory, entry.name);
     if (entry.isSymbolicLink()) continue;
-    if (entry.isDirectory()) findNativeFiles(full, found);
-    else if (entry.name.endsWith('.node') || entry.name.endsWith('.dylib')) found.push(full);
+    const full = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      if (skipBundles && (entry.name.endsWith('.app') || entry.name.endsWith('.framework'))) {
+        continue;
+      }
+      collectMachOFiles(full, { skipBundles }, found);
+    } else if (entry.isFile() && isMachOBinary(full)) {
+      found.push(full);
+    }
   }
   return found;
 }
 
+/**
+ * macOS without an Apple Developer ID: repackaging Electron invalidates its
+ * original signature. Using bare `codesign --deep` strips JIT/unsigned-memory
+ * entitlements from Electron Helper (GPU)/(Renderer) AND misses nested Mach-O
+ * tools like Squirrel.framework/Versions/A/Resources/ShipIt on Intel x64.
+ *
+ * Signing strictly inside-out (all leaf Mach-O files -> frameworks -> helper
+ * .app bundles with inherit entitlements -> outer .app with com.mswnlink.lan)
+ * passes `codesign --verify --deep --strict` on both Intel x64 and Apple Silicon.
+ */
 function signMacAdHoc(context) {
   const realSigning = Boolean(process.env.CSC_LINK) && process.env.CSC_IDENTITY_AUTO_DISCOVERY !== 'false';
   if (realSigning) {
@@ -83,45 +131,53 @@ function signMacAdHoc(context) {
   const appPath = path.join(context.appOutDir, `${appName}.app`);
   if (!fs.existsSync(appPath)) throw new Error(`Expected macOS app bundle not found: ${appPath}`);
 
-  console.log(`[after-pack] Ad-hoc signing ${appPath} (inside-out with entitlements for ScreenCaptureKit & TCC)`);
+  console.log(`[after-pack] Ad-hoc signing ${appPath} inside-out (${context.arch || process.arch})`);
 
-  // 1. Sign unpacked native modules (.node / .dylib) first.
-  for (const file of findNativeFiles(appPath)) {
+  // 1. Sign unpacked native addons (.node / .dylib) inside Contents/Resources first.
+  const resourcesDir = path.join(appPath, 'Contents', 'Resources');
+  for (const file of collectMachOFiles(resourcesDir)) {
     run('codesign', ['--force', '--sign', '-', '--timestamp=none', file]);
   }
 
-  // 2. Sign nested framework helpers and frameworks inside Contents/Frameworks
-  //    before signing helper .app bundles. Using `codesign --deep` without
-  //    inside-out signing strips JIT/unsigned-memory entitlements from Electron
-  //    Helper (GPU) and Helper (Renderer), breaking macOS ScreenCaptureKit.
+  // 2. Sign frameworks inside-out (including Squirrel's Resources/ShipIt on Intel x64,
+  //    Electron Framework's Libraries/*.dylib and Helpers/chrome_crashpad_handler, etc.).
   const frameworksDir = path.join(appPath, 'Contents', 'Frameworks');
   if (fs.existsSync(frameworksDir)) {
     const entries = fs.readdirSync(frameworksDir, { withFileTypes: true });
+
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink() || !entry.name.endsWith('.framework')) continue;
       const fwPath = path.join(frameworksDir, entry.name);
-      const helpersDir = path.join(fwPath, 'Versions', 'Current', 'Helpers');
-      const fallbackHelpersDir = path.join(fwPath, 'Versions', 'A', 'Helpers');
-      const resolvedHelpers = fs.existsSync(fallbackHelpersDir) ? fallbackHelpersDir : helpersDir;
-      if (fs.existsSync(resolvedHelpers)) {
-        for (const helper of fs.readdirSync(resolvedHelpers, { withFileTypes: true })) {
-          if (helper.isSymbolicLink()) continue;
-          const helperPath = path.join(resolvedHelpers, helper.name);
-          if (helper.isFile()) {
-            run('codesign', ['--force', '--sign', '-', '--timestamp=none', helperPath]);
-          }
-        }
+      const fwBaseName = entry.name.replace(/\.framework$/, '');
+      const versionADir = path.join(fwPath, 'Versions', 'A');
+      const scanRoot = fs.existsSync(versionADir) ? versionADir : fwPath;
+      const mainFwBinary = path.join(scanRoot, fwBaseName);
+
+      // Sign all nested leaf Mach-O files (Libraries/*.dylib, Helpers/*, Resources/ShipIt)
+      // before signing the framework's primary Mach-O binary and bundle directory.
+      for (const leaf of collectMachOFiles(scanRoot, { skipBundles: true })) {
+        if (path.resolve(leaf) === path.resolve(mainFwBinary)) continue;
+        run('codesign', ['--force', '--sign', '-', '--timestamp=none', leaf]);
       }
-      const resourcesMainBin = path.join(fwPath, 'Versions', 'A', entry.name.replace(/\.framework$/, ''));
-      if (fs.existsSync(resourcesMainBin) && fs.statSync(resourcesMainBin).isFile()) {
-        run('codesign', ['--force', '--sign', '-', '--timestamp=none', resourcesMainBin]);
+
+      if (fs.existsSync(mainFwBinary) && fs.lstatSync(mainFwBinary).isFile()) {
+        run('codesign', ['--force', '--sign', '-', '--timestamp=none', mainFwBinary]);
       }
       run('codesign', ['--force', '--sign', '-', '--timestamp=none', fwPath]);
     }
 
+    // 3. Sign Helper .app bundles (GPU, Renderer, Plugin, Utility) preserving inherit entitlements.
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink() || !entry.name.endsWith('.app')) continue;
       const helperAppPath = path.join(frameworksDir, entry.name);
+      const helperName = entry.name.replace(/\.app$/, '');
+      const helperMainExec = path.join(helperAppPath, 'Contents', 'MacOS', helperName);
+
+      for (const leaf of collectMachOFiles(helperAppPath, { skipBundles: true })) {
+        if (path.resolve(leaf) === path.resolve(helperMainExec)) continue;
+        run('codesign', ['--force', '--sign', '-', '--timestamp=none', leaf]);
+      }
+
       const helperArgs = ['--force', '--sign', '-', '--timestamp=none'];
       if (fs.existsSync(inheritEntitlements)) {
         helperArgs.push('--entitlements', inheritEntitlements);
@@ -131,7 +187,7 @@ function signMacAdHoc(context) {
     }
   }
 
-  // 3. Sign the top-level application bundle with stable bundle identifier + main entitlements.
+  // 4. Sign the top-level application bundle with stable bundle identifier + main entitlements.
   const mainArgs = ['--force', '--sign', '-', '--timestamp=none', '--identifier', appId];
   if (fs.existsSync(mainEntitlements)) {
     mainArgs.push('--entitlements', mainEntitlements);
@@ -140,5 +196,5 @@ function signMacAdHoc(context) {
   run('codesign', mainArgs);
 
   run('codesign', ['--verify', '--deep', '--strict', '--verbose=2', appPath]);
-  console.log('[after-pack] Ad-hoc signature and entitlements verified.');
+  console.log('[after-pack] Ad-hoc signature and helper entitlements verified.');
 }
