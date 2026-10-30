@@ -58,6 +58,10 @@ let localFeaturePreferences = { clipboard: true, fileTransfer: false, monitorSwi
 const incomingFileHandles = new Map();
 let viewerSessionActive = false;
 let sessionPowerSaveBlockerId = null;
+let localClipboardMonitorTimer = null;
+let lastObservedClipboardText = null;
+let suppressedClipboardEcho = null;
+let suppressedClipboardEchoUntil = 0;
 
 function featurePreferencesPath() {
   return path.join(app.getPath('userData'), 'feature-preferences.json');
@@ -142,7 +146,10 @@ function createWindow() {
     if (url.startsWith('https://')) shell.openExternal(url);
     return { action: 'deny' };
   });
-  mainWindow.on('blur', () => { if (inputAllowed) clearNativeInput(); });
+  mainWindow.on('blur', () => clearNativeInput());
+  mainWindow.on('focus', () => {
+    if (process.platform === 'win32') clearNativeInput();
+  });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
@@ -278,6 +285,61 @@ function stopDeviceDiscovery() {
 
 function hasActiveSession() {
   return viewerSessionActive || Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
+}
+
+function readClipboardTextSafely() {
+  try { return String(clipboard.readText() || '').slice(0, MAX_CLIPBOARD_CHARS); }
+  catch (error) {
+    console.debug('[mswnlink] Could not read the system clipboard:', error.message || error);
+    return null;
+  }
+}
+
+// Keep clipboard monitoring in Electron's main process: renderer timers may be
+// throttled when the viewer is fullscreen, occluded, or backgrounded.
+function startLocalClipboardMonitor() {
+  if (localClipboardMonitorTimer) return;
+  lastObservedClipboardText = null;
+  localClipboardMonitorTimer = setInterval(() => {
+    // Do not inspect the system clipboard unless the user enabled clipboard
+    // sharing and a remote session is actually active.
+    if (!localFeaturePreferences.clipboard || !hasActiveSession()) {
+      lastObservedClipboardText = null;
+      return;
+    }
+    const text = readClipboardTextSafely();
+    if (text === null) return;
+    if (lastObservedClipboardText === null) {
+      lastObservedClipboardText = text;
+      return;
+    }
+    if (text === lastObservedClipboardText) return;
+    lastObservedClipboardText = text;
+
+    // A clipboard update written from the peer must not be echoed back.
+    if (suppressedClipboardEcho !== null && Date.now() <= suppressedClipboardEchoUntil && text === suppressedClipboardEcho) {
+      suppressedClipboardEcho = null;
+      suppressedClipboardEchoUntil = 0;
+      return;
+    }
+    suppressedClipboardEcho = null;
+    suppressedClipboardEchoUntil = 0;
+    if (!hasActiveSession() || !localFeaturePreferences.clipboard) return;
+    sendToUI('local-clipboard-changed', { text });
+  }, 120);
+  if (localClipboardMonitorTimer.unref) localClipboardMonitorTimer.unref();
+}
+
+function stopLocalClipboardMonitor() {
+  if (localClipboardMonitorTimer) clearInterval(localClipboardMonitorTimer);
+  localClipboardMonitorTimer = null;
+}
+
+function isTrustedAppWebContents(webContents, requestingUrl = '') {
+  if (!mainWindow || mainWindow.isDestroyed() || webContents !== mainWindow.webContents) return false;
+  let url = String(requestingUrl || '');
+  if (!url && webContents && typeof webContents.getURL === 'function') url = webContents.getURL();
+  return url.startsWith('file://');
 }
 
 function updateSessionPowerSaveBlocker() {
@@ -498,6 +560,14 @@ function safeName(value) {
 
 function screenCaptureErrorMessage(error) {
   const detail = error && error.message ? error.message : String(error || 'Unknown error');
+  if (process.platform === 'darwin') {
+    let status = 'unknown';
+    try { status = systemPreferences.getMediaAccessStatus('screen'); } catch {}
+    if (status === 'denied' || status === 'restricted') {
+      return `macOS has not granted Screen Recording permission to mswnlink. Open System Settings → Privacy & Security → Screen & System Audio Recording, enable mswnlink, then quit and reopen it. Details: ${detail}`;
+    }
+    return `macOS could not start screen sharing. Start sharing from the mswnlink window and approve the macOS Screen Recording prompt. If permission was changed, enable mswnlink in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen it. Details: ${detail}`;
+  }
   const waylandSession = process.platform === 'linux' && (
     String(process.env.XDG_SESSION_TYPE || '').toLowerCase() === 'wayland' ||
     Boolean(process.env.WAYLAND_DISPLAY)
@@ -546,7 +616,13 @@ function clearNativeInput() {
     for (const key of heldKeys) {
       try { robot.keyToggle(key, 'up'); } catch {}
     }
-    for (const button of heldButtons) {
+    // Windows can lose a pointer-up when focus changes to Task Manager or
+    // another top-level window. Release every native button, not only the
+    // buttons whose matching down event mswnlink still remembers.
+    const buttonsToRelease = process.platform === 'win32'
+      ? ['left', 'middle', 'right']
+      : [...heldButtons];
+    for (const button of buttonsToRelease) {
       try { robot.mouseToggle('up', button); } catch {}
     }
   }
@@ -869,6 +945,7 @@ app.whenReady().then(async () => {
   });
 
   await loadLocalFeaturePreferences();
+  startLocalClipboardMonitor();
   persistentAccessCode = await loadSavedAccessCode();
   await loadUnattendedAccessSetting();
   if (unattendedAccessEnabled && (!persistentAccessCode || persistentAccessCode.length < UNATTENDED_MIN_CODE_LENGTH)) {
@@ -878,6 +955,43 @@ app.whenReady().then(async () => {
     try { await fs.writeFile(unattendedSettingsPath(), JSON.stringify({ enabled: false }, null, 2), { encoding: 'utf8', mode: 0o600 }); } catch {}
   }
   waylandRestoreToken = await loadWaylandRestoreToken();
+
+  // Electron 45+ separates the Screen Capture API permission from the source
+  // selection callback. Grant it only to this app's local renderer; macOS TCC
+  // still requires the user to grant Screen Recording in System Settings.
+  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details = {}) => {
+    if (permission === 'display-capture') {
+      return isTrustedAppWebContents(webContents, details.requestingUrl || requestingOrigin || '');
+    }
+    if (permission === 'clipboard-sanitized-write') {
+      return isTrustedAppWebContents(webContents, details.requestingUrl || requestingOrigin || '');
+    }
+    return false;
+  });
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details = {}) => {
+    const requestingUrl = details.requestingUrl || (webContents && webContents.getURL ? webContents.getURL() : '');
+    const trusted = isTrustedAppWebContents(webContents, requestingUrl);
+    callback(Boolean(trusted && (permission === 'display-capture' || permission === 'clipboard-sanitized-write')));
+  });
+
+  ipcMain.handle('get-screen-capture-status', () => {
+    if (process.platform !== 'darwin') return 'granted';
+    try { return systemPreferences.getMediaAccessStatus('screen'); } catch { return 'unknown'; }
+  });
+  ipcMain.handle('open-screen-capture-settings', async () => {
+    if (process.platform !== 'darwin') return { ok: false, error: 'Screen Recording settings are only available on macOS.' };
+    const urls = [
+      'x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture',
+      'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
+    ];
+    let lastError = null;
+    for (const url of urls) {
+      try { await shell.openExternal(url); return { ok: true }; }
+      catch (error) { lastError = error; }
+    }
+    return { ok: false, error: lastError && lastError.message ? lastError.message : 'Could not open macOS Screen Recording settings.' };
+  });
+
   session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
     try {
       const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 160, height: 100 } });
@@ -1092,6 +1206,8 @@ app.whenReady().then(async () => {
     if (!localFeaturePreferences.clipboard) return { ok: false, error: 'Clipboard sharing is disabled on this device.' };
     if (typeof value !== 'string' || value.length > MAX_CLIPBOARD_CHARS) return { ok: false, error: 'Clipboard text is too large.' };
     clipboard.writeText(value);
+    suppressedClipboardEcho = value;
+    suppressedClipboardEchoUntil = Date.now() + 3000;
     return { ok: true };
   });
   ipcMain.handle('pick-file-to-send', async () => {
@@ -1166,6 +1282,7 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   stopDeviceDiscovery();
+  stopLocalClipboardMonitor();
   if (sessionPowerSaveBlockerId !== null) {
     try { if (powerSaveBlocker.isStarted(sessionPowerSaveBlockerId)) powerSaveBlocker.stop(sessionPowerSaveBlockerId); } catch {}
     sessionPowerSaveBlockerId = null;

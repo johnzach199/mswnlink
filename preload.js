@@ -13,6 +13,7 @@ const allowedEvents = new Set([
   'input-mode-changed',
   'discovered-devices',
   'local-features-changed',
+  'local-clipboard-changed',
   'window-state'
 ]);
 
@@ -43,6 +44,8 @@ contextBridge.exposeInMainWorld('lanAPI', {
   setViewerSessionActive: (active) => ipcRenderer.invoke('set-viewer-session-active', active),
   readLocalClipboard: () => ipcRenderer.invoke('read-local-clipboard'),
   writeLocalClipboard: (text) => ipcRenderer.invoke('write-local-clipboard', text),
+  getScreenCaptureStatus: () => ipcRenderer.invoke('get-screen-capture-status'),
+  openScreenCaptureSettings: () => ipcRenderer.invoke('open-screen-capture-settings'),
   pickFileToSend: () => ipcRenderer.invoke('pick-file-to-send'),
   beginFileReceive: (details) => ipcRenderer.invoke('begin-file-receive', details),
   writeFileChunk: (token, data) => ipcRenderer.invoke('write-file-chunk', token, data),

@@ -1,6 +1,6 @@
 {
   "name": "mswnlink",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A simple local-network remote desktop with optional unattended access.",
   "main": "main.js",
   "author": "mswnlink contributors",
@@ -13,7 +13,7 @@
     "dist:win": "electron-builder --win portable --publish never",
     "dist:mac": "electron-builder --mac dmg --publish never",
     "dist": "electron-builder --publish never",
-    "check": "node --check launch.js && node --check main.js && node --check preload.js && node --check renderer.js && node --check theme-init.js && node --check scripts/after-pack.cjs && node --check linux-wayland-input.js"
+    "check": "node --check launch.js && node --check main.js && node --check preload.js && node --check renderer.js && node --check theme-init.js && node --check linux-wayland-input.js && node --check scripts/after-pack.cjs"
   },
   "dependencies": {
     "ws": "^8.18.3",
@@ -66,8 +66,8 @@
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.inherit.plist",
       "extendInfo": {
-        "NSScreenCaptureUsageDescription": "mswnlink shares your desktop with a device on your local network when you start a session.",
-        "NSAccessibilityUsageDescription": "mswnlink uses accessibility input permissions to send mouse and keyboard events during an authorized remote-control session."
+        "NSScreenCaptureUsageDescription": "mswnlink needs Screen Recording permission to share the display you select with a computer on your local network. Screen capture starts only after you click Start sharing.",
+        "NSAccessibilityUsageDescription": "mswnlink uses Accessibility permission for mouse and keyboard control during a remote-control session that you authorize."
       },
       "icon": "assets/mswnlink.icns"
     },

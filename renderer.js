@@ -57,12 +57,10 @@ const ALL_DISPLAY_ID = '__all_displays__';
 const pendingFileTransfers = new Map();
 const pendingClipboardRequests = new Map();
 const clipboardBaselineByChannel = new WeakMap();
-const CLIPBOARD_SYNC_INTERVAL_MS = 180;
 const CLIPBOARD_SYNC_MAX_CHARS = 1_000_000;
+let pendingLocalClipboardText = null;
 const CLIPBOARD_FRAGMENT_CHARS = 4500;
 const incomingClipboardFragments = new Map();
-let clipboardSyncTimer = null;
-let clipboardSyncInFlight = false;
 let videoWatchdogTimer = null;
 let videoWatchdogGeneration = 0;
 let lastRemoteVideoFrameAt = 0;
@@ -224,6 +222,9 @@ function refreshAccessCodeUI() {
 
 function describeScreenCaptureError(error) {
   const detail = error && error.message ? error.message : String(error || 'Unknown error');
+  if (deviceInfo.platform === 'darwin') {
+    return `macOS blocked screen sharing. Open System Settings → Privacy & Security → Screen & System Audio Recording, enable mswnlink, then quit and reopen the app. If macOS has not asked yet, click Start sharing again and approve the system prompt. Details: ${detail}`;
+  }
   if (deviceInfo.platform === 'linux' && deviceInfo.waylandSession) {
     return `Linux screen capture failed in this Wayland session. The source launcher now tries XWayland automatically. If you opened a packaged build, try launching it with --ozone-platform=x11; if that still fails, check XWayland, PipeWire, and your desktop's xdg-desktop-portal backend. Details: ${detail}`;
   }
@@ -351,9 +352,13 @@ async function setLocalFeaturePreference(feature, enabled) {
   const result = await window.lanAPI.setLocalFeature(feature, enabled);
   if (!result || !result.ok) throw new Error(result && result.error ? result.error : 'Could not update the feature permission.');
   localFeaturePreferences = { ...localFeaturePreferences, ...result.features };
+  if (feature === 'clipboard' && !enabled) pendingLocalClipboardText = null;
   broadcastLocalFeatureHello();
   if (feature === 'clipboard' && enabled) {
-    for (const channel of activeChannels()) await primeClipboardBaseline(channel);
+    for (const channel of activeChannels()) {
+      await primeClipboardBaseline(channel);
+      await flushPendingLocalClipboard(channel);
+    }
   }
   showToast(`${feature === 'clipboard' ? (enabled ? 'Live clipboard sync' : 'Clipboard sync') : feature === 'fileTransfer' ? 'File transfers' : 'Monitor switching'} ${enabled ? 'enabled' : 'disabled'} on this device.`);
 }
@@ -405,42 +410,44 @@ async function applyAutomaticClipboardText(channel, value) {
   const text = String(value || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
   clipboardBaselineByChannel.set(channel, text);
   const existing = await window.lanAPI.readLocalClipboard();
-  if (existing && existing.ok && String(existing.text || '') === text) return true;
+  if (existing && existing.ok && String(existing.text || '') === text) {
+    pendingLocalClipboardText = null;
+    return true;
+  }
   const result = await window.lanAPI.writeLocalClipboard(text);
   if (!result || !result.ok) {
     showToast(result && result.error ? result.error : 'Could not sync clipboard text.');
     return false;
   }
+  // The remote clipboard is authoritative now. The main-process watcher
+  // suppresses the resulting local clipboard event to prevent an echo.
+  pendingLocalClipboardText = null;
   clipboardBaselineByChannel.set(channel, text);
   return true;
 }
 
-async function clipboardSyncTick() {
-  if (clipboardSyncInFlight) return;
-  const channels = activeChannels().filter(channel => channel.readyState === 'open' && localFeaturePreferences.clipboard && remoteFeaturePreferences.clipboard);
-  if (!channels.length) return;
-  clipboardSyncInFlight = true;
+async function flushPendingLocalClipboard(channel) {
+  if (pendingLocalClipboardText === null) return false;
+  if (!channel || channel.readyState !== 'open' || !localFeaturePreferences.clipboard || !remoteFeaturePreferences.clipboard) return false;
+  const text = pendingLocalClipboardText;
   try {
-    for (const channel of channels) {
-      if (channel.bufferedAmount > 512 * 1024) continue;
-      const result = await window.lanAPI.readLocalClipboard();
-      if (!result || !result.ok) continue;
-      const text = String(result.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
-      if (!clipboardBaselineByChannel.has(channel)) {
-        clipboardBaselineByChannel.set(channel, text);
-        continue; // Don't copy an existing clipboard merely because a session opened.
-      }
-      if (clipboardBaselineByChannel.get(channel) !== text) {
-        if (await sendAutomaticClipboard(channel, text)) clipboardBaselineByChannel.set(channel, text);
-      }
-    }
-  } catch (error) { console.debug('[mswnlink] Live clipboard polling failed:', error.message || error); }
-  finally { clipboardSyncInFlight = false; }
+    const sent = await sendAutomaticClipboard(channel, text);
+    if (!sent) return false;
+    clipboardBaselineByChannel.set(channel, text);
+    // Keep the pending value until every currently active channel has received it.
+    const allSent = activeChannels().every(active => clipboardBaselineByChannel.get(active) === text);
+    if (allSent && pendingLocalClipboardText === text) pendingLocalClipboardText = null;
+    return true;
+  } catch (error) {
+    console.debug('[mswnlink] Could not sync the local clipboard:', error.message || error);
+    return false;
+  }
 }
 
-function startClipboardSyncMonitor() {
-  if (clipboardSyncTimer) return;
-  clipboardSyncTimer = setInterval(() => { clipboardSyncTick().catch(error => console.debug('[mswnlink] Clipboard monitor error:', error.message || error)); }, CLIPBOARD_SYNC_INTERVAL_MS);
+function onLocalClipboardChanged(payload) {
+  if (!payload || typeof payload.text !== 'string' || !localFeaturePreferences.clipboard) return;
+  pendingLocalClipboardText = payload.text.slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+  for (const channel of activeChannels()) flushPendingLocalClipboard(channel).catch(() => {});
 }
 
 function updateRemoteFeaturePreferences(features = {}) {
@@ -620,6 +627,7 @@ async function handleSessionDataMessage(side, channel, data) {
     updateRemoteFeaturePreferences(data.features || {});
     if (side === 'client' && data.displays) sendChannelMessage(channel, { kind: 'display-list-request' });
     await primeClipboardBaseline(channel);
+    await flushPendingLocalClipboard(channel);
     return true;
   }
   if (data.kind === 'clipboard-auto') {
@@ -1181,10 +1189,9 @@ async function startSharing() {
   $('#share-toggle').disabled = true;
   showShareError('');
   try {
-    if (!selectedSourceId) {
-      await refreshSources();
-      if (!selectedSourceId) throw new Error(sourceLoadError || 'No display is available to share.');
-    }
+    // Do not await refreshSources() or an IPC permission query before getDisplayMedia:
+    // Chromium requires the screen capture request to be made during the user's click
+    // activation. The main-process handler chooses the selected source or the first one.
     // A LAN-friendly preset controls capture resolution and frame-rate. The video track's
     // content hint prioritizes desktop text/detail; sender parameters below favour sharpness.
     activeShareQuality = $('#share-quality').value || 'balanced';
@@ -1214,6 +1221,14 @@ async function startSharing() {
     if (hostInfo) await window.lanAPI.stopHost();
     hostInfo = null;
     updateShareUI();
+    if (deviceInfo.platform === 'darwin') {
+      try {
+        const status = await window.lanAPI.getScreenCaptureStatus();
+        if (status !== 'granted' && status !== 'unknown') await window.lanAPI.openScreenCaptureSettings();
+      } catch (permissionError) {
+        console.debug('[mswnlink] Could not inspect/open macOS Screen Recording settings:', permissionError.message || permissionError);
+      }
+    }
     showShareError(error.message === sourceLoadError && sourceLoadError ? sourceLoadError : describeScreenCaptureError(error));
   } finally {
     $('#share-toggle').disabled = false;
@@ -1383,7 +1398,7 @@ async function createHostPeer() {
     channel.onopen = () => {
       if (hostDataChannel === channel) hostDataChannel = channel;
       sendLocalFeatureHello(channel);
-      primeClipboardBaseline(channel).catch(() => {});
+      primeClipboardBaseline(channel).then(() => flushPendingLocalClipboard(channel)).catch(() => {});
       updateSessionFeatureUI();
     };
     channel.onmessage = (messageEvent) => {
@@ -1619,7 +1634,7 @@ async function startClientPeer() {
     // essential messages and leave discovery/clipboard/files disabled.
     sendLocalFeatureHello(channel);
     sendChannelMessage(channel, { kind: 'display-list-request' });
-    primeClipboardBaseline(channel).catch(() => {});
+    primeClipboardBaseline(channel).then(() => flushPendingLocalClipboard(channel)).catch(() => {});
     updateSessionFeatureUI();
     if (controlGranted && clientConnected) {
       try { $('#remote-video').focus({ preventScroll: true }); }
@@ -1978,10 +1993,11 @@ function handleRemoteKey(event, action) {
   if (!clientConnected || !controlGranted || !pages.session.classList.contains('page-active')) return;
   const target = event.target;
   if (target && (target.isContentEditable || (target.closest && target.closest('input, textarea, select, [contenteditable="true"]')))) return;
-  // Escape must stay local so users can leave fullscreen. Keep Alt+Tab and
-  // Ctrl+Alt+Delete local as OS-level shortcuts that remote injection cannot
-  // safely override.
-  if (event.key === 'Escape' || event.code === 'Escape') return;
+  // Plain Escape stays local so users can leave fullscreen. Ctrl+Shift+Esc
+  // is forwarded intentionally so a Windows host can open Task Manager.
+  // Alt+Tab and Ctrl+Alt+Delete remain local OS-level shortcuts.
+  const isTaskManagerShortcut = Boolean(event.ctrlKey && event.shiftKey && (event.key === 'Escape' || event.code === 'Escape'));
+  if ((event.key === 'Escape' || event.code === 'Escape') && !isTaskManagerShortcut) return;
   if ((event.altKey && event.code === 'Tab') || (event.ctrlKey && event.altKey && event.code === 'Delete')) return;
   const key = String(event.key || '');
   const printableAscii = key.length === 1 && /^[\x20-\x7e]$/.test(key);
@@ -2050,9 +2066,9 @@ async function initialize() {
     localFeaturePreferences = { ...localFeaturePreferences, ...(features || {}) };
     updateSessionFeatureUI();
   });
+  window.lanAPI.on('local-clipboard-changed', onLocalClipboardChanged);
   refreshDiscoveredDevices();
   setInterval(refreshDiscoveredDevices, 5000);
-  startClipboardSyncMonitor();
 
   const wireFeatureToggle = (id, feature) => {
     const toggle = $(`#${id}`);
@@ -2277,18 +2293,23 @@ async function initialize() {
     pressedRemoteButtons.add(event.button);
     sendInput({ kind: 'mouse', action: 'down', button: event.button });
   });
-  $('#remote-video').addEventListener('pointerup', (event) => {
-    if (!clientConnected || !controlGranted) return;
+  const releaseRemoteButton = (event) => {
+    if (!clientConnected || !controlGranted || !pressedRemoteButtons.has(event.button)) return;
     event.preventDefault();
     pressedRemoteButtons.delete(event.button);
     sendInput({ kind: 'mouse', action: 'up', button: event.button });
-  });
+  };
+  $('#remote-video').addEventListener('pointerup', releaseRemoteButton);
+  // Capture the release at window level as a fallback. Task Manager, pop-up
+  // windows, and pointer capture transitions can move pointerup off the video.
+  window.addEventListener('pointerup', releaseRemoteButton, true);
   const releaseRemoteInput = () => {
     pressedRemoteButtons.clear();
     sendInput({ kind: 'releaseAll' });
   };
   $('#remote-video').addEventListener('pointercancel', releaseRemoteInput);
   $('#remote-video').addEventListener('lostpointercapture', releaseRemoteInput);
+  window.addEventListener('pointercancel', releaseRemoteInput, true);
   $('#remote-video').addEventListener('wheel', (event) => {
     if (!clientConnected || !controlGranted) return;
     event.preventDefault();
