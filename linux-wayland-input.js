@@ -117,6 +117,8 @@ class LinuxWaylandInput {
     this.restoreToken = '';
     this.heldKeys = new Set();
     this.heldButtons = new Set();
+    this.wheelX = 0;
+    this.wheelY = 0;
   }
 
   async start(previousRestoreToken = '') {
@@ -220,9 +222,16 @@ class LinuxWaylandInput {
       await this.remote.NotifyPointerButton(this.sessionHandle, options, button, state);
       if (state) this.heldButtons.add(button); else this.heldButtons.delete(button);
     } else if (event.kind === 'wheel') {
-      const dx = Math.max(-600, Math.min(600, Number(event.dx) || 0));
-      const dy = Math.max(-600, Math.min(600, Number(event.dy) || 0));
-      await this.remote.NotifyPointerAxis(this.sessionHandle, { finish: new dbus.Variant('b', true) }, dx, dy);
+      // Browsers report ~100 pixels per mouse-wheel notch. Convert to whole portal
+      // scroll steps (keeping the remainder) so scrolling speed is the same on every desktop.
+      this.wheelX += Math.max(-600, Math.min(600, Number(event.dx) || 0)) / 100;
+      this.wheelY += Math.max(-600, Math.min(600, Number(event.dy) || 0)) / 100;
+      const stepsX = Math.max(-10, Math.min(10, Math.trunc(this.wheelX)));
+      const stepsY = Math.max(-10, Math.min(10, Math.trunc(this.wheelY)));
+      this.wheelX -= stepsX;
+      this.wheelY -= stepsY;
+      if (stepsY) await this.remote.NotifyPointerAxisDiscrete(this.sessionHandle, options, 0, stepsY);
+      if (stepsX) await this.remote.NotifyPointerAxisDiscrete(this.sessionHandle, options, 1, stepsX);
     } else if (event.kind === 'key') {
       const code = String(event.code || '');
       const keycode = EVDEV_KEYCODES[code];
@@ -245,6 +254,8 @@ class LinuxWaylandInput {
     const buttons = [...this.heldButtons];
     this.heldKeys.clear();
     this.heldButtons.clear();
+    this.wheelX = 0;
+    this.wheelY = 0;
     await Promise.allSettled([
       ...keys.map(code => this.remote.NotifyKeyboardKeycode(this.sessionHandle, {}, code, 0)),
       ...buttons.map(code => this.remote.NotifyPointerButton(this.sessionHandle, {}, code, 0))

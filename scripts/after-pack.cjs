@@ -2,6 +2,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 /**
  * Linux packages launch Electron directly, bypassing launch.js. This wrapper
@@ -9,6 +10,7 @@ const path = require('node:path');
  * falls back to XWayland on Wayland, matching the source launcher behavior.
  */
 module.exports = async function afterPack(context) {
+  if (context.electronPlatformName === 'darwin') return signMacAdHoc(context);
   if (context.electronPlatformName !== 'linux') return;
 
   const appOutDir = context.appOutDir;
@@ -41,3 +43,45 @@ exec "$APP_DIR/${executableName}-electron" "$@"
   fs.writeFileSync(original, wrapper, { mode: 0o755 });
   fs.chmodSync(original, 0o755);
 };
+
+/**
+ * macOS without an Apple Developer ID: repackaging Electron breaks its original
+ * signature, and an app with a broken signature is reported as "damaged" or as
+ * malware by Gatekeeper (worst on Apple Silicon). Re-signing the whole bundle
+ * "ad hoc" (free, no Apple account) gives it a valid signature. macOS still asks
+ * the user to approve a downloaded, non-notarized app once; installing with
+ * scripts/install-mac.sh avoids even that prompt.
+ *
+ * When real credentials are present (CSC_LINK) electron-builder signs and
+ * notarizes the app itself and this step is skipped.
+ */
+function run(command, args) {
+  execFileSync(command, args, { stdio: 'inherit' });
+}
+
+function findNativeFiles(directory, found = []) {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const full = path.join(directory, entry.name);
+    if (entry.isSymbolicLink()) continue;
+    if (entry.isDirectory()) findNativeFiles(full, found);
+    else if (entry.name.endsWith('.node') || entry.name.endsWith('.dylib')) found.push(full);
+  }
+  return found;
+}
+
+function signMacAdHoc(context) {
+  const realSigning = Boolean(process.env.CSC_LINK) && process.env.CSC_IDENTITY_AUTO_DISCOVERY !== 'false';
+  if (realSigning) {
+    console.log('[after-pack] Developer ID credentials found; electron-builder will sign and notarize.');
+    return;
+  }
+  const appName = context.packager.appInfo.productFilename;
+  const appPath = path.join(context.appOutDir, `${appName}.app`);
+  if (!fs.existsSync(appPath)) throw new Error(`Expected macOS app bundle not found: ${appPath}`);
+  console.log(`[after-pack] Ad-hoc signing ${appPath}`);
+  // Native modules (RobotJS) are outside the paths that --deep covers, so sign them first.
+  for (const file of findNativeFiles(appPath)) run('codesign', ['--force', '--sign', '-', '--timestamp=none', file]);
+  run('codesign', ['--force', '--deep', '--sign', '-', '--timestamp=none', appPath]);
+  run('codesign', ['--verify', '--deep', '--strict', '--verbose=2', appPath]);
+  console.log('[after-pack] Ad-hoc signature verified.');
+}

@@ -93,6 +93,7 @@ function applyTheme(theme, persist = false) {
   if (label) label.textContent = dark ? 'Light mode' : 'Dark mode';
   const icon = $('#theme-toggle-icon');
   if (icon) icon.textContent = dark ? '☀' : '☾';
+  document.documentElement.style.colorScheme = nextTheme;
   if (persist) {
     try { localStorage.setItem(THEME_STORAGE_KEY, nextTheme); }
     catch (error) { console.warn('[mswnlink] Could not persist theme preference:', error); }
@@ -100,7 +101,8 @@ function applyTheme(theme, persist = false) {
 }
 
 function initializeTheme() {
-  let savedTheme = 'dark';
+  // theme-init.js already chose the saved theme (or the system one) before first paint.
+  let savedTheme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
   try {
     const saved = localStorage.getItem(THEME_STORAGE_KEY);
     if (saved === 'dark' || saved === 'light') savedTheme = saved;
@@ -114,7 +116,6 @@ function initializeTheme() {
       const current = document.body.dataset.theme === 'dark' ? 'dark' : 'light';
       const next = current === 'dark' ? 'light' : 'dark';
       applyTheme(next, true);
-      showToast(`Switched to ${next} mode.`);
     });
   }
 }
@@ -134,13 +135,11 @@ function setPage(name, options = {}) {
     page.hidden = !active;
     page.setAttribute('aria-hidden', String(!active));
   });
-  $$('.nav-item[data-page]').forEach((button) => {
+  $$('.tab[data-page]').forEach((button) => {
     const active = button.dataset.page === (name === 'session' ? 'connect' : name);
     button.classList.toggle('active', active);
     button.setAttribute('aria-current', active ? 'page' : 'false');
   });
-  const breadcrumb = $('#breadcrumb-current');
-  if (breadcrumb) breadcrumb.textContent = name === 'share' ? 'SHARE THIS PC' : name === 'session' ? 'ACTIVE SESSION' : 'CONNECT';
   document.body.dataset.currentPage = name;
   if (name === 'share' && options.refreshSources !== false) {
     // Navigation must not fail merely because screen-source enumeration is
@@ -170,6 +169,15 @@ function initializePageNavigation() {
       setPage(pageName);
     });
   }
+}
+
+function setSessionState(label, kind = '') {
+  const pill = $('#session-state');
+  pill.className = `status-pill${kind ? ` ${kind}` : ''}`;
+  pill.replaceChildren();
+  const dot = document.createElement('span');
+  dot.className = 'status-dot';
+  pill.append(dot, document.createTextNode(label));
 }
 
 function showToast(message) {
@@ -205,13 +213,13 @@ function refreshAccessCodeUI() {
   const placeholderTitle = $('#pairing-placeholder strong');
   const placeholderCopy = $('#pairing-placeholder span');
   if (accessCodeConfigured) {
-    placeholderTitle.textContent = 'Permanent code saved';
-    placeholderCopy.textContent = 'Start sharing to display this PC’s LAN address and the same saved code.';
+    placeholderTitle.textContent = 'Access code saved';
+    placeholderCopy.textContent = 'Start sharing to see this PC’s address and your code.';
   } else {
-    placeholderTitle.textContent = 'Set your permanent access code';
-    placeholderCopy.textContent = 'Choose a code below before starting screen sharing. It will stay saved until you change it.';
+    placeholderTitle.textContent = 'Set your access code';
+    placeholderCopy.textContent = 'Choose a code below before you start sharing. It stays saved until you change it.';
   }
-  $('#save-access-code').textContent = accessCodeConfigured ? 'Save code changes' : 'Save permanent code';
+  $('#save-access-code').textContent = accessCodeConfigured ? 'Update code' : 'Save code';
 }
 
 function describeScreenCaptureError(error) {
@@ -237,7 +245,7 @@ function renderDiscoveredDevices(devices = []) {
   if (!devices.length) {
     const empty = document.createElement('div');
     empty.className = 'devices-empty';
-    empty.textContent = 'No other mswnlink devices found yet. Open mswnlink on another computer on this LAN.';
+    empty.textContent = 'No other computers found yet. Open mswnlink on another computer on this network, or type its address above.';
     container.append(empty);
     return;
   }
@@ -247,7 +255,9 @@ function renderDiscoveredDevices(devices = []) {
     card.className = 'discovered-device';
     const icon = document.createElement('div');
     icon.className = 'discovered-device-icon';
-    icon.textContent = device.platform === 'darwin' ? '⌘' : device.platform === 'win32' ? '▦' : '▣';
+    icon.textContent = device.platform === 'darwin' ? 'Mac' : device.platform === 'win32' ? 'Win' : 'PC';
+    icon.style.fontSize = '12px';
+    icon.style.fontWeight = '700';
     const copy = document.createElement('div');
     copy.className = 'discovered-device-copy';
     const name = document.createElement('strong');
@@ -256,12 +266,12 @@ function renderDiscoveredDevices(devices = []) {
     detail.textContent = `${device.address} · ${device.platform === 'darwin' ? 'macOS' : device.platform === 'win32' ? 'Windows' : device.platform === 'linux' ? 'Linux' : 'Unknown OS'}`;
     const state = document.createElement('small');
     state.className = `discovered-device-state ${device.sharing ? 'sharing' : 'online'}`;
-    state.textContent = device.sharing ? 'Sharing now' : 'Online · not sharing';
+    state.textContent = device.sharing ? 'Sharing now' : 'Online, not sharing';
     copy.append(name, detail, state);
     const connect = document.createElement('button');
     connect.type = 'button';
     connect.className = 'button button-primary discovered-device-connect';
-    connect.textContent = 'Use device';
+    connect.textContent = 'Select';
     connect.disabled = !device.sharing || clientConnected || clientConnecting;
     connect.title = device.sharing ? 'Use this device address' : 'This device is online but has not started sharing';
     connect.addEventListener('click', () => {
@@ -1088,6 +1098,9 @@ async function refreshSources() {
       grid.append(card);
     }
     await window.lanAPI.chooseSource(selectedSourceId);
+    if (deviceInfo.platform === 'darwin' && (deviceInfo.macScreenAccess === 'denied' || deviceInfo.macScreenAccess === 'restricted')) {
+      showShareError('macOS is blocking screen recording for mswnlink. Open System Settings › Privacy & Security › Screen & System Audio Recording, turn on mswnlink, then restart the app.');
+    }
   } catch (error) {
     sources = [];
     selectedSourceId = null;
@@ -1103,9 +1116,9 @@ async function refreshSources() {
 function updateShareUI() {
   const active = Boolean(hostInfo && sharingStream);
   $('#share-status-pill').classList.toggle('active', active);
-  $('#share-status-pill').innerHTML = `<span class="status-pill-dot"></span>${active ? 'SHARING ACTIVE' : 'NOT SHARING'}`;
+  $('#share-status-pill').replaceChildren(Object.assign(document.createElement('span'), { className: 'status-dot' }), document.createTextNode(active ? 'Sharing' : 'Not sharing'));
   $('#share-toggle-label').textContent = active ? 'Stop sharing' : 'Start sharing';
-  $('#share-toggle').classList.toggle('button-green', !active);
+  $('#share-toggle').classList.toggle('button-primary', !active);
   $('#share-toggle').classList.toggle('button-danger', active);
   $('#pairing-placeholder').hidden = active;
   $('#pairing-active').hidden = !active;
@@ -1140,7 +1153,7 @@ function updateShareUI() {
         copy.className = 'copy-small';
         copy.type = 'button';
         copy.title = `Copy ${ip}`;
-        copy.textContent = '⧉';
+        copy.textContent = 'Copy';
         copy.addEventListener('click', async () => {
           try { await navigator.clipboard.writeText(ip); showToast('Device address copied.'); }
           catch { showToast(`Device address: ${ip}`); }
@@ -1499,7 +1512,7 @@ function updateUnattendedAccessUI(inputAvailable = deviceInfo.inputAvailable) {
       : 'Disabled. Each new connection will ask for host approval.';
 }
 
-function setConnectBusy(busy, label = 'Connect to desktop') {
+function setConnectBusy(busy, label = 'Connect') {
   clientConnecting = busy;
   $('#connect-button').disabled = busy;
   $('#connect-button').querySelector('span:first-child').textContent = label;
@@ -1546,7 +1559,7 @@ function showSession(name, address) {
   $('#viewer-placeholder').hidden = false;
   $('#viewer-placeholder').querySelector('strong').textContent = 'Connecting to the desktop';
   $('#viewer-placeholder').querySelector('span').textContent = 'Negotiating a direct connection on your local network…';
-  $('#session-state').innerHTML = '<span class="pulse-dot"></span> CONNECTING';
+  setSessionState('Connecting');
   $('#viewer-resolution').textContent = 'Waiting for video…';
   setConnectBusy(false);
   setPage('session');
@@ -1652,7 +1665,7 @@ async function startClientPeer() {
     // forwarding intentionally only works while the viewer owns focus.
     try { video.focus({ preventScroll: true }); } catch { try { video.focus(); } catch {} }
     $('#viewer-placeholder').hidden = true;
-    $('#session-state').innerHTML = '<span class="pulse-dot"></span> CONNECTED';
+    setSessionState('Connected', 'active');
     $('#viewer-resolution').textContent = 'Live stream';
     clientConnected = true;
     startRemoteVideoWatchdog();
@@ -1660,9 +1673,7 @@ async function startClientPeer() {
     updateClientControlUI();
     updateSessionFeatureUI();
     if ($('#viewer-quality-select').value === 'auto') startAdaptiveQualityMonitor();
-    video.addEventListener('resize', () => {
-      if (video.videoWidth && video.videoHeight) $('#viewer-resolution').textContent = `${video.videoWidth} × ${video.videoHeight}`;
-    }, { once: true });
+    if (video.videoWidth && video.videoHeight) $('#viewer-resolution').textContent = `${video.videoWidth} × ${video.videoHeight}`;
   };
   peer.onicecandidate = (event) => {
     const candidate = normalizeIceCandidate(event.candidate && event.candidate.toJSON ? event.candidate.toJSON() : event.candidate);
@@ -1673,7 +1684,7 @@ async function startClientPeer() {
       if (clientDisconnectTimer) clearTimeout(clientDisconnectTimer);
       clientDisconnectTimer = null;
       clearConnectTimer();
-      $('#session-state').innerHTML = '<span class="pulse-dot"></span> CONNECTED';
+      setSessionState('Connected', 'active');
       const video = $('#remote-video');
       if (video.paused && video.srcObject) video.play().catch(() => {});
     } else if (peer.connectionState === 'failed') {
@@ -1681,7 +1692,7 @@ async function startClientPeer() {
       clientDisconnectTimer = null;
       failClientNegotiation('The direct connection failed. Check that both devices are on the same LAN and that the host firewall allows mswnlink on TCP port 49382 and the negotiated WebRTC traffic.');
     } else if (peer.connectionState === 'disconnected') {
-      $('#session-state').innerHTML = '<span class="pulse-dot"></span> RECONNECTING';
+      setSessionState('Reconnecting', 'warn');
       if (clientDisconnectTimer) clearTimeout(clientDisconnectTimer);
       clientDisconnectTimer = setTimeout(() => {
         if (clientPeer === peer && peer.connectionState === 'disconnected') {
@@ -2026,8 +2037,6 @@ async function initialize() {
   }
   const name = friendlyDeviceName(deviceInfo.name);
   $('#sidebar-device-name').textContent = name;
-  const topAvatar = $('#top-avatar');
-  if (topAvatar) topAvatar.textContent = name.slice(0, 2).toUpperCase();
   if (!deviceInfo.inputAvailable) {
     $('#accept-control').disabled = true;
     $('#accept-control').title = 'Native mouse/keyboard control backend is unavailable on this build.';
@@ -2198,7 +2207,7 @@ async function initialize() {
   function syncFullscreenButton() {
     const active = document.fullscreenElement || document.webkitFullscreenElement;
     const isFullscreen = active === viewerShell;
-    fullscreenButton.textContent = isFullscreen ? '⤢ Exit full screen' : '⛶ Full screen';
+    fullscreenButton.textContent = isFullscreen ? 'Exit full screen' : 'Full screen';
     fullscreenButton.setAttribute('aria-label', isFullscreen ? 'Exit full screen' : 'Show remote desktop fullscreen');
     fullscreenButton.title = isFullscreen ? 'Exit full screen (Esc)' : 'Fit remote desktop to the whole screen';
   }
@@ -2252,6 +2261,11 @@ async function initialize() {
     showToast('Remote device disconnected. Screen sharing remains active.');
   });
   $('#pairing-code').addEventListener('input', () => { $('#pairing-code').value = $('#pairing-code').value.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 64); });
+  // Keep the resolution label current when the host switches monitor or quality.
+  $('#remote-video').addEventListener('resize', () => {
+    const video = $('#remote-video');
+    if (clientConnected && video.videoWidth && video.videoHeight) $('#viewer-resolution').textContent = `${video.videoWidth} × ${video.videoHeight}`;
+  });
   $('#remote-video').addEventListener('pointermove', handlePointerMove);
   $('#remote-video').addEventListener('pointerdown', (event) => {
     if (!clientConnected || !controlGranted) return;
@@ -2358,7 +2372,7 @@ function initializeWindowChrome() {
 function syncWindowMaximizeButton(maximized) {
   const button = $('#window-maximize');
   if (!button) return;
-  button.textContent = maximized ? '❐' : '□';
+  button.dataset.maximized = maximized ? 'true' : 'false';
   button.title = maximized ? 'Restore window' : 'Maximize window';
   button.setAttribute('aria-label', maximized ? 'Restore window' : 'Maximize window');
 }

@@ -1,6 +1,6 @@
 {
   "name": "mswnlink",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "description": "A simple local-network remote desktop with optional unattended access.",
   "main": "main.js",
   "author": "mswnlink contributors",
@@ -13,7 +13,7 @@
     "dist:win": "electron-builder --win portable --publish never",
     "dist:mac": "electron-builder --mac dmg --publish never",
     "dist": "electron-builder --publish never",
-    "check": "node --check launch.js && node --check main.js && node --check preload.js && node --check renderer.js && node --check scripts/after-pack.cjs && node --check linux-wayland-input.js"
+    "check": "node --check launch.js && node --check main.js && node --check preload.js && node --check renderer.js && node --check theme-init.js && node --check scripts/after-pack.cjs && node --check linux-wayland-input.js"
   },
   "dependencies": {
     "ws": "^8.18.3",
@@ -36,6 +36,7 @@
       "main.js",
       "preload.js",
       "renderer.js",
+      "theme-init.js",
       "index.html",
       "styles.css",
       "assets/**/*",

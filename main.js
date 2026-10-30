@@ -1,10 +1,12 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, desktopCapturer, session, shell, safeStorage, clipboard, dialog, screen, Menu, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, session, shell, safeStorage, clipboard, dialog, screen, Menu, powerSaveBlocker, nativeTheme, systemPreferences } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { promisify } = require('node:util');
+const pbkdf2Async = promisify(crypto.pbkdf2);
 const dgram = require('node:dgram');
 const { WebSocketServer, WebSocket } = require('ws');
 const LinuxWaylandInput = process.platform === 'linux' ? require('./linux-wayland-input') : null;
@@ -23,6 +25,8 @@ const DISCOVERY_PORT = 49383;
 const MAX_SIGNAL_BYTES = 1024 * 1024;
 const MAX_FILE_TRANSFER_BYTES = 100 * 1024 * 1024;
 const MAX_CLIPBOARD_CHARS = 1_000_000;
+// Unattended access lets anyone who knows the code control the PC, so the code must resist guessing.
+const UNATTENDED_MIN_CODE_LENGTH = 12;
 const ALLOWED_SIGNAL_TYPES = new Set(['offer', 'answer', 'candidate', 'hangup', 'control-mode']);
 
 let mainWindow = null;
@@ -106,11 +110,14 @@ function createWindow() {
     height: initialHeight,
     minWidth: minWindowWidth,
     minHeight: minWindowHeight,
-    backgroundColor: '#f6f8fb',
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#0d1110' : '#f2f5f4',
     title: 'mswnlink',
     // Replace the native title bar and default File/Edit/View menu with the
-    // app's slim, integrated draggable chrome in index.html.
-    frame: false,
+    // app's own draggable top bar in index.html. macOS keeps its native traffic
+    // lights (inset into our bar); Windows and Linux use the bar's own buttons.
+    ...(process.platform === 'darwin'
+      ? { titleBarStyle: 'hidden', trafficLightPosition: { x: 18, y: 19 } }
+      : { frame: false }),
     autoHideMenuBar: true,
     show: false,
     webPreferences: {
@@ -231,7 +238,8 @@ function startDeviceDiscovery() {
       try { packet = JSON.parse(message.toString('utf8')); } catch { return; }
       if (!packet || packet.magic !== 'mswnlink-discovery' || packet.version !== 1 || packet.id === localDeviceId) return;
       if (typeof packet.id !== 'string' || packet.id.length > 100 || !isLanAddress(remote.address)) return;
-      if (Number(packet.time) > Date.now() + 15000 || Date.now() - Number(packet.time) > 15000) return;
+      // Freshness is judged by when the packet arrived (lastSeen below), not by the sender's clock:
+      // two PCs whose clocks differ by more than a few seconds would otherwise never see each other.
       const key = `${normalizeIp(remote.address)}:${PORT}`;
       discoveredDevices.set(key, {
         id: packet.id,
@@ -347,6 +355,9 @@ async function saveUnattendedAccessSetting(enabled) {
   if (next && !persistentAccessCode) {
     throw new Error('Save a permanent access passcode before enabling unattended access.');
   }
+  if (next && persistentAccessCode.length < UNATTENDED_MIN_CODE_LENGTH) {
+    throw new Error(`Connecting without asking needs an access code of at least ${UNATTENDED_MIN_CODE_LENGTH} characters (yours has ${persistentAccessCode.length}). Save a longer code first.`);
+  }
   if (next && !hasInputBackend()) {
     throw new Error('Remote input is not available in this build. Unattended access requires a working mouse/keyboard input backend.');
   }
@@ -414,6 +425,10 @@ async function ensureInputBackend() {
     return true;
   }
   if (!robot) throw new Error('Mouse/keyboard control is unavailable. Build the RobotJS input backend for this operating system and architecture.');
+  if (process.platform === 'darwin' && !systemPreferences.isTrustedAccessibilityClient(true)) {
+    // The call above shows the macOS permission prompt. Without it, clicks and keys are silently ignored.
+    throw new Error('macOS has not allowed mswnlink to control this Mac yet. Open System Settings › Privacy & Security › Accessibility, turn on mswnlink, restart the app, then try again.');
+  }
   return true;
 }
 
@@ -438,6 +453,9 @@ async function loadSavedAccessCode() {
 }
 
 async function savePersistentAccessCode(code) {
+  if (unattendedAccessEnabled && code.length < UNATTENDED_MIN_CODE_LENGTH) {
+    throw new Error(`While “Connect without asking” is on, the access code must be at least ${UNATTENDED_MIN_CODE_LENGTH} characters. Choose a longer code, or turn that setting off first.`);
+  }
   if (!safeStorage.isEncryptionAvailable()) {
     throw new Error(getAccessCodeStorageWarning() || 'OS secure storage is unavailable. Set up your desktop keyring and restart mswnlink.');
   }
@@ -493,8 +511,9 @@ function screenCaptureErrorMessage(error) {
   return `Could not access screen sources. Check screen-recording permissions and restart mswnlink. Details: ${detail}`;
 }
 
+// Asynchronous so a wrong-code flood or a slow login never freezes the window.
 function derivePairKey(code, nonce) {
-  return crypto.pbkdf2Sync(code, nonce, 200000, 32, 'sha256');
+  return pbkdf2Async(code, nonce, 200000, 32, 'sha256');
 }
 
 function pairingProof(key, nonce) {
@@ -581,7 +600,7 @@ function bindConnection(socket, req) {
       const now = Date.now();
       const previous = badAttempts.get(remoteIp) || { count: 0, time: now };
       if (now - previous.time > 60_000) { previous.count = 0; previous.time = now; }
-      const derivedKey = derivePairKey(pairingCode || '', socket.authNonce);
+      const derivedKey = await derivePairKey(pairingCode || '', socket.authNonce);
       const expectedProof = pairingProof(derivedKey, socket.authNonce);
       if (!safeEqualHex(msg.proof, expectedProof)) {
         // Never permanently lock out a LAN user after a fixed number of typos.
@@ -823,9 +842,13 @@ async function injectInput(event) {
 }
 
 app.whenReady().then(async () => {
-  // Hide Electron's native application menu on macOS and the default menu on
-  // Windows/Linux; the app uses its own minimal title chrome instead.
-  Menu.setApplicationMenu(null);
+  // Windows/Linux: no menu bar. macOS: keep a minimal system menu, because
+  // without it Cmd+C / Cmd+V / Cmd+Q and window shortcuts stop working.
+  if (process.platform === 'darwin') {
+    Menu.setApplicationMenu(Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }, { role: 'windowMenu' }]));
+  } else {
+    Menu.setApplicationMenu(null);
+  }
 
   ipcMain.handle('window:minimize', (event) => {
     if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return false;
@@ -848,6 +871,12 @@ app.whenReady().then(async () => {
   await loadLocalFeaturePreferences();
   persistentAccessCode = await loadSavedAccessCode();
   await loadUnattendedAccessSetting();
+  if (unattendedAccessEnabled && (!persistentAccessCode || persistentAccessCode.length < UNATTENDED_MIN_CODE_LENGTH)) {
+    // A short code was saved before this rule existed. Fail safe: ask for approval until a longer code is set.
+    console.warn('[mswnlink] Turning off unattended access: the saved access code is too short.');
+    unattendedAccessEnabled = false;
+    try { await fs.writeFile(unattendedSettingsPath(), JSON.stringify({ enabled: false }, null, 2), { encoding: 'utf8', mode: 0o600 }); } catch {}
+  }
   waylandRestoreToken = await loadWaylandRestoreToken();
   session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
     try {
@@ -901,7 +930,9 @@ app.whenReady().then(async () => {
     ips: getLanIPv4(),
     inputAvailable: hasInputBackend(),
     inputBackend: isLinuxWaylandSession ? 'desktop-portal' : (robot ? 'robotjs' : 'unavailable'),
-    unattendedAccess: unattendedAccessEnabled
+    unattendedAccess: unattendedAccessEnabled,
+    unattendedMinCodeLength: UNATTENDED_MIN_CODE_LENGTH,
+    macScreenAccess: process.platform === 'darwin' ? systemPreferences.getMediaAccessStatus('screen') : null
   }));
 
   ipcMain.handle('get-sources', async () => {
@@ -955,10 +986,10 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle('make-pair-proof', (_event, value, nonce) => {
+  ipcMain.handle('make-pair-proof', async (_event, value, nonce) => {
     const code = validateAccessCode(value);
     if (!code || typeof nonce !== 'string' || !/^[a-f0-9]{64}$/i.test(nonce)) throw new Error('Invalid pairing challenge. Use the saved 8–64 character access code.');
-    const key = derivePairKey(code, nonce);
+    const key = await derivePairKey(code, nonce);
     return { proof: pairingProof(key, nonce), key: key.toString('hex') };
   });
   ipcMain.handle('sign-pair-message', (_event, keyHex, nonce, message) => {

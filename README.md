@@ -1,78 +1,70 @@
 # mswnlink
 
-A local-network remote desktop application for Windows, macOS, and Linux.
+A simple remote desktop for computers on your local network. One computer shares its screen, another views and controls it, directly over the LAN. No account, no cloud, no relay.
+
+Features: screen sharing with quality presets (clipboard sharing is on by default and can be switched off on either computer), mouse and keyboard control, optional "connect without asking" (unattended) access, nearby-computer discovery, clipboard sharing, file transfer, display switching, light and dark themes.
+
+> Prototype software that has not been security-audited. Use it on networks you trust.
+
+## Download
+
+Get the newest build from [Releases](../../releases): Fedora/Linux AppImage, Windows portable `.exe`, and macOS DMGs (Apple Silicon `arm64`, Intel `x64`).
+
+## Using it
+
+1. On the computer you want to reach: **Share this PC** → save an access code → **Start sharing**.
+2. On the other computer: **Connect**, enter the address and code (or pick the computer under *Nearby computers*).
+3. By default the host approves each request as view-only or full control. Under **Permissions**, *Connect without asking* lets the correct code connect with full control and no approval. It needs an access code of **12 or more characters** and is off by default.
+
+Both computers must allow TCP port **49382** (and UDP **49383** for discovery) on the private network.
+
+## macOS: "Apple could not verify mswnlink is free of malware"
+
+This is Apple's standard message for any app that has not been notarized, which needs a paid Apple Developer account. It does not mean the app contains malware. Pick one of these:
+
+**Easiest: install from Terminal.** macOS only blocks files that a browser downloaded, so this installs mswnlink without any warning:
+
+```
+curl -fsSL https://raw.githubusercontent.com/johnzach199/mswnlink/main/scripts/install-mac.sh | bash
+```
+
+**Or approve the downloaded app once.** Open the app, click *Done*, then go to **System Settings › Privacy & Security**, scroll down, and click **Open Anyway** next to mswnlink. (On macOS 15 the old right-click › Open trick no longer works.) If it still says "damaged", run `xattr -cr /Applications/mswnlink.app`.
+
+Then allow mswnlink under **Privacy & Security** for **Screen & System Audio Recording** (to share this Mac) and **Accessibility** (to let a remote computer move the mouse and type), and restart the app.
+
+Builds are signed ad hoc and checked in CI so the signature is always valid. With your own Apple Developer ID, add `MAC_CSC_LINK`, `MAC_CSC_KEY_PASSWORD`, `APPLE_API_KEY`, `APPLE_API_KEY_ID` and `APPLE_API_ISSUER` as repository secrets and the workflow signs and notarizes automatically, which removes the prompt for everyone.
+
+## Fedora and other Linux desktops
+
+If the AppImage does not start: `sudo dnf install fuse fuse-libs`.
+
+On Wayland (the Fedora default) programs cannot fake input directly, so mswnlink asks the desktop's *RemoteDesktop portal*. Make sure the portal backend for your desktop is installed (`xdg-desktop-portal-gnome` or `xdg-desktop-portal-kde`). When sharing starts, your desktop asks you to allow mouse and keyboard control; choose the same monitor you are sharing. Desktops that support it remember the approval. That prompt is an operating-system rule and cannot be skipped, even with *Connect without asking*.
+
+If capture is black, check that PipeWire and `xdg-desktop-portal` are running. `MSWNLINK_FORCE_NATIVE_WAYLAND=1` tries native Wayland; `MSWNLINK_DISABLE_GPU=1` forces software rendering.
 
 ## Run from source
 
-Requires Node.js 22.12 or newer and npm.
+Node.js 22.12 or newer.
 
-```bash
+```
 npm install
 npm start
+npm run check
 ```
 
-## Responsive UI
+RobotJS (input on Windows, macOS and X11) is optional; without it sessions are view-only.
 
-The app selects its initial window size from the current display work area. It responds to compact window widths by moving navigation to a top row, stacking the connection/share panels, wrapping session controls, and allowing the content region to scroll without clipping. Height breakpoints also reduce vertical spacing and viewer preview height. The light/dark theme toggle is retained.
+## Build the apps
 
-## Build standalone applications
+Push a tag like `v0.3.0` (or run the workflow from the **Actions** tab) to build every platform on GitHub and attach the files to a release. Locally: `npm run dist:fedora`, `dist:win`, `dist:mac`.
 
-```bash
-npm run dist:fedora
-npm run dist:win
-npm run dist:mac
-```
+## Security notes
 
-For release builds, run **Build and Publish mswnlink Executables** in GitHub Actions from the `main` branch. The workflow builds a Fedora/Linux x64 AppImage, a portable Windows x64 EXE, a macOS Intel x64 DMG, and a macOS Apple Silicon arm64 DMG. Every `electron-builder` packaging script uses `--publish never`; a separate workflow job handles release uploads with `GITHUB_TOKEN`.
+- Video and the input channel use WebRTC's encrypted transport. The access code is never sent; a PBKDF2-derived key proves knowledge of it and authenticates signaling.
+- Only private-network addresses are accepted. The access code is stored with the operating system's secure storage.
+- Signaling is not encrypted, so someone who can capture your network traffic could try to guess a weak code offline. Use a long, unique code.
+- Anyone with the code controls the PC when *Connect without asking* is on. Don't use it on shared networks and don't expose port 49382 to the internet.
 
-## macOS signing
+## License
 
-When all five Apple Developer ID/App Store Connect secrets are configured, macOS builds are signed, notarized, and verified. If credentials are absent or signing/verification fails, the workflow falls back to a clearly labelled `UNSIGNED-TEST-ONLY` DMG with a warning file. That DMG is kept in workflow artifacts and attached to the release instead of being silently skipped; Gatekeeper may still block it. For trusted distribution, configure signing/notarization as described in `MAC-SIGNING-SETUP.md`.
-
-## Native input
-
-The workflow installs the X11/XTest development headers and compiles the RobotJS native backend on each target runner. Fedora Wayland interaction additionally depends on the host desktop's Remote Desktop portal permissions.
-
-
-## Share page navigation fix (v0.2.2)
-
-Page navigation is now bound synchronously before asynchronous operating-system IPC initialization begins. The renderer explicitly updates each page's active class, `hidden` property, and `aria-hidden` state, so the Share this PC page remains reachable even if display-source permission APIs respond slowly or fail.
-
-The GitHub Actions workflow is included at `.github/workflows/main.yml`. Run it manually on `main` for test artifacts; leave `release_tag` empty until the platform builds pass.
-
-
-## Reliability fixes in v0.2.6
-
-- Clipboard sharing is enabled by default on a fresh install, persists its local toggle, and syncs plain text while a session is connected when both computers have it enabled. It polls every 180 ms and avoids echo loops; it does not copy an existing clipboard just because a session starts.
-- Correct RobotJS key names are used for modifiers and numpad operators. Remote input is released on pointer cancellation, focus loss, page hiding, and host input errors to recover from stuck mouse buttons after Task Manager/window switching.
-- Long sessions use a temporary Electron power-save blocker; the fullscreen viewer attempts to resume video and recover a stalled HTML video decoder. Multi-display compositing is frame-rate capped to avoid running at the monitor's unconstrained refresh rate.
-- Wrong passcodes no longer lock the address out after five attempts. Incorrect attempts receive only a short, capped response delay; use a strong permanent passphrase and keep the listener restricted to your trusted LAN.
-- On Windows and Linux X11, monitor mapping uses Electron display ids and guarded fallbacks. Linux Wayland/PipeWire may expose only a single combined capture source, depending on the desktop portal/Electron version; mswnlink cannot switch between physical monitors separately when the OS exposes only one source.
-- macOS DMGs are retained in GitHub release uploads. If signing is unavailable or fails, the workflow falls back to a clearly named `UNSIGNED-TEST-ONLY` DMG and includes a warning file. That permits testing/download, but Gatekeeper may block it; a trusted public release still needs valid Developer ID signing and notarization.
-
-
-## Reliability fixes in v0.2.4
-
-- Windows/Linux remote input is serialized to preserve key and button order while coalescing high-frequency pointer moves. Stuck input is released on viewer focus loss, pointer cancellation, window/page hiding, and input backend errors. RobotJS key names used for left/right modifiers and numpad keys match its supported key list. Windows privilege boundaries still apply: control of elevated/system desktops cannot be guaranteed from a normal-user app.
-- A session power-save blocker and a remote-video watchdog reduce long-session fullscreen stalls; the video element is restarted if it stops rendering frames while the peer remains live.
-- Clipboard text sync runs automatically about every 180 ms when both peers enable clipboard sharing; large text is fragmented over the data channel and reconstructed before applying. Manual send/get buttons remain legacy-compatible but are not required for normal copy/paste.
-- Incorrect access codes no longer trigger a fixed attempt limit or lockout. A short, capped response delay remains to discourage automated guessing. Use a strong permanent passphrase and keep connections on a trusted LAN.
-- Monitor selection uses Electron display ids when available. Fedora/Wayland may expose one combined screen source through PipeWire, in which case separate physical monitor selection is constrained by the OS portal.
-- macOS DMGs are no longer silently removed from release assets: if signing or notarization is unavailable, a named unsigned test DMG plus warning text is uploaded. It may still be blocked by Gatekeeper; a trusted public download requires valid Developer ID signing and notarization.
-
-## Clipboard and keyboard troubleshooting
-
-Live plain-text clipboard synchronization is enabled by default on first launch and can be switched off on either computer. The setting is saved per device. Both computers must have clipboard sharing enabled for automatic copy/paste. Clipboard changes are checked frequently while a WebRTC data channel is connected; clipboard text is exchanged only during an active session.
-
-On a Windows host, normal printable ASCII keystrokes are injected as characters so the host keyboard layout does not reinterpret a remote physical key code. Modifier shortcuts (for example Ctrl+C/Ctrl+V), navigation keys, and function keys use native key-down/key-up injection. Windows secure desktop/UAC prompts and elevated apps may still require the local user to interact with them directly.
-
-If keyboard input still does not reach the host, reconnect using **Allow control**, confirm the host shows mouse/keyboard control as enabled, and inspect the host terminal for `[mswnlink] Could not inject input` messages. If clipboard sync appears idle, confirm the clipboard toggle is enabled on both devices.
-
-
-
-## v0.2.6 keyboard and clipboard changes
-
-- Remote keyboard capture is installed once at app startup rather than during each peer creation, avoiding lost or duplicate handlers after reconnects.
-- On Windows hosts, unmodified printable ASCII input uses RobotJS character injection so typing from Fedora/Windows is less dependent on the source keyboard layout. Modifier shortcuts, navigation, and function keys continue to use native key down/up events.
-- Clipboard sync is enabled by default on fresh installs, can be disabled on either device, and remembers each device's setting. Text changes are detected at 180 ms intervals while connected. Both ends must allow clipboard sync; no clipboard data is transferred outside an active session.
-- The unsigned macOS workflow now unsets signing variables instead of setting them to empty strings, preventing electron-builder from interpreting an empty certificate path as a workspace directory.
+MIT, see [LICENSE](LICENSE).
