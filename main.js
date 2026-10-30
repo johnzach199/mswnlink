@@ -7,9 +7,19 @@ const os = require('os');
 const crypto = require('crypto');
 const { promisify } = require('node:util');
 const pbkdf2Async = promisify(crypto.pbkdf2);
+const { execFile } = require('node:child_process');
 const dgram = require('node:dgram');
 const { WebSocketServer, WebSocket } = require('ws');
 const LinuxWaylandInput = process.platform === 'linux' ? require('./linux-wayland-input') : null;
+const WindowsInputBackend = process.platform === 'win32' ? require('./win32-input') : null;
+const {
+  mapRobotKey,
+  modifierFlagForRobotKey,
+  buildRobotModifiers,
+  shortcutDescriptorForPlatform,
+  parseDarwinMajor,
+  evaluateMacScreenPermission
+} = require('./lib/input-protocol');
 const isLinuxWaylandSession = Boolean(LinuxWaylandInput && LinuxWaylandInput.isSupportedSession());
 
 // Optional fallback for Linux systems whose Mesa/GBM driver cannot be opened.
@@ -42,6 +52,7 @@ let inputAllowed = false;
 let unattendedAccessEnabled = false;
 let waylandInputManager = null;
 let waylandRestoreToken = '';
+let win32InputManager = null;
 let robot = null;
 const heldKeys = new Set();
 const heldButtons = new Set();
@@ -58,10 +69,9 @@ let localFeaturePreferences = { clipboard: true, fileTransfer: false, monitorSwi
 const incomingFileHandles = new Map();
 let viewerSessionActive = false;
 let sessionPowerSaveBlockerId = null;
-let localClipboardMonitorTimer = null;
-let lastObservedClipboardText = null;
-let suppressedClipboardEcho = null;
-let suppressedClipboardEchoUntil = 0;
+let mainClipboardWatcher = null;
+let lastObservedMainClipboard = '';
+let displayMediaUsingSystemPicker = null;
 
 function featurePreferencesPath() {
   return path.join(app.getPath('userData'), 'feature-preferences.json');
@@ -128,12 +138,17 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      // Keep WebRTC data channels, screen capture, and clipboard sync responsive
+      // while mswnlink is minimized or behind another window (e.g. Task Manager).
+      backgroundThrottling: false
     }
   });
   // Also disable any per-window default menu bar on Linux/Windows.
   mainWindow.setMenuBarVisibility(false);
-  mainWindow.removeMenu();
+  if (process.platform !== 'darwin') {
+    mainWindow.removeMenu();
+  }
 
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
   mainWindow.once('ready-to-show', () => mainWindow.show());
@@ -146,9 +161,14 @@ function createWindow() {
     if (url.startsWith('https://')) shell.openExternal(url);
     return { action: 'deny' };
   });
-  mainWindow.on('blur', () => clearNativeInput());
+  // Do NOT call clearNativeInput() when the host's mswnlink window loses focus:
+  // clicking another desktop window (such as Task Manager) blurs mswnlink on the
+  // host and would prematurely cancel remote clicks/drags.
   mainWindow.on('focus', () => {
-    if (process.platform === 'win32') clearNativeInput();
+    if (process.platform === 'darwin') {
+      configureDisplayMediaHandler();
+      sendToUI('mac-permissions-changed', getMacPermissionSnapshot());
+    }
   });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
@@ -287,59 +307,56 @@ function hasActiveSession() {
   return viewerSessionActive || Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
 }
 
-function readClipboardTextSafely() {
-  try { return String(clipboard.readText() || '').slice(0, MAX_CLIPBOARD_CHARS); }
-  catch (error) {
-    console.debug('[mswnlink] Could not read the system clipboard:', error.message || error);
-    return null;
+function syncMainClipboardWatcherState() {
+  const shouldWatch = hasActiveSession() && Boolean(localFeaturePreferences.clipboard);
+  if (shouldWatch && !mainClipboardWatcher) {
+    try {
+      lastObservedMainClipboard = String(clipboard.readText() || '').slice(0, MAX_CLIPBOARD_CHARS);
+    } catch {
+      lastObservedMainClipboard = '';
+    }
+    mainClipboardWatcher = setInterval(() => {
+      if (!hasActiveSession() || !localFeaturePreferences.clipboard) return;
+      try {
+        const current = String(clipboard.readText() || '').slice(0, MAX_CLIPBOARD_CHARS);
+        if (current !== lastObservedMainClipboard) {
+          lastObservedMainClipboard = current;
+          sendToUI('local-clipboard-changed', { text: current });
+        }
+      } catch {}
+    }, 150);
+    if (mainClipboardWatcher.unref) mainClipboardWatcher.unref();
+  } else if (!shouldWatch && mainClipboardWatcher) {
+    clearInterval(mainClipboardWatcher);
+    mainClipboardWatcher = null;
   }
 }
 
-// Keep clipboard monitoring in Electron's main process: renderer timers may be
-// throttled when the viewer is fullscreen, occluded, or backgrounded.
-function startLocalClipboardMonitor() {
-  if (localClipboardMonitorTimer) return;
-  lastObservedClipboardText = null;
-  localClipboardMonitorTimer = setInterval(() => {
-    // Do not inspect the system clipboard unless the user enabled clipboard
-    // sharing and a remote session is actually active.
-    if (!localFeaturePreferences.clipboard || !hasActiveSession()) {
-      lastObservedClipboardText = null;
-      return;
-    }
-    const text = readClipboardTextSafely();
-    if (text === null) return;
-    if (lastObservedClipboardText === null) {
-      lastObservedClipboardText = text;
-      return;
-    }
-    if (text === lastObservedClipboardText) return;
-    lastObservedClipboardText = text;
-
-    // A clipboard update written from the peer must not be echoed back.
-    if (suppressedClipboardEcho !== null && Date.now() <= suppressedClipboardEchoUntil && text === suppressedClipboardEcho) {
-      suppressedClipboardEcho = null;
-      suppressedClipboardEchoUntil = 0;
-      return;
-    }
-    suppressedClipboardEcho = null;
-    suppressedClipboardEchoUntil = 0;
-    if (!hasActiveSession() || !localFeaturePreferences.clipboard) return;
-    sendToUI('local-clipboard-changed', { text });
-  }, 120);
-  if (localClipboardMonitorTimer.unref) localClipboardMonitorTimer.unref();
-}
-
-function stopLocalClipboardMonitor() {
-  if (localClipboardMonitorTimer) clearInterval(localClipboardMonitorTimer);
-  localClipboardMonitorTimer = null;
-}
-
-function isTrustedAppWebContents(webContents, requestingUrl = '') {
-  if (!mainWindow || mainWindow.isDestroyed() || webContents !== mainWindow.webContents) return false;
-  let url = String(requestingUrl || '');
-  if (!url && webContents && typeof webContents.getURL === 'function') url = webContents.getURL();
-  return url.startsWith('file://');
+function getMacPermissionSnapshot() {
+  if (process.platform !== 'darwin') {
+    return {
+      isMac: false,
+      status: 'granted',
+      screen: 'granted',
+      accessibility: true,
+      darwinMajor: 0,
+      granted: true,
+      useSystemPickerFallback: false,
+      needsAttention: false,
+      canResetStaleTcc: false,
+      summary: ''
+    };
+  }
+  let screenStatus = 'not-determined';
+  let accessibility = false;
+  try { screenStatus = systemPreferences.getMediaAccessStatus('screen'); } catch {}
+  try { accessibility = systemPreferences.isTrustedAccessibilityClient(false); } catch {}
+  const evaluated = evaluateMacScreenPermission(screenStatus, 'darwin', os.release());
+  return {
+    ...evaluated,
+    screen: evaluated.status,
+    accessibility
+  };
 }
 
 function updateSessionPowerSaveBlocker() {
@@ -347,6 +364,7 @@ function updateSessionPowerSaveBlocker() {
   // mid-session (a common source of apparent fullscreen freezes). Release it as
   // soon as both the viewer session and host peer are inactive.
   const active = viewerSessionActive || Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
+  syncMainClipboardWatcherState();
   try {
     if (active && sessionPowerSaveBlockerId === null) {
       sessionPowerSaveBlockerId = powerSaveBlocker.start('prevent-display-sleep');
@@ -471,10 +489,12 @@ async function saveWaylandRestoreToken(value) {
 
 function hasInputBackend() {
   if (isLinuxWaylandSession) return Boolean(LinuxWaylandInput);
+  if (process.platform === 'win32') return Boolean(WindowsInputBackend || robot);
   return Boolean(robot);
 }
 
-async function ensureInputBackend() {
+async function ensureInputBackend(options = {}) {
+  const allowElevationPrompt = options.allowElevationPrompt !== false;
   if (isLinuxWaylandSession) {
     if (!LinuxWaylandInput) throw new Error('This Linux Wayland session needs the XDG desktop portal remote-desktop input backend. Update mswnlink and reinstall dependencies.');
     if (!waylandInputManager) waylandInputManager = new LinuxWaylandInput();
@@ -486,10 +506,22 @@ async function ensureInputBackend() {
     if (result && result.restoreToken) await saveWaylandRestoreToken(result.restoreToken);
     return true;
   }
+  if (process.platform === 'win32' && WindowsInputBackend) {
+    if (!win32InputManager) {
+      win32InputManager = new WindowsInputBackend({ userDataPath: app.getPath('userData'), screen });
+    }
+    try {
+      await win32InputManager.start({ allowElevationPrompt });
+      return true;
+    } catch (error) {
+      console.warn('[mswnlink] Windows native SendInput helper could not start; checking RobotJS fallback:', error.message);
+      if (!robot) throw error;
+    }
+  }
   if (!robot) throw new Error('Mouse/keyboard control is unavailable. Build the RobotJS input backend for this operating system and architecture.');
   if (process.platform === 'darwin' && !systemPreferences.isTrustedAccessibilityClient(true)) {
     // The call above shows the macOS permission prompt. Without it, clicks and keys are silently ignored.
-    throw new Error('macOS has not allowed mswnlink to control this Mac yet. Open System Settings › Privacy & Security › Accessibility, turn on mswnlink, restart the app, then try again.');
+    throw new Error('macOS has not allowed mswnlink to control this Mac yet. Open System Settings › Privacy & Security › Accessibility, turn on mswnlink, then click Allow control again.');
   }
   return true;
 }
@@ -560,14 +592,6 @@ function safeName(value) {
 
 function screenCaptureErrorMessage(error) {
   const detail = error && error.message ? error.message : String(error || 'Unknown error');
-  if (process.platform === 'darwin') {
-    let status = 'unknown';
-    try { status = systemPreferences.getMediaAccessStatus('screen'); } catch {}
-    if (status === 'denied' || status === 'restricted') {
-      return `macOS has not granted Screen Recording permission to mswnlink. Open System Settings → Privacy & Security → Screen & System Audio Recording, enable mswnlink, then quit and reopen it. Details: ${detail}`;
-    }
-    return `macOS could not start screen sharing. Start sharing from the mswnlink window and approve the macOS Screen Recording prompt. If permission was changed, enable mswnlink in System Settings → Privacy & Security → Screen & System Audio Recording, then quit and reopen it. Details: ${detail}`;
-  }
   const waylandSession = process.platform === 'linux' && (
     String(process.env.XDG_SESSION_TYPE || '').toLowerCase() === 'wayland' ||
     Boolean(process.env.WAYLAND_DISPLAY)
@@ -612,17 +636,20 @@ function sendSocket(socket, object) {
 }
 
 function clearNativeInput() {
+  if (win32InputManager && win32InputManager.isActive()) {
+    try { win32InputManager.releaseAll(); } catch {}
+  }
   if (robot) {
+    const nonModifiers = [];
+    const modifiers = [];
     for (const key of heldKeys) {
-      try { robot.keyToggle(key, 'up'); } catch {}
+      if (modifierFlagForRobotKey(key)) modifiers.push(key);
+      else nonModifiers.push(key);
     }
-    // Windows can lose a pointer-up when focus changes to Task Manager or
-    // another top-level window. Release every native button, not only the
-    // buttons whose matching down event mswnlink still remembers.
-    const buttonsToRelease = process.platform === 'win32'
-      ? ['left', 'middle', 'right']
-      : [...heldButtons];
-    for (const button of buttonsToRelease) {
+    for (const key of [...nonModifiers, ...modifiers]) {
+      try { robot.keyToggle(key, 'up', []); } catch {}
+    }
+    for (const button of heldButtons) {
       try { robot.mouseToggle('up', button); } catch {}
     }
   }
@@ -709,6 +736,8 @@ function bindConnection(socket, req) {
           activePeer = null;
           return;
         }
+        try { await ensureInputBackend({ allowElevationPrompt: false }); }
+        catch (error) { console.warn('[mswnlink] Unattended input backend warm-up warning:', error.message); }
         activeSocket = socket;
         updateSessionPowerSaveBlocker();
         socket.unattendedAccess = true;
@@ -806,34 +835,15 @@ async function stopHost() {
     waylandInputManager = null;
     try { await manager.close(); } catch (error) { console.warn('[mswnlink] Could not close Wayland input session:', error.message); }
   }
+  if (win32InputManager) {
+    const manager = win32InputManager;
+    win32InputManager = null;
+    try { await manager.close(); } catch (error) { console.warn('[mswnlink] Could not close Windows input helper:', error.message); }
+  }
   sendToUI('host-stopped', {});
   announcePresence();
   sendDiscoveredDevices();
   return { ok: true };
-}
-
-function mapKey(event) {
-  const code = String(event.code || '');
-  const named = {
-    Enter: 'enter', Escape: 'escape', Backspace: 'backspace', Tab: 'tab', Space: 'space',
-    ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down',
-    ShiftLeft: 'shift', ShiftRight: 'right_shift', ControlLeft: 'left_control', ControlRight: 'right_control',
-    AltLeft: 'alt', AltRight: 'right_alt', MetaLeft: 'command', MetaRight: 'command',
-    CapsLock: 'capslock', Delete: 'delete', Home: 'home', End: 'end', PageUp: 'pageup',
-    PageDown: 'pagedown', Insert: 'insert', Backquote: '`', Minus: '-', Equal: '=',
-    BracketLeft: '[', BracketRight: ']', Backslash: '\\', Semicolon: ';', Quote: "'",
-    Comma: ',', Period: '.', Slash: '/', NumpadAdd: 'numpad_+', NumpadSubtract: 'numpad_-',
-    NumpadMultiply: 'numpad_*', NumpadDivide: 'numpad_/', NumpadDecimal: 'numpad_.',
-    NumpadEnter: 'enter', PrintScreen: 'printscreen', ScrollLock: 'scroll_lock'
-  };
-  if (named[code]) return named[code];
-  if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase();
-  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
-  if (/^Numpad[0-9]$/.test(code)) return `numpad_${code.slice(6)}`;
-  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code.toLowerCase();
-  const key = String(event.key || '').toLowerCase();
-  if (/^[a-z0-9]$/.test(key)) return key;
-  return null;
 }
 
 async function injectInput(event) {
@@ -849,6 +859,14 @@ async function injectInput(event) {
       if (!waylandInputManager) throw new Error('Wayland remote input is not active. Start sharing again and approve the desktop permission prompt.');
       return await waylandInputManager.inject(event);
     }
+    if (process.platform === 'win32' && WindowsInputBackend) {
+      if (!win32InputManager || !win32InputManager.isActive()) {
+        await ensureInputBackend({ allowElevationPrompt: false }).catch(() => {});
+      }
+      if (win32InputManager && win32InputManager.isActive()) {
+        return win32InputManager.inject(event);
+      }
+    }
     if (!robot) throw new Error('Native input backend is unavailable.');
     if (event.kind === 'move') {
       const x = Math.max(0, Math.min(1, Number(event.x)));
@@ -860,19 +878,11 @@ async function injectInput(event) {
       const targetDisplay = typeof event.displayId === 'string' && event.displayId
         ? screen.getAllDisplays().find(item => String(item.id) === event.displayId)
         : null;
-      if (targetDisplay) {
-        const bounds = targetDisplay.bounds;
-        robot.moveMouse(
-          Math.round(bounds.x + x * Math.max(0, bounds.width - 1)),
-          Math.round(bounds.y + y * Math.max(0, bounds.height - 1))
-        );
-      } else {
-        const bounds = screen.getPrimaryDisplay().bounds;
-        robot.moveMouse(
-          Math.round(bounds.x + x * Math.max(0, bounds.width - 1)),
-          Math.round(bounds.y + y * Math.max(0, bounds.height - 1))
-        );
-      }
+      const bounds = targetDisplay ? targetDisplay.bounds : screen.getPrimaryDisplay().bounds;
+      robot.moveMouse(
+        Math.round(bounds.x + x * Math.max(0, bounds.width - 1)),
+        Math.round(bounds.y + y * Math.max(0, bounds.height - 1))
+      );
     } else if (event.kind === 'mouse') {
       const button = ({ 0: 'left', 1: 'middle', 2: 'right' })[Number(event.button)];
       if (!button) return { ok: false };
@@ -886,13 +896,11 @@ async function injectInput(event) {
       wheelRemainderX -= dx;
       wheelRemainderY -= dy;
       if (dx || dy) robot.scrollMouse(dx, dy);
+    } else if (event.kind === 'shortcut') {
+      const desc = shortcutDescriptorForPlatform(String(event.action || ''), process.platform);
+      if (!desc) return { ok: false, reason: 'Unsupported shortcut.' };
+      robot.keyTap(desc.key, desc.modifiers);
     } else if (event.kind === 'key') {
-      // Windows remote typing is more reliable when printable, unmodified
-      // characters are emitted as characters: physical keycodes otherwise get
-      // interpreted using the host's keyboard layout (and can silently differ
-      // from the viewer's layout). Modifier shortcuts and non-printable keys
-      // still use keyToggle so Ctrl+C/V, arrows, function keys, and held keys
-      // retain their native down/up lifecycle.
       if (process.platform === 'win32' && event.textInput === true) {
         if (event.action === 'down') {
           const character = String(event.key || '');
@@ -902,10 +910,20 @@ async function injectInput(event) {
         }
         return { ok: true };
       }
-      const key = mapKey(event);
+      const key = mapRobotKey(event, process.platform);
       if (!key) return { ok: false, reason: `Unsupported keyboard key (${String(event.code || event.key || 'unknown')}).` };
-      if (event.action === 'down') { robot.keyToggle(key, 'down'); heldKeys.add(key); }
-      else if (event.action === 'up') { robot.keyToggle(key, 'up'); heldKeys.delete(key); }
+      const isMod = Boolean(modifierFlagForRobotKey(key));
+      if (event.action === 'down') {
+        const mods = isMod
+          ? buildRobotModifiers([...heldKeys].filter(k => k !== key))
+          : buildRobotModifiers(heldKeys, event);
+        robot.keyToggle(key, 'down', mods);
+        heldKeys.add(key);
+      } else if (event.action === 'up') {
+        heldKeys.delete(key);
+        const mods = buildRobotModifiers(heldKeys);
+        robot.keyToggle(key, 'up', mods);
+      }
     }
     return { ok: true };
   } catch (error) {
@@ -917,11 +935,85 @@ async function injectInput(event) {
   }
 }
 
+function configureDisplayMediaHandler() {
+  const snapshot = getMacPermissionSnapshot();
+  const wantSystemPicker = Boolean(snapshot.isMac && snapshot.useSystemPickerFallback);
+  if (displayMediaUsingSystemPicker === wantSystemPicker) return;
+
+  const handler = async (_request, callback) => {
+    try {
+      const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 160, height: 100 } });
+      const source = sources.find(item => item.id === chosenSourceId) || sources[0];
+      if (!source) {
+        const perm = getMacPermissionSnapshot();
+        const message = perm.isMac && !perm.granted
+          ? (perm.summary || 'macOS Screen Recording permission is required. Allow mswnlink in System Settings › Privacy & Security › Screen & System Audio Recording.')
+          : 'No capturable display was returned by the operating system.';
+        sendToUI('host-error', { message });
+        if (perm.isMac) sendToUI('mac-permissions-changed', perm);
+        // Electron requires an object (`{}`), never `null`, when declining display media.
+        callback({});
+        return;
+      }
+      if (process.platform === 'darwin') {
+        // Now that TCC access succeeded, switch to programmatic handler if needed.
+        setImmediate(() => {
+          configureDisplayMediaHandler();
+          sendToUI('mac-permissions-changed', getMacPermissionSnapshot());
+        });
+      }
+      callback({ video: source });
+    } catch (error) {
+      const perm = getMacPermissionSnapshot();
+      const message = perm.isMac && !perm.granted && perm.summary
+        ? perm.summary
+        : screenCaptureErrorMessage(error);
+      console.warn('[mswnlink] Screen capture request failed:', message);
+      sendToUI('host-error', { message });
+      if (perm.isMac) sendToUI('mac-permissions-changed', perm);
+      callback({});
+    }
+  };
+
+  try {
+    if (wantSystemPicker) {
+      session.defaultSession.setDisplayMediaRequestHandler(handler, { useSystemPicker: true });
+      displayMediaUsingSystemPicker = true;
+    } else {
+      session.defaultSession.setDisplayMediaRequestHandler(handler);
+      displayMediaUsingSystemPicker = false;
+    }
+  } catch {
+    session.defaultSession.setDisplayMediaRequestHandler(handler);
+    displayMediaUsingSystemPicker = false;
+  }
+}
+
 app.whenReady().then(async () => {
-  // Windows/Linux: no menu bar. macOS: keep a minimal system menu, because
-  // without it Cmd+C / Cmd+V / Cmd+Q and window shortcuts stop working.
+  // Windows/Linux: no menu bar. macOS: route Cmd+C/V/X/A/Z through our custom
+  // Edit menu handler so shortcuts reach the remote desktop when the viewer
+  // stage is focused, while still working normally in local text inputs.
   if (process.platform === 'darwin') {
-    Menu.setApplicationMenu(Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }, { role: 'windowMenu' }]));
+    const dispatchEdit = (action) => () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      sendToUI('menu-edit-action', { action });
+    };
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      { role: 'appMenu' },
+      {
+        label: 'Edit',
+        submenu: [
+          { label: 'Undo', accelerator: 'CmdOrCtrl+Z', click: dispatchEdit('undo') },
+          { label: 'Redo', accelerator: 'Shift+CmdOrCtrl+Z', click: dispatchEdit('redo') },
+          { type: 'separator' },
+          { label: 'Cut', accelerator: 'CmdOrCtrl+X', click: dispatchEdit('cut') },
+          { label: 'Copy', accelerator: 'CmdOrCtrl+C', click: dispatchEdit('copy') },
+          { label: 'Paste', accelerator: 'CmdOrCtrl+V', click: dispatchEdit('paste') },
+          { label: 'Select All', accelerator: 'CmdOrCtrl+A', click: dispatchEdit('selectAll') }
+        ]
+      },
+      { role: 'windowMenu' }
+    ]));
   } else {
     Menu.setApplicationMenu(null);
   }
@@ -945,7 +1037,6 @@ app.whenReady().then(async () => {
   });
 
   await loadLocalFeaturePreferences();
-  startLocalClipboardMonitor();
   persistentAccessCode = await loadSavedAccessCode();
   await loadUnattendedAccessSetting();
   if (unattendedAccessEnabled && (!persistentAccessCode || persistentAccessCode.length < UNATTENDED_MIN_CODE_LENGTH)) {
@@ -955,54 +1046,62 @@ app.whenReady().then(async () => {
     try { await fs.writeFile(unattendedSettingsPath(), JSON.stringify({ enabled: false }, null, 2), { encoding: 'utf8', mode: 0o600 }); } catch {}
   }
   waylandRestoreToken = await loadWaylandRestoreToken();
+  configureDisplayMediaHandler();
 
-  // Electron 45+ separates the Screen Capture API permission from the source
-  // selection callback. Grant it only to this app's local renderer; macOS TCC
-  // still requires the user to grant Screen Recording in System Settings.
-  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details = {}) => {
-    if (permission === 'display-capture') {
-      return isTrustedAppWebContents(webContents, details.requestingUrl || requestingOrigin || '');
+  ipcMain.handle('perform-edit-action', (event, action) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return false;
+    const wc = mainWindow.webContents;
+    switch (String(action || '')) {
+      case 'undo': wc.undo(); return true;
+      case 'redo': wc.redo(); return true;
+      case 'cut': wc.cut(); return true;
+      case 'copy': wc.copy(); return true;
+      case 'paste': wc.paste(); return true;
+      case 'selectAll': wc.selectAll(); return true;
+      default: return false;
     }
-    if (permission === 'clipboard-sanitized-write') {
-      return isTrustedAppWebContents(webContents, details.requestingUrl || requestingOrigin || '');
-    }
-    return false;
-  });
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details = {}) => {
-    const requestingUrl = details.requestingUrl || (webContents && webContents.getURL ? webContents.getURL() : '');
-    const trusted = isTrustedAppWebContents(webContents, requestingUrl);
-    callback(Boolean(trusted && (permission === 'display-capture' || permission === 'clipboard-sanitized-write')));
   });
 
-  ipcMain.handle('get-screen-capture-status', () => {
-    if (process.platform !== 'darwin') return 'granted';
-    try { return systemPreferences.getMediaAccessStatus('screen'); } catch { return 'unknown'; }
-  });
-  ipcMain.handle('open-screen-capture-settings', async () => {
-    if (process.platform !== 'darwin') return { ok: false, error: 'Screen Recording settings are only available on macOS.' };
-    const urls = [
-      'x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture',
-      'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'
-    ];
-    let lastError = null;
-    for (const url of urls) {
-      try { await shell.openExternal(url); return { ok: true }; }
-      catch (error) { lastError = error; }
-    }
-    return { ok: false, error: lastError && lastError.message ? lastError.message : 'Could not open macOS Screen Recording settings.' };
+  ipcMain.handle('get-mac-permissions', () => {
+    configureDisplayMediaHandler();
+    return getMacPermissionSnapshot();
   });
 
-  session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+  ipcMain.handle('request-mac-screen-permission', async () => {
+    if (process.platform !== 'darwin') return getMacPermissionSnapshot();
     try {
-      const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 160, height: 100 } });
-      const source = sources.find(item => item.id === chosenSourceId) || sources[0];
-      callback(source ? { video: source } : null);
+      // Enumerating screen sources via ScreenCaptureKit triggers the one-time
+      // macOS Screen Recording prompt when status is 'not-determined'.
+      await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 64, height: 40 } });
+    } catch {}
+    configureDisplayMediaHandler();
+    const snapshot = getMacPermissionSnapshot();
+    sendToUI('mac-permissions-changed', snapshot);
+    return snapshot;
+  });
+
+  ipcMain.handle('open-mac-privacy-settings', async (_event, pane = 'screen') => {
+    if (process.platform !== 'darwin') return { ok: false };
+    const url = pane === 'accessibility'
+      ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'
+      : 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture';
+    try {
+      await shell.openExternal(url);
+      return { ok: true };
     } catch (error) {
-      const message = screenCaptureErrorMessage(error);
-      console.warn('[mswnlink] Screen capture request failed:', message);
-      sendToUI('host-error', { message });
-      callback(null);
+      return { ok: false, error: error && error.message ? error.message : 'Could not open System Settings.' };
     }
+  });
+
+  ipcMain.handle('reset-mac-screen-permission', async () => {
+    if (process.platform !== 'darwin') return { ok: false };
+    await new Promise((resolve) => {
+      execFile('tccutil', ['reset', 'ScreenCapture', 'com.mswnlink.lan'], { timeout: 5000 }, () => resolve());
+    });
+    configureDisplayMediaHandler();
+    const snapshot = getMacPermissionSnapshot();
+    sendToUI('mac-permissions-changed', snapshot);
+    return { ok: true, ...snapshot };
   });
 
   ipcMain.handle('get-access-code', () => ({
@@ -1034,20 +1133,28 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle('device-info', () => ({
-    name: os.hostname(),
-    platform: process.platform,
-    waylandSession: process.platform === 'linux' && (
-      String(process.env.XDG_SESSION_TYPE || '').toLowerCase() === 'wayland' ||
-      Boolean(process.env.WAYLAND_DISPLAY)
-    ),
-    ips: getLanIPv4(),
-    inputAvailable: hasInputBackend(),
-    inputBackend: isLinuxWaylandSession ? 'desktop-portal' : (robot ? 'robotjs' : 'unavailable'),
-    unattendedAccess: unattendedAccessEnabled,
-    unattendedMinCodeLength: UNATTENDED_MIN_CODE_LENGTH,
-    macScreenAccess: process.platform === 'darwin' ? systemPreferences.getMediaAccessStatus('screen') : null
-  }));
+  ipcMain.handle('device-info', () => {
+    const macPerm = getMacPermissionSnapshot();
+    return {
+      name: os.hostname(),
+      platform: process.platform,
+      osRelease: os.release(),
+      darwinMajor: parseDarwinMajor(os.release()),
+      waylandSession: process.platform === 'linux' && (
+        String(process.env.XDG_SESSION_TYPE || '').toLowerCase() === 'wayland' ||
+        Boolean(process.env.WAYLAND_DISPLAY)
+      ),
+      ips: getLanIPv4(),
+      inputAvailable: hasInputBackend(),
+      inputBackend: isLinuxWaylandSession
+        ? 'desktop-portal'
+        : (process.platform === 'win32' && WindowsInputBackend ? 'win32-sendinput' : (robot ? 'robotjs' : 'unavailable')),
+      unattendedAccess: unattendedAccessEnabled,
+      unattendedMinCodeLength: UNATTENDED_MIN_CODE_LENGTH,
+      macScreenAccess: process.platform === 'darwin' ? macPerm.screen : null,
+      macPermissions: process.platform === 'darwin' ? macPerm : null
+    };
+  });
 
   ipcMain.handle('get-sources', async () => {
     try {
@@ -1191,6 +1298,7 @@ app.whenReady().then(async () => {
       return { ok: false, error: error && error.message ? error.message : 'Could not save feature preferences.' };
     }
     sendToUI('local-features-changed', { ...localFeaturePreferences });
+    syncMainClipboardWatcherState();
     return { ok: true, features: { ...localFeaturePreferences } };
   });
   ipcMain.handle('set-viewer-session-active', (_event, active) => {
@@ -1200,14 +1308,15 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('read-local-clipboard', () => {
     if (!localFeaturePreferences.clipboard) return { ok: false, error: 'Enable clipboard sharing on this device first.' };
-    return { ok: true, text: String(clipboard.readText() || '').slice(0, MAX_CLIPBOARD_CHARS) };
+    const text = String(clipboard.readText() || '').slice(0, MAX_CLIPBOARD_CHARS);
+    lastObservedMainClipboard = text;
+    return { ok: true, text };
   });
   ipcMain.handle('write-local-clipboard', (_event, value) => {
     if (!localFeaturePreferences.clipboard) return { ok: false, error: 'Clipboard sharing is disabled on this device.' };
     if (typeof value !== 'string' || value.length > MAX_CLIPBOARD_CHARS) return { ok: false, error: 'Clipboard text is too large.' };
+    lastObservedMainClipboard = value;
     clipboard.writeText(value);
-    suppressedClipboardEcho = value;
-    suppressedClipboardEchoUntil = Date.now() + 3000;
     return { ok: true };
   });
   ipcMain.handle('pick-file-to-send', async () => {
@@ -1282,7 +1391,10 @@ app.whenReady().then(async () => {
 
 app.on('before-quit', () => {
   stopDeviceDiscovery();
-  stopLocalClipboardMonitor();
+  if (mainClipboardWatcher) {
+    clearInterval(mainClipboardWatcher);
+    mainClipboardWatcher = null;
+  }
   if (sessionPowerSaveBlockerId !== null) {
     try { if (powerSaveBlocker.isStarted(sessionPowerSaveBlockerId)) powerSaveBlocker.stop(sessionPowerSaveBlockerId); } catch {}
     sessionPowerSaveBlockerId = null;

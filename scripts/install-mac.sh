@@ -39,10 +39,21 @@ echo "Installing to /Applications…"
 hdiutil attach "$WORK/mswnlink.dmg" -mountpoint "$MOUNT" -nobrowse -quiet
 if [ ! -d "$MOUNT/$APP" ]; then echo "$APP was not found inside the download." >&2; exit 1; fi
 pkill -x mswnlink 2>/dev/null || true
+HAD_EXISTING=0
+if [ -d "/Applications/$APP" ]; then HAD_EXISTING=1; fi
 rm -rf "/Applications/$APP"
 cp -R "$MOUNT/$APP" "/Applications/$APP"
 # Belt and braces: make sure no quarantine flag is present.
 xattr -cr "/Applications/$APP" 2>/dev/null || true
+
+# Ad-hoc signed builds change CDHash on each release. Resetting stale TCC entries
+# when upgrading prevents macOS from showing the Screen Recording switch as ON
+# while silently denying screen capture to the new binary.
+if [ "$HAD_EXISTING" = "1" ]; then
+  echo "Refreshing macOS Screen Recording & Accessibility permissions for the updated build…"
+  tccutil reset ScreenCapture com.mswnlink.lan 2>/dev/null || true
+  tccutil reset Accessibility com.mswnlink.lan 2>/dev/null || true
+fi
 
 echo "Done. Opening mswnlink…"
 open "/Applications/$APP"

@@ -11,6 +11,7 @@
 const crypto = require('node:crypto');
 const dbus = require('dbus-next');
 const { Message } = dbus;
+const { shortcutDescriptorForPlatform } = require('./lib/input-protocol');
 
 const BUS_NAME = 'org.freedesktop.portal.Desktop';
 const ROOT = '/org/freedesktop/portal/desktop';
@@ -242,6 +243,18 @@ class LinuxWaylandInput {
       const state = event.action === 'down' ? 1 : 0;
       await this.remote.NotifyKeyboardKeycode(this.sessionHandle, options, keycode, state);
       if (state) this.heldKeys.add(keycode); else this.heldKeys.delete(keycode);
+    } else if (event.kind === 'shortcut') {
+      const desc = shortcutDescriptorForPlatform(String(event.action || ''), 'linux');
+      if (!desc || !desc.evdev) return { ok: false, reason: 'Unsupported shortcut.' };
+      const ctrlHeld = this.heldKeys.has(EVDEV_KEYCODES.ControlLeft) || this.heldKeys.has(EVDEV_KEYCODES.ControlRight);
+      const needShift = desc.modifiers.includes('shift');
+      const shiftHeld = this.heldKeys.has(EVDEV_KEYCODES.ShiftLeft) || this.heldKeys.has(EVDEV_KEYCODES.ShiftRight);
+      if (!ctrlHeld) await this.remote.NotifyKeyboardKeycode(this.sessionHandle, options, EVDEV_KEYCODES.ControlLeft, 1);
+      if (needShift && !shiftHeld) await this.remote.NotifyKeyboardKeycode(this.sessionHandle, options, EVDEV_KEYCODES.ShiftLeft, 1);
+      await this.remote.NotifyKeyboardKeycode(this.sessionHandle, options, desc.evdev, 1);
+      await this.remote.NotifyKeyboardKeycode(this.sessionHandle, options, desc.evdev, 0);
+      if (needShift && !shiftHeld) await this.remote.NotifyKeyboardKeycode(this.sessionHandle, options, EVDEV_KEYCODES.ShiftLeft, 0);
+      if (!ctrlHeld) await this.remote.NotifyKeyboardKeycode(this.sessionHandle, options, EVDEV_KEYCODES.ControlLeft, 0);
     } else if (event.kind === 'releaseAll') {
       await this.releaseAll();
     }

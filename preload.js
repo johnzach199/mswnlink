@@ -14,6 +14,8 @@ const allowedEvents = new Set([
   'discovered-devices',
   'local-features-changed',
   'local-clipboard-changed',
+  'menu-edit-action',
+  'mac-permissions-changed',
   'window-state'
 ]);
 
@@ -22,6 +24,11 @@ contextBridge.exposeInMainWorld('lanAPI', {
   toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggle-maximize'),
   closeWindow: () => ipcRenderer.invoke('window:close'),
   deviceInfo: () => ipcRenderer.invoke('device-info'),
+  getMacPermissions: () => ipcRenderer.invoke('get-mac-permissions'),
+  requestMacScreenPermission: () => ipcRenderer.invoke('request-mac-screen-permission'),
+  openMacPrivacySettings: (pane) => ipcRenderer.invoke('open-mac-privacy-settings', pane),
+  resetMacScreenPermission: () => ipcRenderer.invoke('reset-mac-screen-permission'),
+  performEditAction: (action) => ipcRenderer.invoke('perform-edit-action', action),
   getAccessCode: () => ipcRenderer.invoke('get-access-code'),
   saveAccessCode: (code) => ipcRenderer.invoke('save-access-code', code),
   getUnattendedAccess: () => ipcRenderer.invoke('get-unattended-access'),
@@ -44,8 +51,6 @@ contextBridge.exposeInMainWorld('lanAPI', {
   setViewerSessionActive: (active) => ipcRenderer.invoke('set-viewer-session-active', active),
   readLocalClipboard: () => ipcRenderer.invoke('read-local-clipboard'),
   writeLocalClipboard: (text) => ipcRenderer.invoke('write-local-clipboard', text),
-  getScreenCaptureStatus: () => ipcRenderer.invoke('get-screen-capture-status'),
-  openScreenCaptureSettings: () => ipcRenderer.invoke('open-screen-capture-settings'),
   pickFileToSend: () => ipcRenderer.invoke('pick-file-to-send'),
   beginFileReceive: (details) => ipcRenderer.invoke('begin-file-receive', details),
   writeFileChunk: (token, data) => ipcRenderer.invoke('write-file-chunk', token, data),
