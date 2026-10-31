@@ -667,12 +667,17 @@ class WindowsInputBackend {
         })
       };
     }
+    if (event.kind === 'text') {
+      const text = String(event.text || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 64);
+      if (!text) return { ok: true };
+      return { ok: this.send({ op: 'text', text }) };
+    }
     if (event.kind === 'key') {
       if (event.textInput === true) {
         if (event.action === 'down') {
           const text = String(event.key || '');
           if (!text || /[\u0000-\u001f\u007f]/.test(text)) return { ok: false };
-          return { ok: this.send({ op: 'text', text: text.slice(0, 8) }) };
+          return { ok: this.send({ op: 'text', text: text.slice(0, 64) }) };
         }
         return { ok: true };
       }

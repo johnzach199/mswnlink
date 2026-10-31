@@ -279,6 +279,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
 .viewer-stage { flex: 1; min-height: 0; position: relative; display: flex; background: var(--stage); }
 #remote-video { width: 100%; height: 100%; object-fit: contain; background: var(--stage); outline: none; touch-action: none; user-select: none; -webkit-user-select: none; }
 #remote-video.control-enabled { cursor: crosshair; }
+.remote-input-capture { position: absolute; left: 0; top: 0; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; pointer-events: none; resize: none; overflow: hidden; caret-color: transparent; background: transparent; color: transparent; }
 .viewer-placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; color: #d4dad8; text-align: center; background: var(--stage); padding: 16px; }
 .viewer-placeholder span { font-size: 14px; color: #8b9692; }
 .viewer-loader { width: 28px; height: 28px; margin-bottom: 8px; border-radius: 50%; border: 3px solid #26302d; border-top-color: #5ce0c6; animation: spin 0.9s linear infinite; }

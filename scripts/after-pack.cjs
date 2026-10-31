@@ -31,9 +31,9 @@ SELF="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
 APP_DIR="$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)"
 set -- "$APP_DIR/resources/app.asar" "$@"
 if [ "\${MSWNLINK_FORCE_NATIVE_WAYLAND:-}" = "1" ]; then
-  set -- --ozone-platform=wayland "$@"
-elif [ "\${XDG_SESSION_TYPE:-}" = "wayland" ] || [ -n "\${WAYLAND_DISPLAY:-}" ]; then
-  set -- --ozone-platform=x11 "$@"
+  set -- --ozone-platform=wayland --enable-features=WebRTCPipeWireCapturer "$@"
+elif [ "\${XDG_SESSION_TYPE:-}" = "wayland" ] || { [ "\${XDG_SESSION_TYPE:-}" != "x11" ] && [ -n "\${WAYLAND_DISPLAY:-}" ]; }; then
+  set -- --ozone-platform=x11 --enable-features=WebRTCPipeWireCapturer "$@"
 fi
 if [ "\${MSWNLINK_DISABLE_GPU:-}" = "1" ]; then
   set -- --disable-gpu --disable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE "$@"

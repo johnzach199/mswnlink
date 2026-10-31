@@ -18,9 +18,18 @@ const {
   buildRobotModifiers,
   shortcutDescriptorForPlatform,
   parseDarwinMajor,
-  evaluateMacScreenPermission
+  evaluateMacScreenPermission,
+  normalizeClipboardText,
+  isLinuxWaylandEnv
 } = require('./lib/input-protocol');
-const isLinuxWaylandSession = Boolean(LinuxWaylandInput && LinuxWaylandInput.isSupportedSession());
+const isLinuxWaylandSession = Boolean(
+  (LinuxWaylandInput && LinuxWaylandInput.isSupportedSession()) ||
+  isLinuxWaylandEnv(process.env, process.platform)
+);
+
+if (isLinuxWaylandSession) {
+  app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer');
+}
 
 // Optional fallback for Linux systems whose Mesa/GBM driver cannot be opened.
 // This must run before app.whenReady(); keep acceleration enabled by default.
@@ -70,6 +79,8 @@ const incomingFileHandles = new Map();
 let viewerSessionActive = false;
 let sessionPowerSaveBlockerId = null;
 let mainClipboardWatcher = null;
+let mainClipboardPollInFlight = false;
+let clipboardFallbackBusy = false;
 let lastObservedMainClipboard = '';
 let displayMediaUsingSystemPicker = null;
 
@@ -307,28 +318,44 @@ function hasActiveSession() {
   return viewerSessionActive || Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
 }
 
+async function readOsClipboardText() {
+  // Electron 45+ changed clipboard.readText() to return Promise<string>.
+  // Always await Promise.resolve(...) and normalize so "[object Promise]" is impossible.
+  const raw = await Promise.resolve(clipboard.readText());
+  return normalizeClipboardText(raw, MAX_CLIPBOARD_CHARS);
+}
+
+async function writeOsClipboardText(value) {
+  const safe = normalizeClipboardText(value, MAX_CLIPBOARD_CHARS);
+  await Promise.resolve(clipboard.writeText(safe));
+  return safe;
+}
+
 function syncMainClipboardWatcherState() {
   const shouldWatch = hasActiveSession() && Boolean(localFeaturePreferences.clipboard);
   if (shouldWatch && !mainClipboardWatcher) {
-    try {
-      lastObservedMainClipboard = String(clipboard.readText() || '').slice(0, MAX_CLIPBOARD_CHARS);
-    } catch {
-      lastObservedMainClipboard = '';
-    }
-    mainClipboardWatcher = setInterval(() => {
-      if (!hasActiveSession() || !localFeaturePreferences.clipboard) return;
+    readOsClipboardText()
+      .then((initial) => { lastObservedMainClipboard = initial; })
+      .catch(() => { lastObservedMainClipboard = ''; });
+    mainClipboardWatcher = setInterval(async () => {
+      if (mainClipboardPollInFlight || clipboardFallbackBusy || !hasActiveSession() || !localFeaturePreferences.clipboard) return;
+      mainClipboardPollInFlight = true;
       try {
-        const current = String(clipboard.readText() || '').slice(0, MAX_CLIPBOARD_CHARS);
+        const current = await readOsClipboardText();
         if (current !== lastObservedMainClipboard) {
           lastObservedMainClipboard = current;
           sendToUI('local-clipboard-changed', { text: current });
         }
       } catch {}
+      finally {
+        mainClipboardPollInFlight = false;
+      }
     }, 150);
     if (mainClipboardWatcher.unref) mainClipboardWatcher.unref();
   } else if (!shouldWatch && mainClipboardWatcher) {
     clearInterval(mainClipboardWatcher);
     mainClipboardWatcher = null;
+    mainClipboardPollInFlight = false;
   }
 }
 
@@ -497,7 +524,8 @@ async function ensureInputBackend(options = {}) {
   const allowElevationPrompt = options.allowElevationPrompt !== false;
   if (isLinuxWaylandSession) {
     if (!LinuxWaylandInput) throw new Error('This Linux Wayland session needs the XDG desktop portal remote-desktop input backend. Update mswnlink and reinstall dependencies.');
-    if (!waylandInputManager) waylandInputManager = new LinuxWaylandInput();
+    if (!waylandInputManager) waylandInputManager = new LinuxWaylandInput({ screen });
+    if (waylandInputManager.isActive()) return true;
     const previousToken = waylandRestoreToken || await loadWaylandRestoreToken();
     // Portal restore tokens are one-use. Remove the old token before consuming it.
     waylandRestoreToken = '';
@@ -736,14 +764,18 @@ function bindConnection(socket, req) {
           activePeer = null;
           return;
         }
+        let backendReady = true;
         try { await ensureInputBackend({ allowElevationPrompt: false }); }
-        catch (error) { console.warn('[mswnlink] Unattended input backend warm-up warning:', error.message); }
+        catch (error) {
+          console.warn('[mswnlink] Unattended input backend warm-up warning:', error.message);
+          if (isLinuxWaylandSession) backendReady = Boolean(waylandInputManager && waylandInputManager.isActive());
+        }
         activeSocket = socket;
         updateSessionPowerSaveBlocker();
         socket.unattendedAccess = true;
-        inputAllowed = true;
-        sendSocket(activeSocket, { type: 'accepted', mode: 'control', hostName: os.hostname(), unattended: true });
-        sendToUI('peer-accepted', { peer: activePeer, mode: 'control', inputAvailable: true, unattended: true });
+        inputAllowed = backendReady;
+        sendSocket(activeSocket, { type: 'accepted', mode: inputAllowed ? 'control' : 'view', hostName: os.hostname(), unattended: true });
+        sendToUI('peer-accepted', { peer: activePeer, mode: inputAllowed ? 'control' : 'view', inputAvailable: hasInputBackend(), unattended: true });
       } else {
         pendingSocket = socket;
         sendToUI('incoming-connection', { name: activePeer.name, ip: remoteIp });
@@ -788,7 +820,16 @@ async function startHost() {
   if (!persistentAccessCode) throw new Error('Set a permanent access code on the Share this PC screen before starting to share.');
   // Also verify input readiness when Start Sharing is clicked a second time or
   // the setting was enabled while the listener was already running.
-  if (unattendedAccessEnabled) await ensureInputBackend();
+  if (unattendedAccessEnabled) {
+    await ensureInputBackend();
+  } else if (isLinuxWaylandSession) {
+    // On Fedora/GNOME Wayland, prompt for the RemoteDesktop portal session right when
+    // the owner clicks Start sharing so mouse/keyboard control is ready immediately
+    // when a client joins (without blocking view-only sharing if cancelled).
+    ensureInputBackend().catch((error) => {
+      console.warn('[mswnlink] Wayland remote-input pre-warm deferred until control approval:', error.message);
+    });
+  }
   if (wss) return { code: pairingCode, port: PORT, ips: getLanIPv4() };
   pairingCode = persistentAccessCode;
   const server = new WebSocketServer({ host: '0.0.0.0', port: PORT, maxPayload: MAX_SIGNAL_BYTES });
@@ -846,6 +887,107 @@ async function stopHost() {
   return { ok: true };
 }
 
+async function injectTextViaClipboardFallback(text, triggerPasteShortcut) {
+  const safeText = normalizeClipboardText(text, 256);
+  if (!safeText) return { ok: true };
+  clipboardFallbackBusy = true;
+  let previousClipboard = '';
+  try {
+    previousClipboard = await readOsClipboardText();
+  } catch {}
+  try {
+    await writeOsClipboardText(safeText);
+    await new Promise(resolve => setTimeout(resolve, 18));
+    await triggerPasteShortcut();
+    await new Promise(resolve => setTimeout(resolve, 45));
+    return { ok: true };
+  } finally {
+    try {
+      await writeOsClipboardText(previousClipboard);
+      lastObservedMainClipboard = previousClipboard;
+    } catch {}
+    clipboardFallbackBusy = false;
+  }
+}
+
+function tryXdotoolType(text) {
+  return new Promise((resolve) => {
+    execFile('xdotool', ['type', '--clearmodifiers', '--delay', '0', '--', text], { timeout: 2500 }, (err) => {
+      resolve(!err);
+    });
+  });
+}
+
+async function injectUnicodeTextOnDesktop(rawText) {
+  const text = String(rawText || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 64);
+  if (!text) return { ok: true };
+
+  if (isLinuxWaylandSession) {
+    if (!waylandInputManager || !waylandInputManager.isActive()) {
+      throw new Error('Wayland remote input is not active. Approve the Fedora/GNOME remote interaction prompt.');
+    }
+    const res = await waylandInputManager.inject({ kind: 'text', text });
+    if (res && res.fallbackPaste && res.remainingText) {
+      return injectTextViaClipboardFallback(
+        res.remainingText,
+        () => waylandInputManager.inject({ kind: 'shortcut', action: 'paste' })
+      );
+    }
+    return res || { ok: true };
+  }
+
+  if (process.platform === 'win32' && WindowsInputBackend) {
+    if (!win32InputManager || !win32InputManager.isActive()) {
+      await ensureInputBackend({ allowElevationPrompt: false }).catch(() => {});
+    }
+    if (win32InputManager && win32InputManager.isActive()) {
+      return win32InputManager.inject({ kind: 'text', text });
+    }
+  }
+
+  if (!robot) throw new Error('Native input backend is unavailable.');
+
+  if (process.platform === 'darwin') {
+    // On macOS, RobotJS typeString uses CGEventKeyboardSetUnicodeString (full UTF-16,
+    // layout-independent — works for "'", '"', and Greek words like "έχω").
+    if (typeof robot.typeString === 'function') {
+      robot.typeString(text);
+      return { ok: true };
+    }
+    return injectTextViaClipboardFallback(text, () => {
+      const desc = shortcutDescriptorForPlatform('paste', 'darwin');
+      robot.keyTap(desc.key, desc.modifiers);
+    });
+  }
+
+  if (process.platform === 'linux') {
+    // RobotJS X11 unicodeTap truncates code points > 0x7F to 8-bit `char`.
+    // Printable ASCII (including "'" and '"') works cleanly via XSpecialCharacterTable;
+    // non-ASCII Unicode (such as Greek "έχω") uses xdotool or lossless clipboard paste.
+    if (/^[\x20-\x7e]+$/.test(text) && typeof robot.typeString === 'function') {
+      robot.typeString(text);
+      return { ok: true };
+    }
+    if (await tryXdotoolType(text)) {
+      return { ok: true };
+    }
+    return injectTextViaClipboardFallback(text, () => {
+      const desc = shortcutDescriptorForPlatform('paste', 'linux');
+      robot.keyTap(desc.key, desc.modifiers);
+    });
+  }
+
+  // Windows RobotJS fallback (when PowerShell worker is unavailable)
+  if (typeof robot.typeString === 'function' && /^[\x20-\x7e]+$/.test(text)) {
+    robot.typeString(text);
+    return { ok: true };
+  }
+  return injectTextViaClipboardFallback(text, () => {
+    const desc = shortcutDescriptorForPlatform('paste', process.platform);
+    robot.keyTap(desc.key, desc.modifiers);
+  });
+}
+
 async function injectInput(event) {
   if (!event || typeof event !== 'object') return { ok: false, reason: 'Invalid input event.' };
   // Release events are always honored, including after a focus loss or control
@@ -855,9 +997,24 @@ async function injectInput(event) {
     return { ok: false, reason: 'Control is not enabled.' };
   }
   try {
+    if (event.kind === 'text') {
+      return await injectUnicodeTextOnDesktop(event.text);
+    }
     if (isLinuxWaylandSession) {
-      if (!waylandInputManager) throw new Error('Wayland remote input is not active. Start sharing again and approve the desktop permission prompt.');
-      return await waylandInputManager.inject(event);
+      if (!waylandInputManager || !waylandInputManager.isActive()) {
+        await ensureInputBackend({ allowElevationPrompt: false }).catch(() => {});
+      }
+      if (!waylandInputManager || !waylandInputManager.isActive()) {
+        throw new Error('Wayland remote input is not active. Click Allow control on the host and approve the desktop permission prompt.');
+      }
+      const res = await waylandInputManager.inject(event);
+      if (res && res.fallbackPaste && res.remainingText) {
+        return await injectTextViaClipboardFallback(
+          res.remainingText,
+          () => waylandInputManager.inject({ kind: 'shortcut', action: 'paste' })
+        );
+      }
+      return res;
     }
     if (process.platform === 'win32' && WindowsInputBackend) {
       if (!win32InputManager || !win32InputManager.isActive()) {
@@ -872,9 +1029,6 @@ async function injectInput(event) {
       const x = Math.max(0, Math.min(1, Number(event.x)));
       const y = Math.max(0, Math.min(1, Number(event.y)));
       if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false };
-      // In all-displays mode the renderer sends a trusted local displayId and
-      // coordinates normalized inside that monitor. Use Electron's desktop
-      // geometry so clicks land on the selected monitor rather than the primary.
       const targetDisplay = typeof event.displayId === 'string' && event.displayId
         ? screen.getAllDisplays().find(item => String(item.id) === event.displayId)
         : null;
@@ -901,12 +1055,9 @@ async function injectInput(event) {
       if (!desc) return { ok: false, reason: 'Unsupported shortcut.' };
       robot.keyTap(desc.key, desc.modifiers);
     } else if (event.kind === 'key') {
-      if (process.platform === 'win32' && event.textInput === true) {
+      if (event.textInput === true) {
         if (event.action === 'down') {
-          const character = String(event.key || '');
-          if (!/^[\x20-\x7e]$/.test(character)) return { ok: false, reason: 'Unsupported printable character.' };
-          if (typeof robot.typeString !== 'function') throw new Error('This Windows input backend does not support character injection. Rebuild the native RobotJS backend.');
-          robot.typeString(character);
+          return await injectUnicodeTextOnDesktop(event.key);
         }
         return { ok: true };
       }
@@ -927,9 +1078,10 @@ async function injectInput(event) {
     }
     return { ok: true };
   } catch (error) {
-    // If an OS rejects an event (e.g. focus/integrity changes on Windows),
-    // reset every held key/button so the pointer can recover on the next input.
-    clearNativeInput();
+    // Reset held keys/buttons when an OS focus/permission transition interrupts active input.
+    if (event.kind !== 'move' || heldButtons.size > 0 || heldKeys.size > 0) {
+      clearNativeInput();
+    }
     console.warn('[mswnlink] Could not inject input:', error.message);
     return { ok: false, reason: error.message };
   }
@@ -1140,10 +1292,7 @@ app.whenReady().then(async () => {
       platform: process.platform,
       osRelease: os.release(),
       darwinMajor: parseDarwinMajor(os.release()),
-      waylandSession: process.platform === 'linux' && (
-        String(process.env.XDG_SESSION_TYPE || '').toLowerCase() === 'wayland' ||
-        Boolean(process.env.WAYLAND_DISPLAY)
-      ),
+      waylandSession: isLinuxWaylandSession,
       ips: getLanIPv4(),
       inputAvailable: hasInputBackend(),
       inputBackend: isLinuxWaylandSession
@@ -1306,18 +1455,26 @@ app.whenReady().then(async () => {
     updateSessionPowerSaveBlocker();
     return { ok: true };
   });
-  ipcMain.handle('read-local-clipboard', () => {
+  ipcMain.handle('read-local-clipboard', async () => {
     if (!localFeaturePreferences.clipboard) return { ok: false, error: 'Enable clipboard sharing on this device first.' };
-    const text = String(clipboard.readText() || '').slice(0, MAX_CLIPBOARD_CHARS);
-    lastObservedMainClipboard = text;
-    return { ok: true, text };
+    try {
+      const text = await readOsClipboardText();
+      lastObservedMainClipboard = text;
+      return { ok: true, text };
+    } catch (error) {
+      return { ok: false, error: error && error.message ? error.message : 'Could not read the local clipboard.' };
+    }
   });
-  ipcMain.handle('write-local-clipboard', (_event, value) => {
+  ipcMain.handle('write-local-clipboard', async (_event, value) => {
     if (!localFeaturePreferences.clipboard) return { ok: false, error: 'Clipboard sharing is disabled on this device.' };
-    if (typeof value !== 'string' || value.length > MAX_CLIPBOARD_CHARS) return { ok: false, error: 'Clipboard text is too large.' };
-    lastObservedMainClipboard = value;
-    clipboard.writeText(value);
-    return { ok: true };
+    if (typeof value !== 'string' || value.length > MAX_CLIPBOARD_CHARS) return { ok: false, error: 'Clipboard text is invalid or too large.' };
+    try {
+      lastObservedMainClipboard = value;
+      await writeOsClipboardText(value);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: error && error.message ? error.message : 'Could not update the local clipboard.' };
+    }
   });
   ipcMain.handle('pick-file-to-send', async () => {
     if (!hasActiveSession()) return { ok: false, error: 'Connect to a device before sending a file.' };

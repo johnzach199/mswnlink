@@ -8,9 +8,10 @@ const path = require('node:path');
 // so the Linux compatibility flag must be passed here, on the command line.
 const electronExecutable = require('electron');
 const isLinux = process.platform === 'linux';
+const sessionType = String(process.env.XDG_SESSION_TYPE || '').trim().toLowerCase();
 const isWaylandSession = isLinux && (
-  String(process.env.XDG_SESSION_TYPE || '').toLowerCase() === 'wayland' ||
-  Boolean(process.env.WAYLAND_DISPLAY)
+  sessionType === 'wayland' ||
+  (sessionType !== 'x11' && Boolean(process.env.WAYLAND_DISPLAY))
 );
 // Electron/Chromium's native Wayland + Vulkan path currently emits a persistent
 // incompatibility error on some Linux graphics stacks even when Vulkan feature
@@ -23,18 +24,19 @@ const args = [];
 if (isWaylandSession && forceNativeWayland) {
   args.push(
     '--ozone-platform=wayland',
+    '--enable-features=WebRTCPipeWireCapturer',
     '--disable-features=DefaultANGLEVulkan,VulkanFromANGLE',
     '--use-gl=angle',
     '--use-angle=gl'
   );
   console.warn('[mswnlink] Experimental native Wayland enabled. Chromium may still print a Vulkan compatibility error on some drivers.');
 } else if (isWaylandSession) {
-  args.push('--ozone-platform=x11');
+  args.push('--ozone-platform=x11', '--enable-features=WebRTCPipeWireCapturer');
   if (legacyNativeRequest) {
     console.warn('[mswnlink] MSWNLINK_USE_WAYLAND=1 previously enabled native Wayland, which triggers a Vulkan compatibility error on this setup. Falling back to XWayland.');
     console.warn('[mswnlink] Use MSWNLINK_FORCE_NATIVE_WAYLAND=1 only to experiment with native Wayland.');
   } else {
-    console.log('[mswnlink] Wayland detected; using XWayland to avoid the native Wayland/Vulkan incompatibility.');
+    console.log('[mswnlink] Wayland detected; using XWayland + WebRTCPipeWireCapturer to avoid the native Wayland/Vulkan incompatibility.');
   }
 }
 

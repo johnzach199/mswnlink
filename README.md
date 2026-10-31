@@ -38,15 +38,17 @@ Builds are signed ad hoc inside-out (preserving Electron GPU/Renderer helper ent
 
 Windows blocks standard-user apps from moving or clicking the mouse when an elevated window such as **Task Manager** is in the foreground (UIPI). When remote control is enabled on a Windows host, mswnlink starts a lightweight native Win32 `SendInput` helper and asks once for UAC approval so you can click, drag, and type inside Task Manager and admin tools smoothly. If UAC is declined, mswnlink automatically falls back to standard-user mode with a UIPI foreground-escape guard so the mouse never gets stuck on Task Manager.
 
-## Copy and paste between computers
+## Copy, paste, and international keyboards
 
-Live clipboard sharing is enabled by default on both sides. Copy on either computer and press `Ctrl+V` (or `Cmd+V` on a Mac) in the remote window—mswnlink synchronizes the clipboard before injecting the host's native paste shortcut (`Ctrl+V` on Windows/Linux, `Cmd+V` on macOS), and also provides **Send clipboard** / **Get clipboard** buttons in the session bar.
+Live clipboard sharing is enabled by default on both sides (using async Electron 45 clipboard synchronization so promises/objects never leak). Copy on either computer and press `Ctrl+V` (or `Cmd+V` on a Mac) in the remote window—mswnlink synchronizes the clipboard before injecting the host's native paste shortcut (`Ctrl+V` on Windows/Linux, `Cmd+V` on macOS), and also provides **Send clipboard** / **Get clipboard** buttons in the session bar.
+
+Dead-key accents, apostrophes/quotes (`'`, `"`), and non-Latin scripts such as Greek (`έχω`) compose natively in the viewer and are injected via Unicode/XKB keysyms on the host regardless of whether the host and viewer currently have the same keyboard layout selected.
 
 ## Fedora and other Linux desktops
 
 If the AppImage does not start: `sudo dnf install fuse fuse-libs`.
 
-On Wayland (the Fedora default) programs cannot fake input directly, so mswnlink asks the desktop's *RemoteDesktop portal*. Make sure the portal backend for your desktop is installed (`xdg-desktop-portal-gnome` or `xdg-desktop-portal-kde`). When sharing starts, your desktop asks you to allow mouse and keyboard control; choose the same monitor you are sharing. Desktops that support it remember the approval. That prompt is an operating-system rule and cannot be skipped, even with *Connect without asking*.
+On Wayland (the Fedora default) programs cannot fake input directly, so mswnlink uses XWayland + `WebRTCPipeWireCapturer` for capture and asks the desktop's *RemoteDesktop portal* (`xdg-desktop-portal-gnome` or `xdg-desktop-portal-kde`) for mouse and keyboard control, with HiDPI logical scaling, PipeWire stream keepalive, and automatic relative-pointer fallback. When sharing starts, turn on **Allow remote interaction** and choose the monitor you are sharing. Desktops that support persistence remember the approval.
 
 If capture is black, check that PipeWire and `xdg-desktop-portal` are running. `MSWNLINK_FORCE_NATIVE_WAYLAND=1` tries native Wayland; `MSWNLINK_DISABLE_GPU=1` forces software rendering.
 

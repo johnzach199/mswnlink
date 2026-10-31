@@ -93,6 +93,9 @@ test('macOS Sequoia ScreenCaptureKit permission evaluation', () => {
   assert.equal(denied.canResetStaleTcc, true);
 });
 
+const EventEmitter = require('node:events');
+const LinuxWaylandInput = require('../linux-wayland-input');
+
 test('Windows SendInput worker C# source, verification script, and macOS plist files are valid', () => {
   const extracted = verifyWin32Worker.extractWorkerCSharp();
   assert.match(extracted, /public static class MswnlinkWin32Worker/);
@@ -112,4 +115,163 @@ test('Windows SendInput worker C# source, verification script, and macOS plist f
   );
   assert.match(mainPlist, /com\.apple\.security\.cs\.allow-unsigned-executable-memory/);
   assert.match(inheritPlist, /com\.apple\.security\.cs\.allow-unsigned-executable-memory/);
+});
+
+test('normalizeClipboardText blocks Electron 45 Promise / object coercion ("[object]") while preserving Greek & quotes', () => {
+  const fakePromise = Promise.resolve('copied');
+  assert.equal(inputProtocol.normalizeClipboardText(fakePromise), '');
+  assert.equal(inputProtocol.normalizeClipboardText({ then: () => {} }), '');
+  assert.equal(inputProtocol.normalizeClipboardText({ arbitrary: true }), '');
+  assert.equal(inputProtocol.normalizeClipboardText({ text: "έχω 'mswnlink'" }), "έχω 'mswnlink'");
+  assert.equal(inputProtocol.normalizeClipboardText("έχω '3.3'"), "έχω '3.3'");
+});
+
+test('unicodeToXkbKeysym maps apostrophe, quotes, and official X.Org Greek keysyms ("έχω")', () => {
+  assert.equal(inputProtocol.unicodeToXkbKeysym("'"), 0x0027);
+  assert.equal(inputProtocol.unicodeToXkbKeysym('"'), 0x0022);
+  assert.equal(inputProtocol.unicodeToXkbKeysym('έ'), 0x07b2);
+  assert.equal(inputProtocol.unicodeToXkbKeysym('χ'), 0x07f7);
+  assert.equal(inputProtocol.unicodeToXkbKeysym('ω'), 0x07f9);
+  assert.equal(inputProtocol.unicodeToXkbKeysym('Σ'), 0x07d2);
+  assert.equal(inputProtocol.unicodeToXkbKeysym('ς'), 0x07f3);
+  assert.equal(inputProtocol.unicodeToXkbKeysym('σ'), 0x07f2);
+  assert.equal(inputProtocol.unicodeToXkbKeysym('€'), 0x20ac);
+});
+
+test('isLinuxWaylandEnv detects Fedora Wayland even when AppImage inherits XDG_SESSION_TYPE=tty', () => {
+  assert.equal(
+    inputProtocol.isLinuxWaylandEnv({ XDG_SESSION_TYPE: 'tty', WAYLAND_DISPLAY: 'wayland-0' }, 'linux'),
+    true
+  );
+  assert.equal(
+    inputProtocol.isLinuxWaylandEnv({ XDG_SESSION_TYPE: 'wayland' }, 'linux'),
+    true
+  );
+  assert.equal(
+    inputProtocol.isLinuxWaylandEnv({ XDG_SESSION_TYPE: 'x11', WAYLAND_DISPLAY: 'wayland-0' }, 'linux'),
+    false
+  );
+  assert.equal(
+    inputProtocol.isLinuxWaylandEnv({ WAYLAND_DISPLAY: 'wayland-0' }, 'win32'),
+    false
+  );
+});
+
+test('LinuxWaylandInput handles dbus-broker unique sender signals, HiDPI scaling, relative pointer fallback, and Greek keysyms', async () => {
+  const matchRules = [];
+  const keysymCalls = [];
+  const relMotionCalls = [];
+  let failAbsoluteMotion = true;
+
+  class MockVariant {
+    constructor(signature, value) {
+      this.signature = signature;
+      this.value = value;
+    }
+  }
+  class MockMessage {
+    constructor(opts) {
+      Object.assign(this, opts);
+    }
+  }
+
+  const bus = new EventEmitter();
+  bus.name = ':1.99';
+  bus.call = async (msg) => {
+    if (msg.member === 'AddMatch') matchRules.push(msg.body[0]);
+    return null;
+  };
+  bus.disconnect = () => {};
+
+  const emitPortalResponse = (tokenVariant, results) => {
+    const reqPath = `/org/freedesktop/portal/desktop/request/1_99/${tokenVariant.value}`;
+    setImmediate(() => {
+      // Simulate Fedora dbus-broker emitting from unique sender ':1.42'
+      bus.emit('message', {
+        sender: ':1.42',
+        path: reqPath,
+        interface: 'org.freedesktop.portal.Request',
+        member: 'Response',
+        body: [0, results]
+      });
+    });
+    return reqPath;
+  };
+
+  const remoteIface = {
+    CreateSession: async (opts) =>
+      emitPortalResponse(opts.handle_token, {
+        session_handle: new MockVariant('s', '/org/freedesktop/portal/desktop/session/1_99/s1')
+      }),
+    SelectDevices: async (_session, opts) => emitPortalResponse(opts.handle_token, {}),
+    Start: async (_session, _parent, opts) =>
+      emitPortalResponse(opts.handle_token, {
+        devices: new MockVariant('u', 3),
+        restore_token: new MockVariant('s', 'tok-fedora-41'),
+        // Simulate 4K physical PipeWire size on 200% HiDPI Fedora display (logical 1920x1080)
+        streams: new MockVariant('a(ua{sv})', [[77, { size: new MockVariant('(ii)', [3840, 2160]) }]])
+      }),
+    NotifyPointerMotionAbsolute: async () => {
+      if (failAbsoluteMotion) throw new Error('Dropping early absolute pointer motion');
+    },
+    NotifyPointerMotion: async (_s, _o, dx, dy) => {
+      relMotionCalls.push([dx, dy]);
+    },
+    NotifyKeyboardKeysym: async (_s, _o, sym, state) => {
+      keysymCalls.push([sym, state]);
+    },
+    NotifyKeyboardKeycode: async () => {},
+    NotifyPointerButton: async () => {}
+  };
+
+  const screenCastIface = {
+    SelectSources: async (_s, opts) => emitPortalResponse(opts.handle_token, {}),
+    OpenPipeWireRemote: async () => {
+      throw new Error('no gstreamer in unit test');
+    }
+  };
+
+  bus.getProxyObject = async () => ({
+    getInterface: (name) => {
+      if (name === 'org.freedesktop.portal.RemoteDesktop') return remoteIface;
+      if (name === 'org.freedesktop.portal.ScreenCast') return screenCastIface;
+      return { Close: async () => {} };
+    }
+  });
+
+  const wayland = new LinuxWaylandInput({
+    dbusModule: {
+      Variant: MockVariant,
+      Message: MockMessage,
+      sessionBus: () => bus
+    },
+    screen: {
+      getPrimaryDisplay: () => ({
+        scaleFactor: 2,
+        bounds: { x: 0, y: 0, width: 1920, height: 1080 }
+      })
+    }
+  });
+
+  const started = await wayland.start('');
+  assert.equal(started.restoreToken, 'tok-fedora-41');
+  // Verify no sender='org.freedesktop.portal.Desktop' filter was used
+  assert.ok(matchRules.every((r) => !r.includes("sender='org.freedesktop.portal.Desktop'")));
+  // Verify HiDPI logical resolution (1920x1080, not 3840x2160)
+  assert.equal(wayland.streamWidth, 1920);
+  assert.equal(wayland.streamHeight, 1080);
+
+  // Absolute motion throws -> seamlessly anchors to (0,0) and moves relatively to (960, 540)
+  const moveRes = await wayland.inject({ kind: 'move', x: 0.5, y: 0.5 });
+  assert.equal(moveRes.ok, true);
+  assert.equal(relMotionCalls.length, 2);
+  assert.deepEqual(relMotionCalls[1], [960, 540]);
+
+  // Inject Greek "έχω" + space + "'" via NotifyKeyboardKeysym
+  const textRes = await wayland.inject({ kind: 'text', text: "έχω '" });
+  assert.equal(textRes.ok, true);
+  const pressedSyms = keysymCalls.filter(([, st]) => st === 1).map(([sym]) => sym);
+  assert.deepEqual(pressedSyms, [0x07b2, 0x07f7, 0x07f9, 0x0020, 0x0027]);
+
+  await wayland.close();
 });

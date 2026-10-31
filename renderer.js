@@ -362,11 +362,19 @@ async function setLocalFeaturePreference(feature, enabled) {
   showToast(`${feature === 'clipboard' ? (enabled ? 'Live clipboard sync' : 'Clipboard sync') : feature === 'fileTransfer' ? 'File transfers' : 'Monitor switching'} ${enabled ? 'enabled' : 'disabled'} on this device.`);
 }
 
+function extractClipboardString(value) {
+  if (typeof value === 'string') return value.slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+  if (value && typeof value === 'object' && typeof value.then !== 'function' && typeof value.text === 'string') {
+    return value.text.slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+  }
+  return '';
+}
+
 async function primeClipboardBaseline(channel) {
   if (!channel || channel.readyState !== 'open' || !localFeaturePreferences.clipboard || !remoteFeaturePreferences.clipboard) return;
   try {
     const result = await window.lanAPI.readLocalClipboard();
-    if (result && result.ok) clipboardBaselineByChannel.set(channel, String(result.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS));
+    if (result && result.ok) clipboardBaselineByChannel.set(channel, extractClipboardString(result.text));
   } catch (error) { console.debug('[mswnlink] Could not prime clipboard sync:', error.message || error); }
 }
 
@@ -406,10 +414,11 @@ function clearClipboardFragments(channel) {
 
 async function applyAutomaticClipboardText(channel, value) {
   if (!localFeaturePreferences.clipboard || !remoteFeaturePreferences.clipboard) return false;
-  const text = String(value || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+  if (typeof value !== 'string') return false;
+  const text = extractClipboardString(value);
   clipboardBaselineByChannel.set(channel, text);
   const existing = await window.lanAPI.readLocalClipboard();
-  if (existing && existing.ok && String(existing.text || '') === text) return true;
+  if (existing && existing.ok && extractClipboardString(existing.text) === text) return true;
   const result = await window.lanAPI.writeLocalClipboard(text);
   if (!result || !result.ok) {
     showToast(result && result.error ? result.error : 'Could not sync clipboard text.');
@@ -425,10 +434,10 @@ async function pushLocalClipboardImmediately(explicitText = null) {
   let text = explicitText;
   if (typeof text !== 'string') {
     const result = await window.lanAPI.readLocalClipboard();
-    if (!result || !result.ok) return;
-    text = String(result.text || '');
+    if (!result || !result.ok || typeof result.text !== 'string') return;
+    text = result.text;
   }
-  text = text.slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+  text = extractClipboardString(text);
   for (const channel of channels) {
     if (channel.bufferedAmount > 512 * 1024) continue;
     if (clipboardBaselineByChannel.get(channel) === text) continue;
@@ -456,8 +465,8 @@ async function clipboardSyncTick() {
     for (const channel of channels) {
       if (channel.bufferedAmount > 512 * 1024) continue;
       const result = await window.lanAPI.readLocalClipboard();
-      if (!result || !result.ok) continue;
-      const text = String(result.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+      if (!result || !result.ok || typeof result.text !== 'string') continue;
+      const text = extractClipboardString(result.text);
       if (!clipboardBaselineByChannel.has(channel)) {
         clipboardBaselineByChannel.set(channel, text);
         continue;
@@ -506,7 +515,7 @@ async function sendLocalClipboard(channel) {
   const result = await window.lanAPI.readLocalClipboard();
   if (!result || !result.ok) throw new Error(result && result.error ? result.error : 'Could not read the local clipboard.');
   const id = crypto.randomUUID();
-  const textToSend = String(result.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+  const textToSend = extractClipboardString(result.text);
   setPendingClipboard(id, 'send', channel);
   if (!sendChannelMessage(channel, { kind: 'clipboard-set', id, text: textToSend })) {
     const pending = pendingClipboardRequests.get(id); if (pending) clearTimeout(pending.timer);
@@ -659,7 +668,7 @@ async function handleSessionDataMessage(side, channel, data) {
     if (side === 'client' && localFeaturePreferences.clipboard && remoteFeaturePreferences.clipboard) {
       try {
         const initial = await window.lanAPI.readLocalClipboard();
-        const text = initial && initial.ok ? String(initial.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS) : '';
+        const text = initial && initial.ok ? extractClipboardString(initial.text) : '';
         if (text) {
           await sendAutomaticClipboard(channel, text);
           clipboardBaselineByChannel.set(channel, text);
@@ -670,8 +679,11 @@ async function handleSessionDataMessage(side, channel, data) {
   }
   if (data.kind === 'clipboard-paste-shortcut' && side === 'host') {
     if (localFeaturePreferences.clipboard && remoteFeaturePreferences.clipboard && typeof data.text === 'string' && data.text.length <= CLIPBOARD_SYNC_MAX_CHARS) {
-      clipboardBaselineByChannel.set(channel, data.text);
-      await window.lanAPI.writeLocalClipboard(data.text);
+      const safeText = extractClipboardString(data.text);
+      clipboardBaselineByChannel.set(channel, safeText);
+      await window.lanAPI.writeLocalClipboard(safeText);
+      // Give Wayland/X11/macOS/Windows clipboard selection ownership a brief tick to settle before Ctrl+V/Cmd+V.
+      await new Promise(resolve => setTimeout(resolve, 20));
     }
     if (typeof hostEnqueueInput === 'function') {
       hostEnqueueInput({ kind: 'shortcut', action: 'paste' });
@@ -679,7 +691,9 @@ async function handleSessionDataMessage(side, channel, data) {
     return true;
   }
   if (data.kind === 'clipboard-auto') {
-    await applyAutomaticClipboardText(channel, String(data.text || ''));
+    if (typeof data.text === 'string') {
+      await applyAutomaticClipboardText(channel, data.text);
+    }
     return true;
   }
   if (data.kind === 'clipboard-auto-start') {
@@ -763,7 +777,11 @@ async function handleSessionDataMessage(side, channel, data) {
       sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: false, reason: 'Clipboard sharing is disabled on the receiving device.' });
       return true;
     }
-    const incomingText = String(data.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+    if (typeof data.text !== 'string') {
+      sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: false, reason: 'Invalid clipboard text payload.' });
+      return true;
+    }
+    const incomingText = extractClipboardString(data.text);
     clipboardBaselineByChannel.set(channel, incomingText);
     const result = await window.lanAPI.writeLocalClipboard(incomingText);
     sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: Boolean(result && result.ok), reason: result && result.error ? result.error : '' });
@@ -776,7 +794,7 @@ async function handleSessionDataMessage(side, channel, data) {
     }
     const result = await window.lanAPI.readLocalClipboard();
     if (!result || !result.ok) sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: false, reason: result && result.error ? result.error : 'Could not read clipboard.' });
-    else sendChannelMessage(channel, { kind: 'clipboard-value', id: data.id, text: String(result.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS) });
+    else sendChannelMessage(channel, { kind: 'clipboard-value', id: data.id, text: extractClipboardString(result.text) });
     return true;
   }
   if (data.kind === 'clipboard-value') {
@@ -784,7 +802,8 @@ async function handleSessionDataMessage(side, channel, data) {
     if (!pending || pending.mode !== 'get') return true;
     clearTimeout(pending.timer); pendingClipboardRequests.delete(String(data.id));
     if (!localFeaturePreferences.clipboard) { showToast('Enable Allow clipboard to receive clipboard text.'); return true; }
-    const receivedText = String(data.text || '').slice(0, CLIPBOARD_SYNC_MAX_CHARS);
+    if (typeof data.text !== 'string') return true;
+    const receivedText = extractClipboardString(data.text);
     clipboardBaselineByChannel.set(channel, receivedText);
     const result = await window.lanAPI.writeLocalClipboard(receivedText);
     if (!result || !result.ok) showToast(result && result.error ? result.error : 'Could not update the local clipboard.');
@@ -1560,7 +1579,7 @@ async function createHostPeer() {
       let data;
       try { data = JSON.parse(messageEvent.data); } catch { return; }
       if (!data || typeof data !== 'object') return;
-      const validKinds = new Set(['move', 'mouse', 'wheel', 'key', 'shortcut', 'releaseAll']);
+      const validKinds = new Set(['move', 'mouse', 'wheel', 'key', 'text', 'shortcut', 'releaseAll']);
       if (!validKinds.has(data.kind)) {
         handleSessionDataMessage('host', channel, data).catch(error => {
           console.warn('[mswnlink] Session feature message failed:', error.message || error);
@@ -1799,8 +1818,7 @@ async function startClientPeer() {
     primeClipboardBaseline(channel).catch(() => {});
     updateSessionFeatureUI();
     if (controlGranted && clientConnected) {
-      try { $('#remote-video').focus({ preventScroll: true }); }
-      catch { try { $('#remote-video').focus(); } catch {} }
+      focusRemoteViewerInput();
     }
     if (controlGranted) showToast('Remote desktop ready. Click the screen to send input.');
   };
@@ -1839,9 +1857,8 @@ async function startClientPeer() {
     }
     video.muted = true;
     video.play().catch(() => {});
-    // Focus the remote view when the live screen first arrives. Keyboard
-    // forwarding intentionally only works while the viewer owns focus.
-    try { video.focus({ preventScroll: true }); } catch { try { video.focus(); } catch {} }
+    // Focus the remote input capture surface when the live screen first arrives.
+    focusRemoteViewerInput();
     $('#viewer-placeholder').hidden = true;
     setSessionState('Connected', 'active');
     $('#viewer-resolution').textContent = 'Live stream';
@@ -1962,6 +1979,7 @@ async function handleClientMessage(message) {
   if (message.type === 'control-mode') {
     controlGranted = Boolean(message.allowed);
     if (!controlGranted) sendInput({ kind: 'releaseAll' });
+    else focusRemoteViewerInput();
     updateClientControlUI();
     showToast(controlGranted ? 'The host enabled mouse and keyboard control.' : 'The host switched this session to view-only.');
     return;
@@ -2079,7 +2097,16 @@ async function connectToDevice(event) {
         clientPairKey = challengeResponse.key;
         if (clientSocket !== socket || socket.readyState !== WebSocket.OPEN) return;
         socket.send(JSON.stringify({ type: 'join', proof: challengeResponse.proof, name: deviceInfo.name }));
-        setConnectBusy(true, 'Authenticating…');
+        setConnectBusy(true, 'Waiting for host approval…');
+        // Once the host responded with a challenge, allow up to 60s for the host user
+        // to click "Allow control" and approve any OS portal / UAC permission dialog.
+        clearConnectTimer();
+        connectTimeout = setTimeout(() => {
+          if (!requestAccepted && clientSocket === socket) {
+            showConnectError('The host did not finish approving the connection in time. Ask them to approve the prompt on their screen and try again.');
+            cleanupClient(false);
+          }
+        }, 60000);
         showToast('Passcode proof sent securely. Waiting for the host policy.');
         return;
       }
@@ -2158,12 +2185,39 @@ function handlePointerMove(event) {
   if (point) sendInput({ kind: 'move', ...point });
 }
 
+const REMOTE_CAPTURE_ID = 'remote-input-capture';
+const NON_PRINTABLE_KEY_NAMES = new Set([
+  'Backspace', 'Tab', 'Enter', 'Escape', 'Delete', 'Insert',
+  'Home', 'End', 'PageUp', 'PageDown',
+  'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown',
+  'CapsLock', 'NumLock', 'ScrollLock', 'Pause', 'PrintScreen', 'ContextMenu',
+  'Shift', 'Control', 'Alt', 'Meta', 'AltGraph', 'OS', 'Super', 'Hyper', 'Fn', 'FnLock', 'Symbol'
+]);
+const sentRawKeyCodes = new Set();
+let remoteComposing = false;
+let remoteDeadKeyPending = false;
+
+function focusRemoteViewerInput() {
+  const capture = document.getElementById(REMOTE_CAPTURE_ID);
+  if (capture) {
+    try { capture.focus({ preventScroll: true }); return; }
+    catch { try { capture.focus(); return; } catch {} }
+  }
+  const video = $('#remote-video');
+  if (video) {
+    try { video.focus({ preventScroll: true }); }
+    catch { try { video.focus(); } catch {} }
+  }
+}
+
 function isEditableLocalElement(target) {
   if (!target) return false;
-  return Boolean(
-    target.isContentEditable ||
-    (target.closest && target.closest('input, textarea, select, [contenteditable="true"]'))
-  );
+  if (target.id === REMOTE_CAPTURE_ID) return false;
+  const matched = target.closest
+    ? target.closest('input, textarea, select, [contenteditable="true"]')
+    : null;
+  if (matched && matched.id === REMOTE_CAPTURE_ID) return false;
+  return Boolean(target.isContentEditable || matched);
 }
 
 function detectViewerShortcut(event) {
@@ -2193,16 +2247,34 @@ async function triggerRemoteEditShortcut(action, explicitPasteText = null) {
       let text = explicitPasteText;
       if (typeof text !== 'string') {
         const local = await window.lanAPI.readLocalClipboard();
-        if (local && local.ok) text = String(local.text || '');
+        if (local && local.ok) text = extractClipboardString(local.text);
       }
       if (typeof text === 'string' && text.length <= CLIPBOARD_SYNC_MAX_CHARS) {
-        clipboardBaselineByChannel.set(clientChannel, text);
-        return sendChannelMessage(clientChannel, { kind: 'clipboard-paste-shortcut', text });
+        const cleanText = extractClipboardString(text);
+        clipboardBaselineByChannel.set(clientChannel, cleanText);
+        return sendChannelMessage(clientChannel, { kind: 'clipboard-paste-shortcut', text: cleanText });
       }
     }
     return sendInput({ kind: 'shortcut', action: 'paste' });
   }
   return sendInput({ kind: 'shortcut', action });
+}
+
+function flushCapturedRemoteText(rawText) {
+  const cleaned = String(rawText || '').replace(/[\r\n\u0000-\u001f\u007f]/g, '');
+  if (!cleaned) return;
+  if (!clientConnected || !controlGranted || !pages.session.classList.contains('page-active')) return;
+  sendInput({ kind: 'text', text: cleaned });
+}
+
+function isSpecialOrNavigationKey(event) {
+  const code = String(event.code || '');
+  const key = String(event.key || '');
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code) || /^F([1-9]|1[0-9]|2[0-4])$/.test(key)) return true;
+  if (/^(Shift|Control|Alt|Meta)(Left|Right)?$/.test(code)) return true;
+  if (code === 'NumpadEnter') return true;
+  if (NON_PRINTABLE_KEY_NAMES.has(key) || NON_PRINTABLE_KEY_NAMES.has(code)) return true;
+  return false;
 }
 
 function handleRemoteKey(event, action) {
@@ -2214,8 +2286,31 @@ function handleRemoteKey(event, action) {
   if (event.key === 'Escape' || event.code === 'Escape') return;
   if ((event.altKey && event.code === 'Tab') || (event.ctrlKey && event.altKey && event.code === 'Delete')) return;
 
+  const code = String(event.code || '');
+  const key = String(event.key || '');
+
+  // Always deliver matching keyup for any key whose keydown was sent as a raw VK/evdev event.
+  if (action === 'up' && code && sentRawKeyCodes.has(code)) {
+    sentRawKeyCodes.delete(code);
+    event.preventDefault();
+    sendInput({
+      kind: 'key',
+      action: 'up',
+      code,
+      key,
+      textInput: false,
+      shiftKey: Boolean(event.shiftKey),
+      ctrlKey: Boolean(event.ctrlKey),
+      altKey: Boolean(event.altKey),
+      metaKey: Boolean(event.metaKey),
+      location: Number(event.location) || 0
+    });
+    return;
+  }
+
   const remoteShortcut = detectViewerShortcut(event);
   if (remoteShortcut) {
+    remoteDeadKeyPending = false;
     event.preventDefault();
     if (action === 'down' && !event.repeat) {
       triggerRemoteEditShortcut(remoteShortcut).catch(error => {
@@ -2225,25 +2320,114 @@ function handleRemoteKey(event, action) {
     return;
   }
 
-  const key = String(event.key || '');
-  const isSpaceKey = event.code === 'Space' || key === ' ';
-  const printableNonControl = !isSpaceKey && key.length >= 1 && key.length <= 2 && !/[\u0000-\u001f\u007f]/.test(key) && !/^[A-Za-z]{2,}$/.test(key);
-  const textInput = Boolean(printableNonControl && !event.ctrlKey && !event.altKey && !event.metaKey);
-  // Native held keys (including Spacebar for UI button/checkbox activation) need
-  // real VK keydown/keyup; printable characters use Unicode text injection on Windows.
-  if (action === 'down' && event.repeat && !textInput) return;
+  // Let dead keys (Greek tonos `;` + `ε` -> `έ`, US-Intl dead `'` + Space -> `'`) and
+  // OS IME compositions flow into #remote-input-capture without preventDefault().
+  const isDeadOrIme = key === 'Dead' || key === 'Process' || event.isComposing || remoteComposing || event.keyCode === 229;
+  if (isDeadOrIme) {
+    if (action === 'down') {
+      remoteDeadKeyPending = true;
+      const capture = document.getElementById(REMOTE_CAPTURE_ID);
+      if (capture && document.activeElement !== capture) {
+        focusRemoteViewerInput();
+      }
+    }
+    return;
+  }
+
+  const isAltGr = Boolean(event.getModifierState && event.getModifierState('AltGraph')) || (event.ctrlKey && event.altKey);
+  const hasCommandModifier = Boolean(
+    (event.ctrlKey && !isAltGr) ||
+    event.metaKey ||
+    (event.altKey && !isAltGr)
+  );
+  const isSpaceKey = code === 'Space' || key === ' ';
+  const isSpecial = isSpecialOrNavigationKey(event);
+
+  // Spacebar: send native VK_SPACE / evdev Space for UI buttons & games UNLESS finishing a dead key (e.g. dead `'` + Space -> `'`).
+  if (isSpaceKey && !remoteDeadKeyPending && !hasCommandModifier) {
+    if (action === 'down' && event.repeat) { event.preventDefault(); return; }
+    event.preventDefault();
+    if (action === 'down' && code) sentRawKeyCodes.add(code);
+    sendInput({
+      kind: 'key',
+      action,
+      code: code || 'Space',
+      key: ' ',
+      textInput: false,
+      shiftKey: Boolean(event.shiftKey),
+      ctrlKey: Boolean(event.ctrlKey),
+      altKey: Boolean(event.altKey),
+      metaKey: Boolean(event.metaKey),
+      location: Number(event.location) || 0
+    });
+    return;
+  }
+
+  // Printable text characters (including "'", '"', and Greek letters like "έχω")
+  // without Ctrl/Cmd/Alt modifiers:
+  const isPrintableText = !hasCommandModifier && !isSpecial && (
+    (isSpaceKey && remoteDeadKeyPending) ||
+    (!isSpaceKey && key.length >= 1 && !/[\u0000-\u001f\u007f]/.test(key) && key !== 'Unidentified')
+  );
+
+  if (isPrintableText) {
+    remoteDeadKeyPending = false;
+    const capture = document.getElementById(REMOTE_CAPTURE_ID);
+    if (capture && document.activeElement === capture) {
+      // Allow browser/OS to commit into #remote-input-capture (completing any active dead-key accent);
+      // its `input` listener immediately flushes { kind: 'text', text } to the host.
+      return;
+    }
+    event.preventDefault();
+    if (action === 'down') {
+      flushCapturedRemoteText(key);
+      focusRemoteViewerInput();
+    }
+    return;
+  }
+
+  remoteDeadKeyPending = false;
+  if (action === 'down' && event.repeat) { event.preventDefault(); return; }
   event.preventDefault();
+  if (action === 'down' && code) sentRawKeyCodes.add(code);
   const sent = sendInput({
-    kind: 'key', action, code: event.code, key,
-    textInput,
-    shiftKey: Boolean(event.shiftKey), ctrlKey: Boolean(event.ctrlKey),
-    altKey: Boolean(event.altKey), metaKey: Boolean(event.metaKey),
+    kind: 'key',
+    action,
+    code,
+    key,
+    textInput: false,
+    shiftKey: Boolean(event.shiftKey),
+    ctrlKey: Boolean(event.ctrlKey),
+    altKey: Boolean(event.altKey),
+    metaKey: Boolean(event.metaKey),
     location: Number(event.location) || 0
   });
   if (!sent) console.debug('[mswnlink] Keyboard event was not sent; the remote data channel is not ready.');
 }
 
 function installRemoteKeyboardCapture() {
+  const capture = document.getElementById(REMOTE_CAPTURE_ID);
+  if (capture) {
+    capture.addEventListener('compositionstart', () => {
+      remoteComposing = true;
+      remoteDeadKeyPending = true;
+    });
+    capture.addEventListener('compositionend', (event) => {
+      remoteComposing = false;
+      remoteDeadKeyPending = false;
+      const text = capture.value || (event && typeof event.data === 'string' ? event.data : '');
+      capture.value = '';
+      flushCapturedRemoteText(text);
+    });
+    capture.addEventListener('input', (event) => {
+      if (remoteComposing || (event && event.isComposing)) return;
+      remoteDeadKeyPending = false;
+      const text = capture.value;
+      if (!text) return;
+      capture.value = '';
+      flushCapturedRemoteText(text);
+    });
+  }
   // Install once at renderer startup, not during each connection. This avoids
   // lost/duplicated key handlers after reconnecting or recreating a peer.
   window.addEventListener('keydown', event => handleRemoteKey(event, 'down'), true);
@@ -2580,7 +2764,7 @@ async function initialize() {
   $('#remote-video').addEventListener('pointerdown', (event) => {
     if (!clientConnected || !controlGranted) return;
     event.preventDefault();
-    $('#remote-video').focus({ preventScroll: true });
+    focusRemoteViewerInput();
     try { $('#remote-video').setPointerCapture(event.pointerId); } catch {}
     const point = getNormalizedPointer(event, false);
     if (!point) return;
@@ -2601,8 +2785,13 @@ async function initialize() {
     }
   });
   const releaseRemoteInput = () => {
-    const hadPressed = pressedRemoteButtons.size > 0;
+    const hadPressed = pressedRemoteButtons.size > 0 || sentRawKeyCodes.size > 0;
     pressedRemoteButtons.clear();
+    sentRawKeyCodes.clear();
+    remoteDeadKeyPending = false;
+    remoteComposing = false;
+    const capture = document.getElementById(REMOTE_CAPTURE_ID);
+    if (capture) capture.value = '';
     if (hadPressed || (clientConnected && controlGranted)) {
       sendInput({ kind: 'releaseAll' });
     }
