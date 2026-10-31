@@ -120,6 +120,27 @@ jobs:
             npm test
           fi
 
+      - name: Verify cross-platform executable icon assets (.ico, .icns, .png)
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const ico = fs.readFileSync("assets/mswnlink.ico");
+            const icns = fs.readFileSync("assets/mswnlink.icns");
+            const png = fs.readFileSync("assets/mswnlink.png");
+            const hicolor512 = fs.readFileSync("assets/icons/512x512.png");
+            if (ico.readUInt16LE(0) !== 0 || ico.readUInt16LE(2) !== 1 || ico.readUInt16LE(4) < 5) {
+              throw new Error("Invalid Windows assets/mswnlink.ico header");
+            }
+            if (icns.subarray(0, 4).toString("ascii") !== "icns" || icns.length < 16384) {
+              throw new Error("Invalid macOS assets/mswnlink.icns container");
+            }
+            if (png.subarray(0, 4).toString("hex") !== "89504e47" || hicolor512.subarray(0, 4).toString("hex") !== "89504e47") {
+              throw new Error("Invalid Linux PNG icon header");
+            }
+            console.log("Verified executable icon assets: ico=" + ico.length + "B, icns=" + icns.length + "B, png=" + png.length + "B");
+          '
+
       - name: Verify Windows C# SendInput & Task Manager UIPI worker compiles
         if: runner.os == 'Windows'
         shell: powershell
@@ -177,6 +198,22 @@ jobs:
         if: runner.os != 'macOS'
         shell: bash
         run: npx electron-builder ${{ matrix.dist_args }} --publish never
+
+      - name: Verify Fedora AppImage embeds desktop icon (.DirIcon)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for appimg in release/*.AppImage; do
+            chmod +x "$appimg"
+            EXTRACT_DIR="$(mktemp -d)"
+            (cd "$EXTRACT_DIR" && "$OLDPWD/$appimg" --appimage-extract >/dev/null)
+            test -e "$EXTRACT_DIR/squashfs-root/.DirIcon" || { echo "Missing .DirIcon inside $appimg" >&2; exit 1; }
+            test -s "$EXTRACT_DIR/squashfs-root/mswnlink.png" || { echo "Missing mswnlink.png inside $appimg" >&2; exit 1; }
+            rm -rf "$EXTRACT_DIR"
+            echo "Verified embedded AppImage file icon (.DirIcon) in $appimg"
+          done
 
       - name: Package macOS DMG (Developer ID if configured, inside-out ad-hoc signed otherwise)
         id: package_macos
@@ -303,12 +340,14 @@ jobs:
               exit 1
             }
 
-            # 3. Privacy usage descriptions required for macOS permission prompts
+            # 3. Privacy usage descriptions & bundle icon required for macOS
             PLIST="$APP/Contents/Info.plist"
             SCREEN_DESC="$(plutil -extract NSScreenCaptureUsageDescription raw -o - "$PLIST")"
             ACCESS_DESC="$(plutil -extract NSAccessibilityUsageDescription raw -o - "$PLIST")"
+            ICON_FILE="$(plutil -extract CFBundleIconFile raw -o - "$PLIST")"
             test -n "$SCREEN_DESC" || { echo "Missing NSScreenCaptureUsageDescription in Info.plist" >&2; exit 1; }
             test -n "$ACCESS_DESC" || { echo "Missing NSAccessibilityUsageDescription in Info.plist" >&2; exit 1; }
+            test -n "$ICON_FILE" || { echo "Missing CFBundleIconFile in Info.plist" >&2; exit 1; }
 
             # 4. Verify GPU & Renderer Helper .app bundles retain JIT / unsigned-executable-memory entitlements
             for helper_name in "mswnlink Helper (GPU).app" "mswnlink Helper (Renderer).app"; do
@@ -392,10 +431,11 @@ jobs:
           generate_release_notes: true
           body: |
             ### What's Fixed in mswnlink 3.3
-            - **Cross-OS Copy & Paste**: Live two-way clipboard sync when unfocused, atomic `Ctrl+V` / `Cmd+V` paste sync, echo-free manual clipboard send/get, macOS `Edit` menu routing, and preserved modifier flags on macOS hosts.
-            - **macOS Screen Recording Permissions**: Synchronous `getDisplayMedia()` prompt activation, macOS 15 Sequoia picker fallback, inside-out ad-hoc Mach-O & helper entitlement signing (Intel x64 + Apple Silicon), and one-click reset for stale upgrade TCC entries.
-            - **Windows Task Manager Control & Keyboard**: Named-Pipe Win32 `SendInput` worker with one-time UAC elevation, Medium-Integrity UIPI escape guard, multi-monitor `dipToScreenRect` scaling, and native `VK_SPACE` handling for dialogs.
-            - **Resilient LAN Sessions**: Symmetric 25-second WebRTC transient disconnect recovery on both host and viewer.
+            - **Fedora Wayland Client ↔ Host Interactivity & Stop-Sharing Fix**: Native Python3 `Gio.DBusConnection` (`UNIX_FD` `SCM_RIGHTS`) portal worker + hardened non-singleton `dbus-next` fallback eliminates `Tried to write a message to a closed stream`, stops duplicate GNOME ScreenCast popups (`DcSctpTransport4->OnAborted`), and makes **Start sharing / Stop sharing** instant and non-blocking.
+            - **Custom Executable Icons Across All Platforms**: Multi-resolution BMP/PNG `.ico` (Windows `.exe`), `.icns` + `.VolumeIcon.icns` (macOS `.dmg` & `.app`), and Freedesktop hicolor `.DirIcon` + GIO custom file icon integration (Fedora `.AppImage`).
+            - **Cross-OS Copy & Paste (Electron 45 Async Fix)**: Awaits Electron 45's async `clipboard.readText()` / `writeText()` (fixing `[object Promise]` paste), live two-way clipboard sync when unfocused, atomic `Ctrl+V` / `Cmd+V` paste sync, and macOS `Edit` menu routing.
+            - **International Keyboard, Quotes (`'`) & Greek (`έχω`)**: Hidden viewer IME/dead-key capture surface + cross-platform Unicode/XKB keysym text injection across Fedora Wayland, Windows, macOS, and X11.
+            - **macOS Screen Recording Permissions & Windows Task Manager Control**: Synchronous `getDisplayMedia()`, macOS 15 Sequoia picker fallback, inside-out ad-hoc Mach-O signing (Intel x64 + Apple Silicon), and Named-Pipe Win32 `SendInput` + UIPI escape guard.
 
             ### Install or Upgrade on macOS (clears Gatekeeper quarantine & refreshes stale TCC permissions)
             Paste into Terminal:
