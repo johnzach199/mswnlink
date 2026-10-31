@@ -224,10 +224,14 @@ test('LinuxWaylandInput handles dbus-broker unique sender signals, HiDPI scaling
     NotifyPointerButton: async () => {}
   };
 
+  let openPipeWireRemoteCalled = false;
+  let sessionBusArg = undefined;
+
   const screenCastIface = {
     SelectSources: async (_s, opts) => emitPortalResponse(opts.handle_token, {}),
     OpenPipeWireRemote: async () => {
-      throw new Error('no gstreamer in unit test');
+      openPipeWireRemoteCalled = true;
+      throw new Error('OpenPipeWireRemote must never be called over pure-JS dbus-next');
     }
   };
 
@@ -243,7 +247,10 @@ test('LinuxWaylandInput handles dbus-broker unique sender signals, HiDPI scaling
     dbusModule: {
       Variant: MockVariant,
       Message: MockMessage,
-      sessionBus: () => bus
+      sessionBus: (opts) => {
+        sessionBusArg = opts;
+        return bus;
+      }
     },
     screen: {
       getPrimaryDisplay: () => ({
@@ -255,6 +262,10 @@ test('LinuxWaylandInput handles dbus-broker unique sender signals, HiDPI scaling
 
   const started = await wayland.start('');
   assert.equal(started.restoreToken, 'tok-fedora-41');
+  // Verify non-singleton sessionBus(opts) was used and UNIX_FD OpenPipeWireRemote was never called on dbus-next
+  assert.equal(typeof sessionBusArg, 'object');
+  assert.notEqual(sessionBusArg, null);
+  assert.equal(openPipeWireRemoteCalled, false);
   // Verify no sender='org.freedesktop.portal.Desktop' filter was used
   assert.ok(matchRules.every((r) => !r.includes("sender='org.freedesktop.portal.Desktop'")));
   // Verify HiDPI logical resolution (1920x1080, not 3840x2160)
@@ -273,5 +284,58 @@ test('LinuxWaylandInput handles dbus-broker unique sender signals, HiDPI scaling
   const pressedSyms = keysymCalls.filter(([, st]) => st === 1).map(([sym]) => sym);
   assert.deepEqual(pressedSyms, [0x07b2, 0x07f7, 0x07f9, 0x0020, 0x0027]);
 
+  // Simulate dbus-broker closing stream mid-call ("Tried to write a message to a closed stream"):
+  // must reject in-flight call immediately without hanging inputQueue or close()!
+  remoteIface.NotifyPointerMotion = () =>
+    new Promise(() => {
+      setImmediate(() => {
+        bus.emit('error', new Error('Tried to write a message to a closed stream'));
+      });
+    });
+
+  await assert.rejects(
+    () => wayland.inject({ kind: 'move', x: 0.25, y: 0.25 }),
+    /closed stream|Wayland input session closed/i
+  );
+  assert.equal(wayland.isActive(), false);
+
+  const closeStartedAt = Date.now();
   await wayland.close();
+  assert.ok(Date.now() - closeStartedAt < 250, 'close() must return immediately on closed stream');
 });
+
+test('Wayland Gio.DBusConnection Python worker compiles cleanly and multi-OS executable icons are valid', () => {
+  const { execFileSync } = require('node:child_process');
+  try {
+    execFileSync(
+      'python3',
+      ['-c', "import sys; compile(sys.stdin.read(), 'wayland_portal.py', 'exec')"],
+      { input: LinuxWaylandInput.WAYLAND_PORTAL_PY_SCRIPT, stdio: ['pipe', 'ignore', 'pipe'], timeout: 3000 }
+    );
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') throw err;
+  }
+
+  const rootDir = path.join(__dirname, '..');
+  const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
+  assert.equal(pkg.build.win.icon, 'assets/mswnlink.ico');
+  assert.equal(pkg.build.win.signAndEditExecutable, true);
+  assert.equal(pkg.build.mac.icon, 'assets/mswnlink.icns');
+  assert.equal(pkg.build.dmg.icon, 'assets/mswnlink.icns');
+  assert.equal(pkg.build.linux.icon, 'assets/icons');
+
+  const ico = fs.readFileSync(path.join(rootDir, 'assets', 'mswnlink.ico'));
+  assert.equal(ico.readUInt16LE(0), 0);
+  assert.equal(ico.readUInt16LE(2), 1);
+  assert.ok(ico.readUInt16LE(4) >= 6, 'ICO should include multi-resolution frames');
+
+  const icns = fs.readFileSync(path.join(rootDir, 'assets', 'mswnlink.icns'));
+  assert.equal(icns.subarray(0, 4).toString('ascii'), 'icns');
+  assert.equal(icns.readUInt32BE(4), icns.length);
+
+  for (const rel of ['assets/mswnlink.png', 'assets/icons/256x256.png', 'assets/icons/512x512.png']) {
+    const png = fs.readFileSync(path.join(rootDir, rel));
+    assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  }
+});
+

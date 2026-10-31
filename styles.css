@@ -93,7 +93,7 @@ button:disabled, select:disabled, input:disabled { cursor: not-allowed; opacity:
 }
 .bar button, .bar .switcher, .bar a { -webkit-app-region: no-drag; }
 .bar-brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
-.logo { width: 24px; height: 24px; fill: none; stroke: var(--accent); stroke-width: 1.9; flex: none; }
+.logo { width: 24px; height: 24px; border-radius: 6px; object-fit: contain; display: block; flex: none; }
 .wordmark { font-weight: 700; letter-spacing: -0.015em; font-size: 15.5px; }
 .bar-end { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
 .device-chip { display: inline-flex; align-items: center; gap: 8px; max-width: 200px; padding: 0 8px; color: var(--muted); font-size: 13px; }

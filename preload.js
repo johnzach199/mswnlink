@@ -33,7 +33,7 @@ contextBridge.exposeInMainWorld('lanAPI', {
   saveAccessCode: (code) => ipcRenderer.invoke('save-access-code', code),
   getUnattendedAccess: () => ipcRenderer.invoke('get-unattended-access'),
   setUnattendedAccess: (enabled) => ipcRenderer.invoke('set-unattended-access', enabled),
-  getSources: () => ipcRenderer.invoke('get-sources'),
+  getSources: (options) => ipcRenderer.invoke('get-sources', options),
   chooseSource: (id) => ipcRenderer.invoke('choose-source', id),
   startHost: () => ipcRenderer.invoke('host-start'),
   makePairProof: (code, nonce) => ipcRenderer.invoke('make-pair-proof', code, nonce),

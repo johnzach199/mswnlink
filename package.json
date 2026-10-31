@@ -57,7 +57,8 @@
         "portable"
       ],
       "artifactName": "mswnlink-windows-3.3-${arch}.${ext}",
-      "icon": "assets/mswnlink.ico"
+      "icon": "assets/mswnlink.ico",
+      "signAndEditExecutable": true
     },
     "mac": {
       "target": [
@@ -74,6 +75,10 @@
       },
       "icon": "assets/mswnlink.icns"
     },
+    "dmg": {
+      "icon": "assets/mswnlink.icns",
+      "iconSize": 100
+    },
     "linux": {
       "target": [
         "AppImage"
@@ -81,7 +86,7 @@
       "category": "Network",
       "executableName": "mswnlink",
       "artifactName": "mswnlink-fedora-3.3-${arch}.${ext}",
-      "icon": "assets/mswnlink.png"
+      "icon": "assets/icons"
     },
     "afterPack": "scripts/after-pack.cjs",
     "portable": {

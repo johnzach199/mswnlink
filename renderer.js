@@ -26,6 +26,8 @@ let selectedSourceId = null;
 let sourceLoadError = '';
 let sharingStream = null;
 let hostInfo = null;
+let shareToggleBusy = false;
+let lastDisplayListRequestAt = 0;
 let hostPeer = null;
 let hostRemoteCandidates = [];
 let clientSocket = null;
@@ -661,7 +663,10 @@ async function handleSessionDataMessage(side, channel, data) {
   if (!data || typeof data.kind !== 'string') return false;
   if (data.kind === 'mswnlink-hello') {
     updateRemoteFeaturePreferences(data.features || {});
-    if (side === 'client' && data.displays) sendChannelMessage(channel, { kind: 'display-list-request' });
+    if (side === 'client' && data.displays && performance.now() - lastDisplayListRequestAt > 600) {
+      lastDisplayListRequestAt = performance.now();
+      sendChannelMessage(channel, { kind: 'display-list-request' });
+    }
     await primeClipboardBaseline(channel);
     // Sync the viewer's pre-existing clipboard on connect so text copied right
     // before opening the remote session can be pasted immediately with Ctrl+V/Cmd+V.
@@ -733,6 +738,13 @@ async function handleSessionDataMessage(side, channel, data) {
     return true;
   }
   if (data.kind === 'quality-profile-result') return true;
+  if (data.kind === 'session-bye' && side === 'host') {
+    closeHostPeer();
+    hostPeerDetails = null;
+    hostControlAllowed = false;
+    updateShareUI();
+    return true;
+  }
   if (data.kind === 'display-list-request' && side === 'host') {
     const displays = await window.lanAPI.getSources();
     sendChannelMessage(channel, { kind: 'display-list', displays: displays.map(item => ({ id: item.id, name: item.name, displayId: item.displayId || '', bounds: item.bounds || null, scaleFactor: item.scaleFactor || 1 })) });
@@ -1010,6 +1022,9 @@ function mapCompositePointerInput(data) {
 
 async function switchSharedDisplay(sourceId, channel) {
   if (!hostPeer || !sharingStream) throw new Error('A live host session is required to switch displays.');
+  if (deviceInfo.waylandSession || String(sourceId || '').startsWith('wayland-display:')) {
+    throw new Error('On Fedora/Wayland, GNOME manages the shared monitor through its native screen-sharing indicator. Stop and restart sharing on the host to pick a different screen.');
+  }
   const profile = SHARE_PROFILES[activeShareQuality] || SHARE_PROFILES.balanced;
   let replacement = null;
   let nextComposite = null;
@@ -1228,7 +1243,28 @@ async function refreshSources() {
       const image = document.createElement('img');
       image.className = 'source-thumb';
       image.alt = '';
-      if (source.thumbnail) image.src = source.thumbnail;
+      if (source.thumbnail) {
+        image.src = source.thumbnail;
+      } else {
+        const previewCanvas = document.createElement('canvas');
+        previewCanvas.width = 360;
+        previewCanvas.height = 220;
+        const g = previewCanvas.getContext('2d');
+        if (g) {
+          g.fillStyle = '#0d1728';
+          g.fillRect(0, 0, 360, 220);
+          g.strokeStyle = '#14b8a6';
+          g.lineWidth = 3;
+          g.strokeRect(36, 28, 288, 152);
+          g.fillStyle = '#e2e8f0';
+          g.font = '600 13px system-ui, sans-serif';
+          g.fillText(source.name || 'Desktop Display', 52, 96);
+          g.fillStyle = '#94a3b8';
+          g.font = '12px system-ui, sans-serif';
+          g.fillText(source.waylandPortalManaged ? 'Wayland portal selects on Start sharing' : 'Ready to share', 52, 120);
+          image.src = previewCanvas.toDataURL('image/png');
+        }
+      }
       const meta = document.createElement('div');
       meta.className = 'source-meta';
       const name = document.createElement('strong');
@@ -1269,18 +1305,32 @@ async function refreshSources() {
   }
 }
 
+let shareSessionEpoch = 0;
+let sharePendingCancelable = false;
+
+function hasLiveSharingStream() {
+  if (!sharingStream) return false;
+  const tracks = sharingStream.getVideoTracks();
+  return tracks.length > 0 && tracks.some(track => track.readyState !== 'ended');
+}
+
 function updateShareUI() {
-  const active = Boolean(hostInfo && sharingStream);
+  const active = Boolean(hasLiveSharingStream() || hostInfo);
   $('#share-status-pill').classList.toggle('active', active);
-  $('#share-status-pill').replaceChildren(Object.assign(document.createElement('span'), { className: 'status-dot' }), document.createTextNode(active ? 'Sharing' : 'Not sharing'));
-  $('#share-toggle-label').textContent = active ? 'Stop sharing' : 'Start sharing';
-  $('#share-toggle').classList.toggle('button-primary', !active);
-  $('#share-toggle').classList.toggle('button-danger', active);
+  $('#share-status-pill').replaceChildren(
+    Object.assign(document.createElement('span'), { className: 'status-dot' }),
+    document.createTextNode(active ? 'Sharing' : (sharePendingCancelable ? 'Waiting for permission…' : 'Not sharing'))
+  );
+  $('#share-toggle-label').textContent = sharePendingCancelable
+    ? 'Cancel sharing'
+    : (active ? 'Stop sharing' : 'Start sharing');
+  $('#share-toggle').classList.toggle('button-primary', !active && !sharePendingCancelable);
+  $('#share-toggle').classList.toggle('button-danger', active || sharePendingCancelable);
   $('#pairing-placeholder').hidden = active;
   $('#pairing-active').hidden = !active;
   refreshAccessCodeUI();
-  $$('.source-card').forEach(card => { card.disabled = active; });
-  $('#share-quality').disabled = active;
+  $$('.source-card').forEach(card => { card.disabled = active || sharePendingCancelable; });
+  $('#share-quality').disabled = active || sharePendingCancelable;
   $('#active-peer-bar').hidden = !hostPeerDetails;
   if (hostPeerDetails) {
     $('#active-peer-name').textContent = friendlyDeviceName(hostPeerDetails.name);
@@ -1288,10 +1338,10 @@ function updateShareUI() {
     $('#toggle-host-control').textContent = hostControlAllowed ? 'Revoke control' : 'Allow control';
     $('#toggle-host-control').disabled = !deviceInfo.inputAvailable;
   }
-  if (active) {
+  if (active && hostInfo) {
     $('#host-pairing-code').textContent = hostInfo.code;
     $('#host-ip-list').replaceChildren();
-    const ips = hostInfo.ips.length ? hostInfo.ips : [];
+    const ips = Array.isArray(hostInfo.ips) && hostInfo.ips.length ? hostInfo.ips : [];
     if (!ips.length) {
       const row = document.createElement('div');
       row.className = 'ip-row';
@@ -1322,8 +1372,14 @@ function updateShareUI() {
 }
 
 async function startSharing() {
-  if (sharingStream && hostInfo) {
-    await stopSharing();
+  // Allow clicking the button while waiting on an OS/Wayland portal picker to cancel immediately.
+  if (sharePendingCancelable) {
+    await stopSharing(false);
+    return;
+  }
+  if (shareToggleBusy) return;
+  if (hasLiveSharingStream() || sharingStream || hostInfo) {
+    await stopSharing(false);
     return;
   }
   if (!accessCodeConfigured || !persistentAccessCode) {
@@ -1334,13 +1390,28 @@ async function startSharing() {
     showToast(message);
     return;
   }
+
+  const epoch = ++shareSessionEpoch;
+  shareToggleBusy = true;
+  sharePendingCancelable = false;
   $('#share-toggle').disabled = true;
+  $('#share-toggle-label').textContent = 'Starting…';
   showShareError('');
+
+  // If the Fedora/GNOME or macOS picker stays open for >650ms, re-enable the button
+  // as "Cancel sharing" so the UI can never get stuck behind a dismissed/hidden portal dialog.
+  const enableCancelTimer = setTimeout(() => {
+    if (epoch === shareSessionEpoch && shareToggleBusy && !hostInfo) {
+      sharePendingCancelable = true;
+      $('#share-toggle').disabled = false;
+      updateShareUI();
+    }
+  }, 650);
+
   try {
     // IMPORTANT: Call getDisplayMedia synchronously inside the click handler
     // BEFORE any `await` so Chromium preserves transient user activation and
-    // macOS can open its native Screen Recording prompt / Sequoia picker even
-    // when desktopCapturer could not pre-enumerate sources beforehand.
+    // macOS/Wayland open their native screen picker cleanly.
     activeShareQuality = $('#share-quality').value || 'balanced';
     const profile = SHARE_PROFILES[activeShareQuality] || SHARE_PROFILES.balanced;
     const capturePromise = navigator.mediaDevices.getDisplayMedia({
@@ -1348,59 +1419,120 @@ async function startSharing() {
       audio: false
     });
     const stream = await capturePromise;
+    if (epoch !== shareSessionEpoch) {
+      stream.getTracks().forEach(track => { try { track.stop(); } catch {} });
+      return;
+    }
+    const videoTracks = stream.getVideoTracks();
+    if (!videoTracks.length || videoTracks.every(track => track.readyState === 'ended')) {
+      stream.getTracks().forEach(track => { try { track.stop(); } catch {} });
+      throw new Error('Screen capture ended before sharing could start.');
+    }
     sharingStream = stream;
-    stream.getVideoTracks().forEach(track => {
+    videoTracks.forEach(track => {
       try { track.contentHint = 'detail'; } catch {}
       track.addEventListener('ended', () => {
-        if (sharingStream === stream && hostInfo) stopSharing(true);
+        if (sharingStream === stream) {
+          stopSharing(true).catch(() => {});
+        }
       }, { once: true });
     });
     if (deviceInfo.platform === 'darwin') {
       await refreshMacPermissionState();
     }
-    if (!sources.length) {
+    if (!sources.length && !deviceInfo.waylandSession) {
       await refreshSources().catch(() => {});
     }
-    hostInfo = await window.lanAPI.startHost();
+    const startedHost = await window.lanAPI.startHost();
+    if (epoch !== shareSessionEpoch || sharingStream !== stream || stream.getVideoTracks().every(track => track.readyState === 'ended')) {
+      stream.getTracks().forEach(track => { try { track.stop(); } catch {} });
+      if (epoch === shareSessionEpoch) {
+        await stopSharing(true);
+      }
+      return;
+    }
+    hostInfo = startedHost;
+    sharePendingCancelable = false;
     updateShareUI();
     showToast('Sharing is active. Share the LAN address and your permanent access code with the person connecting.');
   } catch (error) {
-    if (sharingStream) sharingStream.getTracks().forEach(track => track.stop());
+    if (epoch !== shareSessionEpoch) return;
+    if (sharingStream) sharingStream.getTracks().forEach(track => { try { track.stop(); } catch {} });
     if (activeCompositeCapture && typeof activeCompositeCapture.cleanup === 'function') activeCompositeCapture.cleanup();
     activeCompositeCapture = null;
     lastCompositeDisplayId = null;
     sharingStream = null;
-    if (hostInfo) await window.lanAPI.stopHost();
     hostInfo = null;
+    sharePendingCancelable = false;
+    await Promise.race([
+      window.lanAPI.stopHost().catch(() => {}),
+      new Promise(resolve => setTimeout(resolve, 1000))
+    ]);
     if (deviceInfo.platform === 'darwin') {
       await refreshMacPermissionState();
     }
     updateShareUI();
-    const macSummary = deviceInfo.platform === 'darwin' && macPermissionsState && !macPermissionsState.granted
-      ? macPermissionsState.summary
-      : '';
-    showShareError(macSummary || (error.message === sourceLoadError && sourceLoadError ? sourceLoadError : describeScreenCaptureError(error)));
+    const errName = String((error && error.name) || '');
+    const errMsg = String((error && error.message) || '');
+    const userCancelled = errName === 'NotAllowedError' || errName === 'AbortError' || /cancelled|canceled|denied by system|permission denied/i.test(errMsg);
+    if (deviceInfo.waylandSession && userCancelled) {
+      showToast('Screen sharing was cancelled.');
+    } else {
+      const macSummary = deviceInfo.platform === 'darwin' && macPermissionsState && !macPermissionsState.granted
+        ? macPermissionsState.summary
+        : '';
+      showShareError(macSummary || (error.message === sourceLoadError && sourceLoadError ? sourceLoadError : describeScreenCaptureError(error)));
+    }
   } finally {
-    $('#share-toggle').disabled = false;
+    clearTimeout(enableCancelTimer);
+    if (epoch === shareSessionEpoch) {
+      sharePendingCancelable = false;
+      shareToggleBusy = false;
+      $('#share-toggle').disabled = false;
+      updateShareUI();
+    }
   }
 }
 
 async function stopSharing(fromSystem = false) {
-  $('#share-toggle').disabled = true;
-  try { await window.lanAPI.stopHost(); } catch {}
-  if (sharingStream) sharingStream.getTracks().forEach(track => track.stop());
-  if (activeCompositeCapture && typeof activeCompositeCapture.cleanup === 'function') activeCompositeCapture.cleanup();
-  activeCompositeCapture = null;
-  lastCompositeDisplayId = null;
+  const epoch = ++shareSessionEpoch;
+  sharePendingCancelable = false;
+  shareToggleBusy = false;
+
+  // Stop capture tracks and reset UI state IMMEDIATELY so GNOME's screen-sharing
+  // indicator and the Share/Stop button respond in 0ms and can never get stuck
+  // waiting on main-process D-Bus/portal teardown.
+  const streamToStop = sharingStream;
   sharingStream = null;
   hostInfo = null;
+  if (streamToStop) {
+    streamToStop.getTracks().forEach(track => {
+      try { track.stop(); } catch {}
+    });
+  }
+  if (activeCompositeCapture && typeof activeCompositeCapture.cleanup === 'function') {
+    try { activeCompositeCapture.cleanup(); } catch {}
+  }
+  activeCompositeCapture = null;
+  lastCompositeDisplayId = null;
   closeHostPeer();
   $('#incoming-modal').hidden = true;
   hostPeerDetails = null;
   hostControlAllowed = false;
-  updateShareUI();
   $('#share-toggle').disabled = false;
-  if (!fromSystem) showToast('Screen sharing stopped. Your permanent access code remains saved for next time.');
+  updateShareUI();
+
+  await Promise.race([
+    window.lanAPI.stopHost().catch(() => {}),
+    new Promise(resolve => setTimeout(resolve, 1200))
+  ]);
+  if (epoch === shareSessionEpoch) {
+    $('#share-toggle').disabled = false;
+    updateShareUI();
+    if (!fromSystem) {
+      showToast('Screen sharing stopped. Your permanent access code remains saved for next time.');
+    }
+  }
 }
 
 function sendHostSignal(message) {
@@ -1814,6 +1946,7 @@ async function startClientPeer() {
     // same handler. A second onopen assignment here would overwrite these
     // essential messages and leave discovery/clipboard/files disabled.
     sendLocalFeatureHello(channel);
+    lastDisplayListRequestAt = performance.now();
     sendChannelMessage(channel, { kind: 'display-list-request' });
     primeClipboardBaseline(channel).catch(() => {});
     updateSessionFeatureUI();
@@ -2017,10 +2150,13 @@ function cleanupClient(sendHangup = false) {
       .finally(() => { try { socketToClose.close(); } catch {} });
   }
   if (clientChannel) {
-    try { clientChannel.close(); } catch {}
+    if (sendHangup && clientChannel.readyState === 'open') {
+      sendChannelMessage(clientChannel, { kind: 'session-bye' });
+    }
+    try { clientChannel.onclose = null; clientChannel.onmessage = null; } catch {}
   }
   if (clientPeer) {
-    try { clientPeer.ontrack = null; clientPeer.onicecandidate = null; clientPeer.close(); } catch {}
+    try { clientPeer.ontrack = null; clientPeer.onicecandidate = null; clientPeer.onconnectionstatechange = null; clientPeer.close(); } catch {}
   }
   if (clientSocket) {
     try {
@@ -2832,12 +2968,18 @@ async function initialize() {
   });
   window.lanAPI.on('host-signal', handleHostSignal);
   window.lanAPI.on('host-stopped', () => {
+    // Ignore late host-stopped notifications from an earlier stopHost() call if a
+    // brand-new startSharing() attempt is currently in progress.
+    if (shareToggleBusy && !hostInfo) return;
     closeHostPeer();
     hostPeerDetails = null;
     hostControlAllowed = false;
-    if (sharingStream) sharingStream.getTracks().forEach(track => track.stop());
+    if (sharingStream) sharingStream.getTracks().forEach(track => { try { track.stop(); } catch {} });
     sharingStream = null;
     hostInfo = null;
+    sharePendingCancelable = false;
+    shareToggleBusy = false;
+    $('#share-toggle').disabled = false;
     $('#incoming-modal').hidden = true;
     updateShareUI();
   });

@@ -61,6 +61,7 @@ let inputAllowed = false;
 let unattendedAccessEnabled = false;
 let waylandInputManager = null;
 let waylandRestoreToken = '';
+let inputBackendInitPromise = null;
 let win32InputManager = null;
 let robot = null;
 const heldKeys = new Set();
@@ -130,6 +131,10 @@ function createWindow() {
   const initialWidth = Math.min(1240, Math.max(minWindowWidth, workArea.width - 32));
   const initialHeight = Math.min(820, Math.max(minWindowHeight, workArea.height - 32));
 
+  const windowIconPath = process.platform === 'darwin'
+    ? undefined
+    : path.join(__dirname, 'assets', process.platform === 'win32' ? 'mswnlink.ico' : 'mswnlink.png');
+
   mainWindow = new BrowserWindow({
     width: initialWidth,
     height: initialHeight,
@@ -137,6 +142,7 @@ function createWindow() {
     minHeight: minWindowHeight,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#0d1110' : '#f2f5f4',
     title: 'mswnlink',
+    ...(windowIconPath ? { icon: windowIconPath } : {}),
     // Replace the native title bar and default File/Edit/View menu with the
     // app's own draggable top bar in index.html. macOS keeps its native traffic
     // lights (inset into our bar); Windows and Linux use the bar's own buttons.
@@ -520,38 +526,83 @@ function hasInputBackend() {
   return Boolean(robot);
 }
 
+async function ensureLinuxDesktopIconIntegration() {
+  if (process.platform !== 'linux') return;
+  try {
+    const srcIcon = path.join(__dirname, 'assets', 'mswnlink.png');
+    const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+    const destIconDir = path.join(dataHome, 'icons', 'hicolor', '512x512', 'apps');
+    const destIconPath = path.join(destIconDir, 'mswnlink.png');
+    await fs.mkdir(destIconDir, { recursive: true });
+    await fs.copyFile(srcIcon, destIconPath);
+
+    const appImagePath = process.env.APPIMAGE ? path.resolve(process.env.APPIMAGE) : '';
+    if (appImagePath) {
+      // Set GVFS custom-icon metadata so Fedora GNOME Files (Nautilus) renders the
+      // icon image directly on the standalone .AppImage file.
+      const iconUri = `file://${encodeURI(destIconPath)}`;
+      execFile('gio', ['set', appImagePath, 'metadata::custom-icon', iconUri], { timeout: 2500 }, () => {});
+
+      const appsDir = path.join(dataHome, 'applications');
+      await fs.mkdir(appsDir, { recursive: true });
+      const escapedExec = appImagePath.includes(' ') ? `"${appImagePath.replace(/"/g, '\\"')}"` : appImagePath;
+      const desktopEntry = [
+        '[Desktop Entry]',
+        'Type=Application',
+        'Name=mswnlink 3.3',
+        'Comment=Local-network remote desktop and file sharing',
+        `Exec=${escapedExec} %U`,
+        `Icon=${destIconPath}`,
+        'Terminal=false',
+        'Categories=Network;RemoteAccess;Utility;',
+        'StartupWMClass=mswnlink',
+        ''
+      ].join('\n');
+      await fs.writeFile(path.join(appsDir, 'mswnlink.desktop'), desktopEntry, { encoding: 'utf8', mode: 0o644 });
+    }
+  } catch {}
+}
+
 async function ensureInputBackend(options = {}) {
+  if (inputBackendInitPromise) return inputBackendInitPromise;
   const allowElevationPrompt = options.allowElevationPrompt !== false;
-  if (isLinuxWaylandSession) {
-    if (!LinuxWaylandInput) throw new Error('This Linux Wayland session needs the XDG desktop portal remote-desktop input backend. Update mswnlink and reinstall dependencies.');
-    if (!waylandInputManager) waylandInputManager = new LinuxWaylandInput({ screen });
-    if (waylandInputManager.isActive()) return true;
-    const previousToken = waylandRestoreToken || await loadWaylandRestoreToken();
-    // Portal restore tokens are one-use. Remove the old token before consuming it.
-    waylandRestoreToken = '';
-    try { await fs.unlink(waylandRestoreTokenPath()); } catch {}
-    const result = await waylandInputManager.start(previousToken);
-    if (result && result.restoreToken) await saveWaylandRestoreToken(result.restoreToken);
-    return true;
-  }
-  if (process.platform === 'win32' && WindowsInputBackend) {
-    if (!win32InputManager) {
-      win32InputManager = new WindowsInputBackend({ userDataPath: app.getPath('userData'), screen });
-    }
-    try {
-      await win32InputManager.start({ allowElevationPrompt });
+  inputBackendInitPromise = (async () => {
+    if (isLinuxWaylandSession) {
+      if (!LinuxWaylandInput) throw new Error('This Linux Wayland session needs the XDG desktop portal remote-desktop input backend. Update mswnlink and reinstall dependencies.');
+      if (!waylandInputManager) waylandInputManager = new LinuxWaylandInput({ screen });
+      if (waylandInputManager.isActive()) return true;
+      const previousToken = waylandRestoreToken || await loadWaylandRestoreToken();
+      // Portal restore tokens are one-use. Remove the old token before consuming it.
+      waylandRestoreToken = '';
+      try { await fs.unlink(waylandRestoreTokenPath()); } catch {}
+      const result = await waylandInputManager.start(previousToken);
+      if (result && result.restoreToken) await saveWaylandRestoreToken(result.restoreToken);
       return true;
-    } catch (error) {
-      console.warn('[mswnlink] Windows native SendInput helper could not start; checking RobotJS fallback:', error.message);
-      if (!robot) throw error;
     }
+    if (process.platform === 'win32' && WindowsInputBackend) {
+      if (!win32InputManager) {
+        win32InputManager = new WindowsInputBackend({ userDataPath: app.getPath('userData'), screen });
+      }
+      try {
+        await win32InputManager.start({ allowElevationPrompt });
+        return true;
+      } catch (error) {
+        console.warn('[mswnlink] Windows native SendInput helper could not start; checking RobotJS fallback:', error.message);
+        if (!robot) throw error;
+      }
+    }
+    if (!robot) throw new Error('Mouse/keyboard control is unavailable. Build the RobotJS input backend for this operating system and architecture.');
+    if (process.platform === 'darwin' && !systemPreferences.isTrustedAccessibilityClient(true)) {
+      // The call above shows the macOS permission prompt. Without it, clicks and keys are silently ignored.
+      throw new Error('macOS has not allowed mswnlink to control this Mac yet. Open System Settings › Privacy & Security › Accessibility, turn on mswnlink, then click Allow control again.');
+    }
+    return true;
+  })();
+  try {
+    return await inputBackendInitPromise;
+  } finally {
+    inputBackendInitPromise = null;
   }
-  if (!robot) throw new Error('Mouse/keyboard control is unavailable. Build the RobotJS input backend for this operating system and architecture.');
-  if (process.platform === 'darwin' && !systemPreferences.isTrustedAccessibilityClient(true)) {
-    // The call above shows the macOS permission prompt. Without it, clicks and keys are silently ignored.
-    throw new Error('macOS has not allowed mswnlink to control this Mac yet. Open System Settings › Privacy & Security › Accessibility, turn on mswnlink, then click Allow control again.');
-  }
-  return true;
 }
 
 async function loadSavedAccessCode() {
@@ -823,12 +874,17 @@ async function startHost() {
   if (unattendedAccessEnabled) {
     await ensureInputBackend();
   } else if (isLinuxWaylandSession) {
-    // On Fedora/GNOME Wayland, prompt for the RemoteDesktop portal session right when
-    // the owner clicks Start sharing so mouse/keyboard control is ready immediately
-    // when a client joins (without blocking view-only sharing if cancelled).
-    ensureInputBackend().catch((error) => {
-      console.warn('[mswnlink] Wayland remote-input pre-warm deferred until control approval:', error.message);
-    });
+    // Only pre-warm silently in the background when a saved one-use restore token
+    // already exists; otherwise avoid stacking a second GNOME portal dialog right on
+    // top of the getDisplayMedia() screen-picker dialog (host-resolve-join prompts
+    // cleanly when the host clicks "Allow control").
+    const savedWaylandToken = waylandRestoreToken || await loadWaylandRestoreToken();
+    if (savedWaylandToken) {
+      waylandRestoreToken = savedWaylandToken;
+      ensureInputBackend().catch((error) => {
+        console.warn('[mswnlink] Wayland remote-input restore deferred until control approval:', error.message);
+      });
+    }
   }
   if (wss) return { code: pairingCode, port: PORT, ips: getLanIPv4() };
   pairingCode = persistentAccessCode;
@@ -1093,18 +1149,35 @@ function configureDisplayMediaHandler() {
   if (displayMediaUsingSystemPicker === wantSystemPicker) return;
 
   const handler = async (_request, callback) => {
+    let settled = false;
+    const safeCallback = (payload) => {
+      if (settled) return;
+      settled = true;
+      try { callback(payload); } catch {}
+    };
+    const guardTimer = setTimeout(() => {
+      safeCallback({});
+    }, 60000);
+    if (guardTimer.unref) guardTimer.unref();
+
     try {
-      const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 160, height: 100 } });
-      const source = sources.find(item => item.id === chosenSourceId) || sources[0];
+      const thumbSize = isLinuxWaylandSession ? { width: 0, height: 0 } : { width: 160, height: 100 };
+      const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: thumbSize });
+      if (settled) return;
+      const source = (chosenSourceId && !chosenSourceId.startsWith('wayland-display:')
+        ? sources.find(item => item.id === chosenSourceId)
+        : null) || sources[0];
       if (!source) {
         const perm = getMacPermissionSnapshot();
-        const message = perm.isMac && !perm.granted
-          ? (perm.summary || 'macOS Screen Recording permission is required. Allow mswnlink in System Settings › Privacy & Security › Screen & System Audio Recording.')
-          : 'No capturable display was returned by the operating system.';
-        sendToUI('host-error', { message });
-        if (perm.isMac) sendToUI('mac-permissions-changed', perm);
+        if (perm.isMac && !perm.granted) {
+          const message = perm.summary || 'macOS Screen Recording permission is required. Allow mswnlink in System Settings › Privacy & Security › Screen & System Audio Recording.';
+          sendToUI('host-error', { message });
+          sendToUI('mac-permissions-changed', perm);
+        } else if (!isLinuxWaylandSession) {
+          sendToUI('host-error', { message: 'No capturable display was returned by the operating system.' });
+        }
         // Electron requires an object (`{}`), never `null`, when declining display media.
-        callback({});
+        safeCallback({});
         return;
       }
       if (process.platform === 'darwin') {
@@ -1114,16 +1187,20 @@ function configureDisplayMediaHandler() {
           sendToUI('mac-permissions-changed', getMacPermissionSnapshot());
         });
       }
-      callback({ video: source });
+      safeCallback({ video: source });
     } catch (error) {
       const perm = getMacPermissionSnapshot();
       const message = perm.isMac && !perm.granted && perm.summary
         ? perm.summary
         : screenCaptureErrorMessage(error);
       console.warn('[mswnlink] Screen capture request failed:', message);
-      sendToUI('host-error', { message });
+      if (!isLinuxWaylandSession || !/cancelled|canceled|denied/i.test(String((error && error.message) || ''))) {
+        sendToUI('host-error', { message });
+      }
       if (perm.isMac) sendToUI('mac-permissions-changed', perm);
-      callback({});
+      safeCallback({});
+    } finally {
+      clearTimeout(guardTimer);
     }
   };
 
@@ -1142,6 +1219,11 @@ function configureDisplayMediaHandler() {
 }
 
 app.whenReady().then(async () => {
+  if (process.platform === 'win32') {
+    app.setAppUserModelId('com.mswnlink.lan');
+  } else if (process.platform === 'linux') {
+    ensureLinuxDesktopIconIntegration().catch(() => {});
+  }
   // Windows/Linux: no menu bar. macOS: route Cmd+C/V/X/A/Z through our custom
   // Edit menu handler so shortcuts reach the remote desktop when the viewer
   // stage is focused, while still working normally in local text inputs.
@@ -1305,8 +1387,33 @@ app.whenReady().then(async () => {
     };
   });
 
-  ipcMain.handle('get-sources', async () => {
+  ipcMain.handle('get-sources', async (_event, options = {}) => {
     try {
+      // On Fedora/GNOME Wayland, every desktopCapturer.getSources() call opens a
+      // system-modal XDG ScreenCast portal dialog (including on passive tab switches
+      // and viewer display-list-request messages, which disrupts active streams).
+      // Return native display geometry from `screen.getAllDisplays()` unless the
+      // caller explicitly requests an interactive portal picker.
+      if (isLinuxWaylandSession && (!options || options.allowWaylandPortal !== true)) {
+        const nativeDisplays = screen.getAllDisplays();
+        return nativeDisplays.map((display, index) => ({
+          id: `wayland-display:${display.id}`,
+          name: display.label
+            ? `${display.label} (${display.bounds.width}×${display.bounds.height})`
+            : `Display ${index + 1} (${display.bounds.width}×${display.bounds.height})`,
+          displayId: String(display.id),
+          bounds: {
+            x: display.bounds.x,
+            y: display.bounds.y,
+            width: display.bounds.width,
+            height: display.bounds.height
+          },
+          scaleFactor: Number(display.scaleFactor) || 1,
+          thumbnail: '',
+          waylandPortalManaged: true
+        }));
+      }
+
       const sources = await desktopCapturer.getSources({
         types: ['screen'],
         thumbnailSize: { width: 360, height: 220 },
@@ -1317,9 +1424,6 @@ app.whenReady().then(async () => {
         let display = source.display_id
           ? nativeDisplays.find(item => String(item.id) === String(source.display_id))
           : null;
-        // Some Electron backends (notably older X11/Windows capture paths) omit
-        // or mismatch display_id. Use the documented source label when possible,
-        // otherwise use array order only if there is a one-to-one source/display list.
         if (!display && nativeDisplays.length === sources.length) {
           const match = String(source.name || '').match(/(?:screen|display|monitor)\s*#?\s*(\d+)/i);
           if (match) {
@@ -1346,6 +1450,10 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('choose-source', async (_event, id) => {
     if (typeof id !== 'string') return false;
+    if (isLinuxWaylandSession && id.startsWith('wayland-display:')) {
+      chosenSourceId = id;
+      return true;
+    }
     try {
       const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
       if (!sources.some(source => source.id === id)) return false;
