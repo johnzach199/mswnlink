@@ -146,6 +146,16 @@ function setPage(name, options = {}) {
     button.setAttribute('aria-current', active ? 'page' : 'false');
   });
   document.body.dataset.currentPage = name;
+  const content = $('.content');
+  if (content) content.scrollTop = 0;
+  if (name !== 'session' && document.body.classList.contains('viewer-fullscreen-active')) {
+    document.body.classList.remove('viewer-fullscreen-active');
+    const shellEl = $('#viewer-shell');
+    if (shellEl) shellEl.classList.remove('is-fullscreen');
+    if (typeof window.lanAPI.setWindowFullscreen === 'function') {
+      window.lanAPI.setWindowFullscreen(false).catch(() => {});
+    }
+  }
   if (name === 'share') {
     refreshMacPermissionState().then(() => {
       if (options.refreshSources !== false) return refreshSources();
@@ -1053,8 +1063,11 @@ async function switchSharedDisplay(sourceId, channel) {
     activeCompositeCapture = nextComposite;
     lastCompositeDisplayId = null;
     selectedSourceId = sourceId;
-    track.addEventListener('ended', () => { if (sharingStream === replacement && hostInfo) stopSharing(true); }, { once: true });
-    oldStream.getTracks().forEach(oldTrack => { try { oldTrack.stop(); } catch {} });
+    stopStandbyRecoveryStream();
+    bindHostCaptureTrackLifecycle(replacement, shareSessionEpoch);
+    if (oldStream && oldStream !== replacement) {
+      oldStream.getTracks().forEach(oldTrack => { try { oldTrack.stop(); } catch {} });
+    }
     if (oldComposite && typeof oldComposite.cleanup === 'function') oldComposite.cleanup();
     sendChannelMessage(channel, { kind: 'display-result', ok: true, name: displayName });
     showToast(`Now sharing ${displayName}.`);
@@ -1190,6 +1203,42 @@ async function refreshMacPermissionState() {
   }
 }
 
+let winRdpHandoffCompleted = false;
+
+function syncWinRdpBannerUI() {
+  const banner = $('#win-rdp-banner');
+  if (!banner) return;
+  if (deviceInfo.platform !== 'win32') {
+    banner.hidden = true;
+    return;
+  }
+  const inRdp = Boolean(deviceInfo.rdpSession);
+  const showBanner = inRdp || winRdpHandoffCompleted;
+  banner.hidden = !showBanner;
+  if (!showBanner) return;
+
+  const title = $('#win-rdp-title');
+  const copy = $('#win-rdp-copy');
+  const btn = $('#win-handoff-rdp-button');
+  if (inRdp) {
+    if (title) title.textContent = 'Windows Remote Desktop session detected';
+    if (copy) {
+      copy.textContent = 'Closing Remote Desktop normally disconnects Windows’ display. mswnlink keeps host sharing active and automatically reattaches your local display when Remote Desktop closes — or click below to transfer this session to the local console right now. Turn on “Connect without asking” if no one is at the physical monitor.';
+    }
+    if (btn) {
+      btn.hidden = false;
+      btn.disabled = false;
+      btn.textContent = 'Disconnect RDP & Keep Sharing';
+    }
+  } else {
+    if (title) title.textContent = 'Transferred from Remote Desktop to local Windows console';
+    if (copy) {
+      copy.textContent = 'Your Windows session is attached to the local console display while mswnlink host sharing remains active.';
+    }
+    if (btn) btn.hidden = true;
+  }
+}
+
 async function refreshSources() {
   sourceLoadError = '';
   const grid = $('#source-grid');
@@ -1274,7 +1323,7 @@ async function refreshSources() {
       meta.append(name, radio);
       card.append(image, meta);
       card.addEventListener('click', async () => {
-        if (sharingStream) return;
+        if (sharingStream || hostInfo) return;
         selectedSourceId = source.id;
         const ok = await window.lanAPI.chooseSource(source.id);
         if (!ok) showToast('Could not select this display. Refresh the display list and try again.');
@@ -1289,6 +1338,9 @@ async function refreshSources() {
     await window.lanAPI.chooseSource(selectedSourceId);
     if (deviceInfo.platform === 'darwin') {
       await refreshMacPermissionState();
+    }
+    if (hostInfo || hasLiveSharingStream()) {
+      updateShareUI();
     }
   } catch (error) {
     sources = [];
@@ -1307,11 +1359,223 @@ async function refreshSources() {
 
 let shareSessionEpoch = 0;
 let sharePendingCancelable = false;
+let winCaptureRecoveryPromise = null;
+let standbyCanvasState = null;
 
 function hasLiveSharingStream() {
   if (!sharingStream) return false;
   const tracks = sharingStream.getVideoTracks();
   return tracks.length > 0 && tracks.some(track => track.readyState !== 'ended');
+}
+
+function isStandbyRecoveryStream(stream) {
+  return Boolean(stream && stream.__mswnlinkStandby === true);
+}
+
+function stopStandbyRecoveryStream() {
+  const activeStandby = standbyCanvasState;
+  standbyCanvasState = null;
+  if (activeStandby && typeof activeStandby.cleanup === 'function') {
+    try { activeStandby.cleanup(); } catch {}
+  }
+}
+
+function createStandbyRecoveryStream() {
+  stopStandbyRecoveryStream();
+  const canvas = document.createElement('canvas');
+  canvas.width = 1280;
+  canvas.height = 720;
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const draw = () => {
+    if (!ctx) return;
+    ctx.fillStyle = '#0d1422';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#14b8a6';
+    ctx.fillRect(88, 256, 72, 6);
+    ctx.fillStyle = '#f1f5f9';
+    ctx.font = '600 26px system-ui, -apple-system, Segoe UI, sans-serif';
+    ctx.fillText('Reattaching Windows display after Remote Desktop closed…', 88, 306);
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '400 17px system-ui, -apple-system, Segoe UI, sans-serif';
+    ctx.fillText('mswnlink host sharing is still active. Switching to the local console display automatically.', 88, 344);
+  };
+  draw();
+  const timer = setInterval(draw, 500);
+  const stream = canvas.captureStream(15);
+  stream.__mswnlinkStandby = true;
+  const cleanup = () => {
+    clearInterval(timer);
+    stream.getTracks().forEach(track => {
+      try { track.stop(); } catch {}
+    });
+  };
+  standbyCanvasState = { stream, cleanup };
+  return standbyCanvasState;
+}
+
+function pickReplacementWindowsSource(candidateSources, previousId, preferredDisplayId) {
+  if (!Array.isArray(candidateSources) || !candidateSources.length) return null;
+  const valid = candidateSources.filter(
+    item => item && typeof item.id === 'string' && item.id.trim() && !item.id.startsWith('wayland-display:')
+  );
+  if (!valid.length) return null;
+  if (previousId) {
+    const exact = valid.find(item => item.id === previousId);
+    if (exact) return exact;
+  }
+  if (preferredDisplayId) {
+    const byDisplay = valid.find(item => String(item.displayId || '') === String(preferredDisplayId));
+    if (byDisplay) return byDisplay;
+  }
+  return valid[0];
+}
+
+async function replaceActiveHostVideoTrack(nextStream, epoch, isStandby = false) {
+  const nextTrack = nextStream && nextStream.getVideoTracks()[0];
+  if (!nextTrack) throw new Error('Replacement capture stream has no video track.');
+  try { nextTrack.contentHint = 'detail'; } catch {}
+  const previousStream = sharingStream;
+  const previousComposite = activeCompositeCapture;
+  sharingStream = nextStream;
+  if (!isStandby) {
+    activeCompositeCapture = null;
+    lastCompositeDisplayId = null;
+    bindHostCaptureTrackLifecycle(nextStream, epoch);
+  }
+  if (hostPeer && typeof hostPeer.getSenders === 'function') {
+    const sender = hostPeer.getSenders().find(
+      item => (item && item.track && item.track.kind === 'video') || (item && !item.track)
+    );
+    if (sender && typeof sender.replaceTrack === 'function') {
+      try {
+        await sender.replaceTrack(nextTrack);
+      } catch (error) {
+        console.warn('[mswnlink] Could not hot-swap host video track on active peer:', error.message || error);
+      }
+    }
+  }
+  if (previousStream && previousStream !== nextStream && !isStandbyRecoveryStream(previousStream)) {
+    previousStream.getTracks().forEach(oldTrack => {
+      try { oldTrack.stop(); } catch {}
+    });
+  }
+  if (!isStandby) {
+    stopStandbyRecoveryStream();
+    if (previousComposite && typeof previousComposite.cleanup === 'function') {
+      try { previousComposite.cleanup(); } catch {}
+    }
+  }
+  updateShareUI();
+}
+
+function bindHostCaptureTrackLifecycle(stream, epoch) {
+  if (!stream || isStandbyRecoveryStream(stream)) return;
+  stream.getVideoTracks().forEach((track) => {
+    try { track.contentHint = 'detail'; } catch {}
+    track.addEventListener('ended', () => {
+      if (epoch !== shareSessionEpoch || sharingStream !== stream) return;
+      if (deviceInfo.platform === 'win32') {
+        // On Windows, closing Remote Desktop (mstsc.exe), UAC secure-desktop prompts,
+        // or display driver resets end the virtual RDPDD DXGI output track even though
+        // the user did NOT click Stop sharing. Keep the host listener and WebRTC peer
+        // alive and automatically reacquire the local console display!
+        console.info('[mswnlink] Windows display track ended; keeping host share alive and reattaching local display.');
+        recoverWindowsHostCapture(epoch, 'track-ended').catch((err) => {
+          console.warn('[mswnlink] Windows capture recovery error:', err && err.message ? err.message : err);
+        });
+        return;
+      }
+      stopSharing(true).catch(() => {});
+    }, { once: true });
+  });
+}
+
+async function recoverWindowsHostCapture(epoch = shareSessionEpoch, reason = 'track-ended') {
+  if (deviceInfo.platform !== 'win32' || epoch !== shareSessionEpoch) return false;
+  if (winCaptureRecoveryPromise) return winCaptureRecoveryPromise;
+
+  winCaptureRecoveryPromise = (async () => {
+    const previousSelected = selectedSourceId;
+    const prevMeta = sources.find(item => item.id === previousSelected);
+    const preferredDisplayId = prevMeta && prevMeta.displayId ? String(prevMeta.displayId) : '';
+
+    // Install an immediate live standby stream so sharingStream is never null/ended
+    // while Windows transitions from the closed RDP virtual display to the physical console.
+    if (!hasLiveSharingStream()) {
+      const standby = createStandbyRecoveryStream();
+      await replaceActiveHostVideoTrack(standby.stream, epoch, true);
+    }
+
+    const profile = SHARE_PROFILES[activeShareQuality] || SHARE_PROFILES.balanced;
+    const retryDelays = [60, 220, 450, 800, 1200, 1600, 2000];
+
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      if (epoch !== shareSessionEpoch) return false;
+      const waitMs = retryDelays[Math.min(attempt, retryDelays.length - 1)];
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+      if (epoch !== shareSessionEpoch) return false;
+
+      let candidateList = [];
+      try {
+        if (typeof window.lanAPI.recoverWindowsCapture === 'function') {
+          const probe = await window.lanAPI.recoverWindowsCapture();
+          if (probe && typeof probe.rdpSession === 'boolean') {
+            if (deviceInfo.rdpSession && !probe.rdpSession) winRdpHandoffCompleted = true;
+            deviceInfo.rdpSession = probe.rdpSession;
+            syncWinRdpBannerUI();
+          }
+          if (probe && Array.isArray(probe.sources) && probe.sources.length) {
+            candidateList = probe.sources;
+          }
+        }
+        if (!candidateList.length) {
+          candidateList = await window.lanAPI.getSources();
+        }
+      } catch {
+        candidateList = [];
+      }
+
+      if (!candidateList.length || epoch !== shareSessionEpoch) continue;
+
+      const primaryChoice = pickReplacementWindowsSource(
+        candidateList,
+        reason === 'rdp-handoff' ? '' : previousSelected,
+        preferredDisplayId
+      );
+      const orderedCandidates = primaryChoice
+        ? [primaryChoice, ...candidateList.filter(item => item && item.id !== primaryChoice.id)]
+        : candidateList;
+
+      for (const candidate of orderedCandidates) {
+        if (!candidate || !candidate.id || epoch !== shareSessionEpoch) continue;
+        let captured = null;
+        try {
+          captured = await captureDesktopSource(candidate.id, profile);
+          const vt = captured && captured.getVideoTracks()[0];
+          if (!vt || vt.readyState === 'ended') {
+            if (captured) captured.getTracks().forEach(t => { try { t.stop(); } catch {} });
+            continue;
+          }
+          selectedSourceId = candidate.id;
+          sources = candidateList;
+          window.lanAPI.chooseSource(candidate.id).catch(() => {});
+          await replaceActiveHostVideoTrack(captured, epoch, false);
+          refreshSources().catch(() => {});
+          showToast(`Display reattached (${candidate.name || 'Local display'}) — sharing stayed active.`);
+          return true;
+        } catch {
+          if (captured) captured.getTracks().forEach(t => { try { t.stop(); } catch {} });
+        }
+      }
+    }
+    return false;
+  })();
+
+  try {
+    return await winCaptureRecoveryPromise;
+  } finally {
+    winCaptureRecoveryPromise = null;
+  }
 }
 
 function updateShareUI() {
@@ -1429,14 +1693,7 @@ async function startSharing() {
       throw new Error('Screen capture ended before sharing could start.');
     }
     sharingStream = stream;
-    videoTracks.forEach(track => {
-      try { track.contentHint = 'detail'; } catch {}
-      track.addEventListener('ended', () => {
-        if (sharingStream === stream) {
-          stopSharing(true).catch(() => {});
-        }
-      }, { once: true });
-    });
+    bindHostCaptureTrackLifecycle(stream, epoch);
     if (deviceInfo.platform === 'darwin') {
       await refreshMacPermissionState();
     }
@@ -1444,19 +1701,32 @@ async function startSharing() {
       await refreshSources().catch(() => {});
     }
     const startedHost = await window.lanAPI.startHost();
-    if (epoch !== shareSessionEpoch || sharingStream !== stream || stream.getVideoTracks().every(track => track.readyState === 'ended')) {
+    if (epoch !== shareSessionEpoch) {
       stream.getTracks().forEach(track => { try { track.stop(); } catch {} });
-      if (epoch === shareSessionEpoch) {
-        await stopSharing(true);
-      }
+      return;
+    }
+    if (
+      deviceInfo.platform !== 'win32' &&
+      (sharingStream !== stream || stream.getVideoTracks().every(track => track.readyState === 'ended'))
+    ) {
+      stream.getTracks().forEach(track => { try { track.stop(); } catch {} });
+      await stopSharing(true);
       return;
     }
     hostInfo = startedHost;
+    if (startedHost && typeof startedHost.rdpSession === 'boolean') {
+      deviceInfo.rdpSession = startedHost.rdpSession;
+      syncWinRdpBannerUI();
+    }
+    if (deviceInfo.platform === 'win32' && (!hasLiveSharingStream() || isStandbyRecoveryStream(sharingStream))) {
+      recoverWindowsHostCapture(epoch, 'startup-reattach').catch(() => {});
+    }
     sharePendingCancelable = false;
     updateShareUI();
     showToast('Sharing is active. Share the LAN address and your permanent access code with the person connecting.');
   } catch (error) {
     if (epoch !== shareSessionEpoch) return;
+    stopStandbyRecoveryStream();
     if (sharingStream) sharingStream.getTracks().forEach(track => { try { track.stop(); } catch {} });
     if (activeCompositeCapture && typeof activeCompositeCapture.cleanup === 'function') activeCompositeCapture.cleanup();
     activeCompositeCapture = null;
@@ -1505,6 +1775,7 @@ async function stopSharing(fromSystem = false) {
   const streamToStop = sharingStream;
   sharingStream = null;
   hostInfo = null;
+  stopStandbyRecoveryStream();
   if (streamToStop) {
     streamToStop.getTracks().forEach(track => {
       try { track.stop(); } catch {}
@@ -1605,6 +1876,9 @@ function closeHostPeer() {
 
 async function createHostPeer() {
   if (hostPeer) return hostPeer;
+  if (deviceInfo.platform === 'win32' && hostInfo && (!hasLiveSharingStream() || isStandbyRecoveryStream(sharingStream))) {
+    await recoverWindowsHostCapture(shareSessionEpoch, 'peer-connect').catch(() => {});
+  }
   if (!sharingStream) throw new Error('Screen sharing is not active.');
   const peer = new RTCPeerConnection({ iceServers: [] });
   hostPeer = peer;
@@ -2332,6 +2606,81 @@ const NON_PRINTABLE_KEY_NAMES = new Set([
 const sentRawKeyCodes = new Set();
 let remoteComposing = false;
 let remoteDeadKeyPending = false;
+let pendingDeadAccent = null;
+let lastDirectFlushedText = '';
+let lastDirectFlushedAt = 0;
+
+const CLIENT_DEAD_ACUTE_MAP = new Map([
+  ['α', 'ά'], ['ε', 'έ'], ['η', 'ή'], ['ι', 'ί'], ['ο', 'ό'], ['υ', 'ύ'], ['ω', 'ώ'],
+  ['Α', 'Ά'], ['Ε', 'Έ'], ['Η', 'Ή'], ['Ι', 'Ί'], ['Ο', 'Ό'], ['Υ', 'Ύ'], ['Ω', 'Ώ'],
+  ['ϊ', 'ΐ'], ['ϋ', 'ΰ'],
+  ['a', 'á'], ['e', 'é'], ['i', 'í'], ['o', 'ó'], ['u', 'ú'], ['y', 'ý'], ['c', 'ć'], ['n', 'ń'], ['s', 'ś'], ['z', 'ź'],
+  ['A', 'Á'], ['E', 'É'], ['I', 'Í'], ['O', 'Ó'], ['U', 'Ú'], ['Y', 'Ý'], ['C', 'Ć'], ['N', 'Ń'], ['S', 'Ś'], ['Z', 'Ź'],
+  [' ', "'"]
+]);
+const CLIENT_DEAD_DIAERESIS_MAP = new Map([
+  ['ι', 'ϊ'], ['υ', 'ϋ'], ['Ι', 'Ϊ'], ['Υ', 'Ϋ'],
+  ['a', 'ä'], ['e', 'ë'], ['i', 'ï'], ['o', 'ö'], ['u', 'ü'], ['y', 'ÿ'],
+  ['A', 'Ä'], ['E', 'Ë'], ['I', 'Ï'], ['O', 'Ö'], ['U', 'Ü'], ['Y', 'Ÿ'],
+  [' ', '¨']
+]);
+const CLIENT_DEAD_DIALYTIKA_ACUTE_MAP = new Map([
+  ['ι', 'ΐ'], ['υ', 'ΰ'], ['Ι', 'Ί'], ['Υ', 'Ύ'],
+  [' ', '΅']
+]);
+const CLIENT_DEAD_GRAVE_MAP = new Map([
+  ['a', 'à'], ['e', 'è'], ['i', 'ì'], ['o', 'ò'], ['u', 'ù'],
+  ['A', 'À'], ['E', 'È'], ['I', 'Ì'], ['O', 'Ò'], ['U', 'Ù'],
+  [' ', '`']
+]);
+const CLIENT_DEAD_CIRCUMFLEX_MAP = new Map([
+  ['a', 'â'], ['e', 'ê'], ['i', 'î'], ['o', 'ô'], ['u', 'û'],
+  ['A', 'Â'], ['E', 'Ê'], ['I', 'Î'], ['O', 'Ô'], ['U', 'Û'],
+  [' ', '^']
+]);
+const CLIENT_DEAD_TILDE_MAP = new Map([
+  ['a', 'ã'], ['n', 'ñ'], ['o', 'õ'],
+  ['A', 'Ã'], ['N', 'Ñ'], ['O', 'Õ'],
+  [' ', '~']
+]);
+
+function detectClientDeadKeyAccent(event) {
+  if (!event) return null;
+  const key = String(event.key || '');
+  const code = String(event.code || '');
+  const shift = Boolean(event.shiftKey);
+  const altGr = Boolean(
+    (event.getModifierState && event.getModifierState('AltGraph')) ||
+    (event.ctrlKey && event.altKey)
+  );
+  if (key === '\u0385' || key === '΅') return 'dialytika_acute';
+  if (key === '\u0384' || key === '΄' || key === '´') return 'acute';
+  if (key === '¨') return 'diaeresis';
+  if (key !== 'Dead') return null;
+  if (code === 'Semicolon') {
+    if (shift && altGr) return 'dialytika_acute';
+    return shift ? 'diaeresis' : 'acute';
+  }
+  if (code === 'KeyW' && shift) return 'dialytika_acute';
+  if (code === 'Quote') return shift ? 'diaeresis' : 'acute';
+  if (code === 'Backquote') return shift ? 'tilde' : 'grave';
+  if (code === 'Digit6' && shift) return 'circumflex';
+  return 'acute';
+}
+
+function composeClientDeadKey(accent, baseKey) {
+  const ch = String(baseKey || '');
+  if (!ch || !accent) return ch;
+  switch (accent) {
+    case 'acute': return CLIENT_DEAD_ACUTE_MAP.get(ch) || ch;
+    case 'diaeresis': return CLIENT_DEAD_DIAERESIS_MAP.get(ch) || ch;
+    case 'dialytika_acute': return CLIENT_DEAD_DIALYTIKA_ACUTE_MAP.get(ch) || CLIENT_DEAD_ACUTE_MAP.get(ch) || ch;
+    case 'grave': return CLIENT_DEAD_GRAVE_MAP.get(ch) || ch;
+    case 'circumflex': return CLIENT_DEAD_CIRCUMFLEX_MAP.get(ch) || ch;
+    case 'tilde': return CLIENT_DEAD_TILDE_MAP.get(ch) || ch;
+    default: return ch;
+  }
+}
 
 function focusRemoteViewerInput() {
   const capture = document.getElementById(REMOTE_CAPTURE_ID);
@@ -2396,11 +2745,22 @@ async function triggerRemoteEditShortcut(action, explicitPasteText = null) {
   return sendInput({ kind: 'shortcut', action });
 }
 
-function flushCapturedRemoteText(rawText) {
+function flushCapturedRemoteText(rawText, options = {}) {
   const cleaned = String(rawText || '').replace(/[\r\n\u0000-\u001f\u007f]/g, '');
   if (!cleaned) return;
   if (!clientConnected || !controlGranted || !pages.session.classList.contains('page-active')) return;
-  sendInput({ kind: 'text', text: cleaned });
+  const now = performance.now();
+  if (!options.markDirect && cleaned === lastDirectFlushedText && (now - lastDirectFlushedAt) < 40) {
+    return;
+  }
+  if (options.markDirect) {
+    lastDirectFlushedText = cleaned;
+    lastDirectFlushedAt = now;
+  }
+  const payload = { kind: 'text', text: cleaned };
+  if (typeof options.code === 'string' && options.code) payload.code = options.code;
+  if (typeof options.shiftKey === 'boolean') payload.shiftKey = options.shiftKey;
+  sendInput(payload);
 }
 
 function isSpecialOrNavigationKey(event) {
@@ -2414,7 +2774,16 @@ function isSpecialOrNavigationKey(event) {
 }
 
 function handleRemoteKey(event, action) {
-  if (!clientConnected || !controlGranted || !pages.session.classList.contains('page-active')) return;
+  // Allow F11 on non-session pages (such as Host "Share this PC") to toggle clean window fullscreen.
+  if (!pages.session.classList.contains('page-active')) {
+    if (action === 'down' && !event.repeat && (event.code === 'F11' || event.key === 'F11') && typeof window.lanAPI.setWindowFullscreen === 'function') {
+      event.preventDefault();
+      const nextFs = !document.body.classList.contains('native-window-fullscreen');
+      window.lanAPI.setWindowFullscreen(nextFs).catch(() => {});
+    }
+    return;
+  }
+  if (!clientConnected || !controlGranted) return;
   if (isEditableLocalElement(event.target)) return;
   // Escape must stay local so users can leave fullscreen. Keep Alt+Tab and
   // Ctrl+Alt+Delete local as OS-level shortcuts that remote injection cannot
@@ -2447,6 +2816,7 @@ function handleRemoteKey(event, action) {
   const remoteShortcut = detectViewerShortcut(event);
   if (remoteShortcut) {
     remoteDeadKeyPending = false;
+    pendingDeadAccent = null;
     event.preventDefault();
     if (action === 'down' && !event.repeat) {
       triggerRemoteEditShortcut(remoteShortcut).catch(error => {
@@ -2456,10 +2826,29 @@ function handleRemoteKey(event, action) {
     return;
   }
 
-  // Let dead keys (Greek tonos `;` + `ε` -> `έ`, US-Intl dead `'` + Space -> `'`) and
-  // OS IME compositions flow into #remote-input-capture without preventDefault().
-  const isDeadOrIme = key === 'Dead' || key === 'Process' || event.isComposing || remoteComposing || event.keyCode === 229;
-  if (isDeadOrIme) {
+  // Handle Greek tonos (`;` + `ε` -> `έ`), dialytika (`¨` + `ι` -> `ϊ`), and US-Intl dead keys
+  // deterministically in JS so Fedora XWayland never drops accents when DOM composition skips.
+  const detectedAccent = detectClientDeadKeyAccent(event);
+  if (detectedAccent && !event.isComposing && !remoteComposing) {
+    event.preventDefault();
+    if (action === 'down' && !event.repeat) {
+      if (pendingDeadAccent === 'diaeresis' && detectedAccent === 'acute') {
+        pendingDeadAccent = 'dialytika_acute';
+      } else if (pendingDeadAccent === 'acute' && detectedAccent === 'diaeresis') {
+        pendingDeadAccent = 'dialytika_acute';
+      } else {
+        pendingDeadAccent = detectedAccent;
+      }
+      remoteDeadKeyPending = true;
+      const capture = document.getElementById(REMOTE_CAPTURE_ID);
+      if (capture) capture.value = '';
+    }
+    return;
+  }
+
+  // Let multi-keystroke CJK/Pinyin OS IME compositions flow into #remote-input-capture.
+  const isImeComposition = key === 'Process' || event.isComposing || remoteComposing || event.keyCode === 229;
+  if (isImeComposition) {
     if (action === 'down') {
       remoteDeadKeyPending = true;
       const capture = document.getElementById(REMOTE_CAPTURE_ID);
@@ -2480,7 +2869,7 @@ function handleRemoteKey(event, action) {
   const isSpecial = isSpecialOrNavigationKey(event);
 
   // Spacebar: send native VK_SPACE / evdev Space for UI buttons & games UNLESS finishing a dead key (e.g. dead `'` + Space -> `'`).
-  if (isSpaceKey && !remoteDeadKeyPending && !hasCommandModifier) {
+  if (isSpaceKey && !remoteDeadKeyPending && !pendingDeadAccent && !hasCommandModifier) {
     if (action === 'down' && event.repeat) { event.preventDefault(); return; }
     event.preventDefault();
     if (action === 'down' && code) sentRawKeyCodes.add(code);
@@ -2500,29 +2889,34 @@ function handleRemoteKey(event, action) {
   }
 
   // Printable text characters (including "'", '"', and Greek letters like "έχω")
-  // without Ctrl/Cmd/Alt modifiers:
+  // without Ctrl/Cmd/Alt modifiers: dispatch IMMEDIATELY on keydown instead of relying
+  // on #remote-input-capture firing `input` (which XWayland/fullscreen can suppress).
   const isPrintableText = !hasCommandModifier && !isSpecial && (
-    (isSpaceKey && remoteDeadKeyPending) ||
+    (isSpaceKey && (remoteDeadKeyPending || Boolean(pendingDeadAccent))) ||
     (!isSpaceKey && key.length >= 1 && !/[\u0000-\u001f\u007f]/.test(key) && key !== 'Unidentified')
   );
 
   if (isPrintableText) {
-    remoteDeadKeyPending = false;
-    const capture = document.getElementById(REMOTE_CAPTURE_ID);
-    if (capture && document.activeElement === capture) {
-      // Allow browser/OS to commit into #remote-input-capture (completing any active dead-key accent);
-      // its `input` listener immediately flushes { kind: 'text', text } to the host.
-      return;
-    }
     event.preventDefault();
+    const capture = document.getElementById(REMOTE_CAPTURE_ID);
+    if (capture) capture.value = '';
     if (action === 'down') {
-      flushCapturedRemoteText(key);
-      focusRemoteViewerInput();
+      const composed = pendingDeadAccent ? composeClientDeadKey(pendingDeadAccent, isSpaceKey ? ' ' : key) : key;
+      pendingDeadAccent = null;
+      remoteDeadKeyPending = false;
+      flushCapturedRemoteText(composed, {
+        code,
+        shiftKey: Boolean(event.shiftKey),
+        markDirect: true
+      });
     }
     return;
   }
 
-  remoteDeadKeyPending = false;
+  if (action === 'down' && !isSpecial) {
+    pendingDeadAccent = null;
+    remoteDeadKeyPending = false;
+  }
   if (action === 'down' && event.repeat) { event.preventDefault(); return; }
   event.preventDefault();
   if (action === 'down' && code) sentRawKeyCodes.add(code);
@@ -2551,6 +2945,7 @@ function installRemoteKeyboardCapture() {
     capture.addEventListener('compositionend', (event) => {
       remoteComposing = false;
       remoteDeadKeyPending = false;
+      pendingDeadAccent = null;
       const text = capture.value || (event && typeof event.data === 'string' ? event.data : '');
       capture.value = '';
       flushCapturedRemoteText(text);
@@ -2558,6 +2953,7 @@ function installRemoteKeyboardCapture() {
     capture.addEventListener('input', (event) => {
       if (remoteComposing || (event && event.isComposing)) return;
       remoteDeadKeyPending = false;
+      pendingDeadAccent = null;
       const text = capture.value;
       if (!text) return;
       capture.value = '';
@@ -2725,6 +3121,33 @@ async function initialize() {
       showToast('Cleared stale macOS permission entry. Approve the new prompt or toggle mswnlink back on.');
     }
   });
+  wireAction('win-handoff-rdp-button', async () => {
+    if (typeof window.lanAPI.handoffWindowsRdp !== 'function') return;
+    const btn = $('#win-handoff-rdp-button');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Transferring to local console…';
+    }
+    const res = await window.lanAPI.handoffWindowsRdp();
+    if (!res || !res.ok) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Disconnect RDP & Keep Sharing';
+      }
+      throw new Error((res && res.error) || 'Could not transfer Remote Desktop to local console.');
+    }
+    deviceInfo.rdpSession = false;
+    winRdpHandoffCompleted = true;
+    syncWinRdpBannerUI();
+    if (hostInfo) {
+      recoverWindowsHostCapture(shareSessionEpoch, 'rdp-handoff').catch(() => {});
+      showToast('Remote Desktop transferred to local Windows console — mswnlink sharing remains active.');
+    } else {
+      await refreshSources().catch(() => {});
+      showToast('Remote Desktop transferred to local Windows console.');
+    }
+  });
+  syncWinRdpBannerUI();
 
   updateSessionFeatureUI();
 
@@ -2827,36 +3250,96 @@ async function initialize() {
   });
   const viewerShell = $('#viewer-shell');
   const fullscreenButton = $('#fullscreen-button');
+  const fullscreenExitOverlay = $('#fullscreen-exit-overlay');
+  let viewerCssFullscreen = false;
+
+  function isViewerFullscreenActive() {
+    const domFs = document.fullscreenElement || document.webkitFullscreenElement;
+    return domFs === viewerShell || viewerCssFullscreen;
+  }
+
+  function applyViewerFullscreenClasses(active) {
+    viewerShell.classList.toggle('is-fullscreen', Boolean(active));
+    document.body.classList.toggle('viewer-fullscreen-active', Boolean(active));
+  }
+
   function syncFullscreenButton() {
-    const active = document.fullscreenElement || document.webkitFullscreenElement;
-    const isFullscreen = active === viewerShell;
+    const isFullscreen = isViewerFullscreenActive();
+    applyViewerFullscreenClasses(isFullscreen);
     fullscreenButton.textContent = isFullscreen ? 'Exit full screen' : 'Full screen';
     fullscreenButton.setAttribute('aria-label', isFullscreen ? 'Exit full screen' : 'Show remote desktop fullscreen');
     fullscreenButton.title = isFullscreen ? 'Exit full screen (Esc)' : 'Fit remote desktop to the whole screen';
   }
-  const fullscreenExitOverlay = $('#fullscreen-exit-overlay');
+
+  async function exitViewerFullscreen() {
+    viewerCssFullscreen = false;
+    applyViewerFullscreenClasses(false);
+    const domFs = document.fullscreenElement || document.webkitFullscreenElement;
+    if (domFs) {
+      try {
+        if (document.exitFullscreen) await document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      } catch {}
+    }
+    if (typeof window.lanAPI.setWindowFullscreen === 'function') {
+      await window.lanAPI.setWindowFullscreen(false).catch(() => {});
+    }
+    syncFullscreenButton();
+  }
+
   async function toggleViewerFullscreen(event) {
     if (event) {
       event.preventDefault();
       event.stopPropagation();
     }
     try {
-      const active = document.fullscreenElement || document.webkitFullscreenElement;
-      if (active === viewerShell) {
-        if (document.exitFullscreen) await document.exitFullscreen();
-        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
-      } else if (viewerShell.requestFullscreen) {
-        await viewerShell.requestFullscreen();
-      } else if (viewerShell.webkitRequestFullscreen) {
-        viewerShell.webkitRequestFullscreen();
-      } else {
-        showToast('Full screen is not available in this environment.');
+      if (isViewerFullscreenActive()) {
+        await exitViewerFullscreen();
+        return;
       }
-    } catch { showToast('Full screen is not available in this environment.'); }
+      // On Electron desktop (especially Fedora GNOME + XWayland frameless windows),
+      // element.requestFullscreen() sets 100vh to full monitor height while GNOME's
+      // 32px top panel can still overlap y=0..32, hiding the top of the shared screen.
+      // Using BrowserWindow.setFullScreen(true) + inset:0 client-bounds CSS ensures
+      // 100% of the top of the remote screen is visible without clipping.
+      if (typeof window.lanAPI.setWindowFullscreen === 'function') {
+        viewerCssFullscreen = true;
+        applyViewerFullscreenClasses(true);
+        await window.lanAPI.setWindowFullscreen(true).catch(() => {});
+        syncFullscreenButton();
+      } else if (viewerShell.requestFullscreen) {
+        viewerCssFullscreen = true;
+        applyViewerFullscreenClasses(true);
+        await viewerShell.requestFullscreen().catch(() => {});
+        syncFullscreenButton();
+      } else if (viewerShell.webkitRequestFullscreen) {
+        viewerCssFullscreen = true;
+        applyViewerFullscreenClasses(true);
+        viewerShell.webkitRequestFullscreen();
+        syncFullscreenButton();
+      } else {
+        viewerCssFullscreen = true;
+        applyViewerFullscreenClasses(true);
+        syncFullscreenButton();
+      }
+    } catch {
+      viewerCssFullscreen = true;
+      applyViewerFullscreenClasses(true);
+      syncFullscreenButton();
+    }
   }
   fullscreenButton.addEventListener('click', toggleViewerFullscreen);
   fullscreenExitOverlay.addEventListener('click', toggleViewerFullscreen);
+  window.addEventListener('keydown', (event) => {
+    if ((event.key === 'Escape' || event.code === 'Escape') && isViewerFullscreenActive()) {
+      exitViewerFullscreen().catch(() => {});
+    }
+  });
   const resumeViewerVideo = () => {
+    const domFs = document.fullscreenElement || document.webkitFullscreenElement;
+    if (!domFs && typeof window.lanAPI.setWindowFullscreen !== 'function') {
+      viewerCssFullscreen = false;
+    }
     const video = $('#remote-video');
     if (video && video.srcObject && video.paused) video.play().catch(error => console.debug('[mswnlink] Viewer playback resume deferred:', error.message || error));
     syncFullscreenButton();
@@ -2925,6 +3408,7 @@ async function initialize() {
     pressedRemoteButtons.clear();
     sentRawKeyCodes.clear();
     remoteDeadKeyPending = false;
+    pendingDeadAccent = null;
     remoteComposing = false;
     const capture = document.getElementById(REMOTE_CAPTURE_ID);
     if (capture) capture.value = '';
@@ -2974,6 +3458,7 @@ async function initialize() {
     closeHostPeer();
     hostPeerDetails = null;
     hostControlAllowed = false;
+    stopStandbyRecoveryStream();
     if (sharingStream) sharingStream.getTracks().forEach(track => { try { track.stop(); } catch {} });
     sharingStream = null;
     hostInfo = null;
@@ -2982,6 +3467,18 @@ async function initialize() {
     $('#share-toggle').disabled = false;
     $('#incoming-modal').hidden = true;
     updateShareUI();
+  });
+  window.lanAPI.on('host-display-changed', (payload = {}) => {
+    if (typeof payload.rdpSession === 'boolean') {
+      if (deviceInfo.rdpSession && !payload.rdpSession) winRdpHandoffCompleted = true;
+      deviceInfo.rdpSession = payload.rdpSession;
+      syncWinRdpBannerUI();
+    }
+    if (deviceInfo.platform === 'win32' && hostInfo) {
+      if (!hasLiveSharingStream() || isStandbyRecoveryStream(sharingStream)) {
+        recoverWindowsHostCapture(shareSessionEpoch, 'display-changed').catch(() => {});
+      }
+    }
   });
   window.lanAPI.on('host-error', (error) => showShareError(error.message || 'The host service encountered an error.'));
   window.lanAPI.on('peer-accepted', ({ peer, mode, unattended = false }) => {
@@ -3027,7 +3524,22 @@ function initializeWindowChrome() {
     } catch (error) { showToast(`Could not resize window: ${error.message}`); }
   });
   close?.addEventListener('click', () => { window.lanAPI.closeWindow().catch(error => showToast(`Could not close application: ${error.message}`)); });
-  window.lanAPI.on('window-state', state => syncWindowMaximizeButton(Boolean(state && state.maximized)));
+  window.lanAPI.on('window-state', (state) => {
+    const isMax = Boolean(state && state.maximized);
+    const isFs = Boolean(state && state.fullscreen);
+    document.body.classList.toggle('native-window-fullscreen', isFs);
+    if (!isFs && document.body.classList.contains('viewer-fullscreen-active')) {
+      document.body.classList.remove('viewer-fullscreen-active');
+      const shellEl = $('#viewer-shell');
+      if (shellEl) shellEl.classList.remove('is-fullscreen');
+      const fsBtn = $('#fullscreen-button');
+      if (fsBtn) {
+        fsBtn.textContent = 'Full screen';
+        fsBtn.setAttribute('aria-label', 'Show remote desktop fullscreen');
+      }
+    }
+    syncWindowMaximizeButton(isMax);
+  });
   syncWindowMaximizeButton(false);
 }
 

@@ -31,7 +31,11 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn, execFileSync } = require('node:child_process');
-const { mapWin32VirtualKey, shortcutDescriptorForPlatform } = require('./lib/input-protocol');
+const {
+  mapWin32VirtualKey,
+  shortcutDescriptorForPlatform,
+  isWindowsRdpEnv
+} = require('./lib/input-protocol');
 
 const WORKER_SCRIPT = String.raw`
 param(
@@ -44,7 +48,10 @@ $ErrorActionPreference = 'Stop'
 $code = @"
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 
 public static class MswnlinkWin32Worker {
     [StructLayout(LayoutKind.Sequential)]
@@ -86,6 +93,36 @@ public static class MswnlinkWin32Worker {
         public int Bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct STARTUPINFO {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public uint dwProcessId;
+        public uint dwThreadId;
+    }
+
     public const uint INPUT_MOUSE = 0;
     public const uint INPUT_KEYBOARD = 1;
 
@@ -110,6 +147,13 @@ public static class MswnlinkWin32Worker {
     public const int SM_YVIRTUALSCREEN = 77;
     public const int SM_CXVIRTUALSCREEN = 78;
     public const int SM_CYVIRTUALSCREEN = 79;
+    public const int SM_REMOTESESSION = 0x1000;
+
+    public const int WTSConnectState = 8;
+    public const int WTSActive = 0;
+    public const int WTSDisconnected = 4;
+    public const uint CREATE_NO_WINDOW = 0x08000000;
+    public const uint DESKTOP_ALL_ACCESS = 0x01FF;
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
@@ -141,6 +185,56 @@ public static class MswnlinkWin32Worker {
     [DllImport("kernel32.dll")]
     public static extern uint GetCurrentThreadId();
 
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentProcessId();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ProcessIdToSessionId(uint dwProcessId, out uint pSessionId);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool CreateProcessW(
+        string lpApplicationName,
+        StringBuilder lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("wtsapi32.dll", SetLastError = true)]
+    public static extern bool WTSQuerySessionInformation(
+        IntPtr hServer,
+        int sessionId,
+        int wtsInfoClass,
+        out IntPtr ppBuffer,
+        out int pBytesReturned
+    );
+
+    [DllImport("wtsapi32.dll")]
+    public static extern void WTSFreeMemory(IntPtr memory);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetThreadDesktop(IntPtr hDesktop);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool CloseDesktop(IntPtr hDesktop);
+
     [DllImport("user32.dll")]
     public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
 
@@ -157,6 +251,10 @@ public static class MswnlinkWin32Worker {
     private static Dictionary<ushort, bool> heldKeys = new Dictionary<ushort, bool>();
     private static int lastTargetX = 0;
     private static int lastTargetY = 0;
+    private static volatile bool keepConsoleEnabled = false;
+    private static Timer rdpWatchdogTimer = null;
+    private static int rdpWatchdogBusy = 0;
+    private static int lastConsoleRedirectTick = 0;
 
     public static void InitDpi() {
         try { SetProcessDpiAwarenessContext((IntPtr)(-4)); }
@@ -171,6 +269,151 @@ public static class MswnlinkWin32Worker {
         } catch {
             return false;
         }
+    }
+
+    public static bool IsRemoteSession() {
+        try {
+            return GetSystemMetrics(SM_REMOTESESSION) != 0;
+        } catch {
+            return false;
+        }
+    }
+
+    public static int GetSessionConnectState(out uint sessionId) {
+        sessionId = 0;
+        try {
+            if (!ProcessIdToSessionId(GetCurrentProcessId(), out sessionId)) return -1;
+            IntPtr buffer = IntPtr.Zero;
+            int bytesReturned = 0;
+            if (!WTSQuerySessionInformation(IntPtr.Zero, (int)sessionId, WTSConnectState, out buffer, out bytesReturned)) {
+                return -1;
+            }
+            try {
+                if (buffer != IntPtr.Zero && bytesReturned >= 4) {
+                    return Marshal.ReadInt32(buffer);
+                }
+            } finally {
+                if (buffer != IntPtr.Zero) WTSFreeMemory(buffer);
+            }
+        } catch {}
+        return -1;
+    }
+
+    public static bool SyncInputDesktop() {
+        IntPtr desk = IntPtr.Zero;
+        try {
+            desk = OpenInputDesktop(0, false, DESKTOP_ALL_ACCESS);
+            if (desk == IntPtr.Zero) return false;
+            return SetThreadDesktop(desk);
+        } catch {
+            return false;
+        } finally {
+            if (desk != IntPtr.Zero) {
+                try { CloseDesktop(desk); } catch {}
+            }
+        }
+    }
+
+    private static string ResolveTsconExecutable() {
+        string sysRoot = Environment.GetEnvironmentVariable("SystemRoot");
+        if (string.IsNullOrEmpty(sysRoot)) sysRoot = @"C:\Windows";
+        string sysnative = Path.Combine(sysRoot, @"Sysnative\tscon.exe");
+        if (File.Exists(sysnative)) return sysnative;
+        string system32 = Path.Combine(sysRoot, @"System32\tscon.exe");
+        if (File.Exists(system32)) return system32;
+        return "tscon.exe";
+    }
+
+    public static bool RedirectSessionToConsole() {
+        if (!IsElevated()) return false;
+        uint sessionId = 0;
+        if (!ProcessIdToSessionId(GetCurrentProcessId(), out sessionId)) return false;
+        string tscon = ResolveTsconExecutable();
+        StringBuilder cmdLine = new StringBuilder("\"" + tscon + "\" " + sessionId.ToString() + " /dest:console");
+        STARTUPINFO si = new STARTUPINFO();
+        si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+        bool started = false;
+        try {
+            started = CreateProcessW(
+                null,
+                cmdLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                false,
+                CREATE_NO_WINDOW,
+                IntPtr.Zero,
+                null,
+                ref si,
+                out pi
+            );
+            if (!started) return false;
+            WaitForSingleObject(pi.hProcess, 4500);
+            uint exitCode = 1;
+            GetExitCodeProcess(pi.hProcess, out exitCode);
+            SyncInputDesktop();
+            return exitCode == 0;
+        } catch {
+            return false;
+        } finally {
+            if (pi.hThread != IntPtr.Zero) { try { CloseHandle(pi.hThread); } catch {} }
+            if (pi.hProcess != IntPtr.Zero) { try { CloseHandle(pi.hProcess); } catch {} }
+        }
+    }
+
+    public static bool EnsureConsoleActive() {
+        uint sid = 0;
+        int state = GetSessionConnectState(out sid);
+        if (state == WTSDisconnected) {
+            lastConsoleRedirectTick = Environment.TickCount;
+            return RedirectSessionToConsole();
+        }
+        return SyncInputDesktop();
+    }
+
+    private static void OnRdpWatchdogTick(object stateObj) {
+        if (!keepConsoleEnabled || !IsElevated()) return;
+        if (Interlocked.Exchange(ref rdpWatchdogBusy, 1) != 0) return;
+        try {
+            uint sid = 0;
+            int state = GetSessionConnectState(out sid);
+            if (state == WTSDisconnected) {
+                int now = Environment.TickCount;
+                if (unchecked((uint)(now - lastConsoleRedirectTick)) >= 2500u) {
+                    lastConsoleRedirectTick = now;
+                    RedirectSessionToConsole();
+                }
+            }
+        } catch {}
+        finally {
+            Interlocked.Exchange(ref rdpWatchdogBusy, 0);
+        }
+    }
+
+    public static void SetKeepConsoleOnRdpDisconnect(bool enabled) {
+        keepConsoleEnabled = enabled;
+        if (enabled) {
+            if (rdpWatchdogTimer == null) {
+                rdpWatchdogTimer = new Timer(new TimerCallback(OnRdpWatchdogTick), null, 450, 450);
+            }
+        } else {
+            Timer existing = rdpWatchdogTimer;
+            rdpWatchdogTimer = null;
+            if (existing != null) {
+                try { existing.Dispose(); } catch {}
+            }
+        }
+    }
+
+    private static uint SendInputWithDesktopSync(INPUT[] inputs) {
+        int cb = Marshal.SizeOf(typeof(INPUT));
+        uint sent = SendInput((uint)inputs.Length, inputs, cb);
+        if (sent == 0) {
+            if (SyncInputDesktop()) {
+                sent = SendInput((uint)inputs.Length, inputs, cb);
+            }
+        }
+        return sent;
     }
 
     private static int ToAbsolute(int coord, int origin, int span) {
@@ -216,7 +459,7 @@ public static class MswnlinkWin32Worker {
         inp[0].U.mi.dy = ToAbsolute(y, vy, vh);
         inp[0].U.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
 
-        uint sent = SendInput(1, inp, Marshal.SizeOf(typeof(INPUT)));
+        uint sent = SendInputWithDesktopSync(inp);
         if (sent == 0) {
             // Non-elevated fallback hit a High-Integrity foreground window (e.g. Task Manager).
             // Release foreground lock when pointer moves outside the elevated window or was dragging.
@@ -249,7 +492,7 @@ public static class MswnlinkWin32Worker {
         INPUT[] inp = new INPUT[1];
         inp[0].type = INPUT_MOUSE;
         inp[0].U.mi.dwFlags = flag;
-        uint sent = SendInput(1, inp, Marshal.SizeOf(typeof(INPUT)));
+        uint sent = SendInputWithDesktopSync(inp);
         if (down && sent > 0) heldButtons[button] = true;
         else heldButtons.Remove(button);
 
@@ -280,7 +523,7 @@ public static class MswnlinkWin32Worker {
         }
         if (list.Count > 0) {
             INPUT[] arr = list.ToArray();
-            SendInput((uint)arr.Length, arr, Marshal.SizeOf(typeof(INPUT)));
+            SendInputWithDesktopSync(arr);
         }
     }
 
@@ -296,7 +539,7 @@ public static class MswnlinkWin32Worker {
         inp[0].U.ki.wScan = scan;
         inp[0].U.ki.dwFlags = flags;
 
-        uint sent = SendInput(1, inp, Marshal.SizeOf(typeof(INPUT)));
+        uint sent = SendInputWithDesktopSync(inp);
         if (down && sent > 0) heldKeys[vk] = extended;
         else heldKeys.Remove(vk);
         return sent > 0;
@@ -317,7 +560,7 @@ public static class MswnlinkWin32Worker {
             inputs[i * 2 + 1].U.ki.wScan = ch;
             inputs[i * 2 + 1].U.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
         }
-        return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT))) > 0;
+        return SendInputWithDesktopSync(inputs) > 0;
     }
 
     public static bool TapCtrlShortcut(ushort vk, bool withShift) {
@@ -344,7 +587,7 @@ public static class MswnlinkWin32Worker {
         if (withShift) addKey(0xA0, false);
         addKey(0xA2, false);
         INPUT[] arr = seq.ToArray();
-        return SendInput((uint)arr.Length, arr, Marshal.SizeOf(typeof(INPUT))) > 0;
+        return SendInputWithDesktopSync(arr) > 0;
     }
 
     public static void ReleaseAll() {
@@ -358,7 +601,7 @@ public static class MswnlinkWin32Worker {
                 INPUT[] inp = new INPUT[1];
                 inp[0].type = INPUT_MOUSE;
                 inp[0].U.mi.dwFlags = flag;
-                SendInput(1, inp, Marshal.SizeOf(typeof(INPUT)));
+                SendInputWithDesktopSync(inp);
             } catch {}
         }
         heldButtons.Clear();
@@ -377,7 +620,8 @@ $writer = New-Object System.IO.StreamWriter($pipe, $utf8NoBom)
 $writer.AutoFlush = $true
 
 $elevated = [MswnlinkWin32Worker]::IsElevated()
-$authMsg = @{ event = 'ready'; secret = $Secret; elevated = $elevated } | ConvertTo-Json -Compress
+$remoteSession = [MswnlinkWin32Worker]::IsRemoteSession()
+$authMsg = @{ event = 'ready'; secret = $Secret; elevated = $elevated; remoteSession = $remoteSession } | ConvertTo-Json -Compress
 $writer.WriteLine($authMsg)
 
 try {
@@ -393,11 +637,15 @@ try {
       'key' { [void][MswnlinkWin32Worker]::KeyToggle([uint16]$cmd.vk, [bool]$cmd.extended, [bool]$cmd.down) }
       'text' { [void][MswnlinkWin32Worker]::TypeUnicode([string]$cmd.text) }
       'shortcut' { [void][MswnlinkWin32Worker]::TapCtrlShortcut([uint16]$cmd.vk, [bool]$cmd.shift) }
+      'keepConsole' { [MswnlinkWin32Worker]::SetKeepConsoleOnRdpDisconnect([bool]$cmd.enabled) }
+      'ensureConsole' { [void][MswnlinkWin32Worker]::EnsureConsoleActive() }
+      'handoffRdp' { [void][MswnlinkWin32Worker]::RedirectSessionToConsole() }
       'releaseAll' { [MswnlinkWin32Worker]::ReleaseAll() }
-      'stop' { [MswnlinkWin32Worker]::ReleaseAll(); break }
+      'stop' { [MswnlinkWin32Worker]::SetKeepConsoleOnRdpDisconnect($false); [MswnlinkWin32Worker]::ReleaseAll(); break }
     }
   }
 } finally {
+  try { [MswnlinkWin32Worker]::SetKeepConsoleOnRdpDisconnect($false) } catch {}
   try { [MswnlinkWin32Worker]::ReleaseAll() } catch {}
   try { $pipe.Dispose() } catch {}
 }
@@ -413,6 +661,28 @@ function isProcessElevatedWindows() {
   }
 }
 
+function handoffRdpSessionElevated() {
+  if (process.platform !== 'win32') return Promise.resolve({ ok: false, error: 'Windows only.' });
+  return new Promise((resolve) => {
+    const psCommand = [
+      "$ErrorActionPreference = 'Stop'",
+      '$sid = (Get-Process -Id $PID).SessionId',
+      '$sysRoot = if ($env:SystemRoot) { $env:SystemRoot } else { "C:\\Windows" }',
+      '$tscon = Join-Path $sysRoot "Sysnative\\tscon.exe"',
+      'if (-not (Test-Path $tscon)) { $tscon = Join-Path $sysRoot "System32\\tscon.exe" }',
+      'Start-Process -FilePath $tscon -ArgumentList "$sid /dest:console" -Verb RunAs -WindowStyle Hidden -Wait'
+    ].join('; ');
+    const child = spawn('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', psCommand
+    ], { stdio: 'ignore', windowsHide: true });
+    child.once('error', (error) => resolve({ ok: false, error: error.message }));
+    child.once('exit', (code) => {
+      if (code === 0) resolve({ ok: true });
+      else resolve({ ok: false, error: `Could not transfer Remote Desktop to local console (exit ${code}).` });
+    });
+  });
+}
+
 class WindowsInputBackend {
   constructor({ userDataPath, screen }) {
     this.userDataPath = userDataPath;
@@ -421,9 +691,15 @@ class WindowsInputBackend {
     this.socket = null;
     this.proc = null;
     this.elevated = false;
+    this.remoteSession = isWindowsRdpEnv(process.env, process.platform);
+    this.keepConsoleAlive = false;
     this.ready = false;
     this.startPromise = null;
     this.scriptPath = path.join(userDataPath, 'mswnlink-win32-worker.ps1');
+  }
+
+  static isRdpSession(env = process.env) {
+    return isWindowsRdpEnv(env, process.platform);
   }
 
   isActive() {
@@ -436,11 +712,16 @@ class WindowsInputBackend {
   }
 
   async start({ allowElevationPrompt = true } = {}) {
-    if (this.isActive()) return { ok: true, elevated: this.elevated };
+    if (this.isActive()) {
+      if (this.keepConsoleAlive) this.send({ op: 'keepConsole', enabled: true });
+      return { ok: true, elevated: this.elevated, remoteSession: this.remoteSession };
+    }
     if (this.startPromise) return this.startPromise;
 
     this.startPromise = (async () => {
+      const preserveKeepConsole = this.keepConsoleAlive;
       await this.close();
+      this.keepConsoleAlive = preserveKeepConsole;
       await this.ensureWorkerScript();
 
       const alreadyElevated = isProcessElevatedWindows();
@@ -511,7 +792,15 @@ class WindowsInputBackend {
           }
           this.socket = client;
           this.elevated = Boolean(handshake.elevated);
+          this.remoteSession = isWindowsRdpEnv(
+            process.env,
+            process.platform,
+            Boolean(handshake.remoteSession)
+          );
           this.ready = true;
+          if (this.keepConsoleAlive) {
+            this.send({ op: 'keepConsole', enabled: true });
+          }
           client.on('close', () => {
             if (this.socket === client) {
               this.socket = null;
@@ -521,7 +810,7 @@ class WindowsInputBackend {
           client.on('error', () => {});
           // Only accept this single authenticated worker connection.
           try { server.close(); } catch {}
-          finish(null, { ok: true, elevated: this.elevated });
+          finish(null, { ok: true, elevated: this.elevated, remoteSession: this.remoteSession });
         };
         client.on('data', onData);
         client.on('error', (err) => finish(err));
@@ -696,11 +985,34 @@ class WindowsInputBackend {
     return { ok: false, reason: 'Unknown input event.' };
   }
 
+  setKeepConsoleAlive(enabled) {
+    this.keepConsoleAlive = Boolean(enabled);
+    if (this.isActive()) {
+      this.send({ op: 'keepConsole', enabled: this.keepConsoleAlive });
+    }
+    return this.keepConsoleAlive;
+  }
+
+  ensureConsoleSession() {
+    if (!this.isActive()) return false;
+    return this.send({ op: 'ensureConsole' });
+  }
+
+  async handoffRdpToConsole() {
+    if (this.isActive() && this.elevated) {
+      this.setKeepConsoleAlive(true);
+      const sent = this.send({ op: 'handoffRdp' });
+      if (sent) return { ok: true, viaWorker: true };
+    }
+    return handoffRdpSessionElevated();
+  }
+
   releaseAll() {
     this.send({ op: 'releaseAll' });
   }
 
   async close() {
+    this.keepConsoleAlive = false;
     if (this.isActive()) {
       try { this.socket.write(`${JSON.stringify({ op: 'stop' })}\n`); } catch {}
     }
@@ -720,4 +1032,5 @@ class WindowsInputBackend {
 
 module.exports = WindowsInputBackend;
 module.exports.isProcessElevatedWindows = isProcessElevatedWindows;
+module.exports.handoffRdpSessionElevated = handoffRdpSessionElevated;
 module.exports.WORKER_SCRIPT = WORKER_SCRIPT;

@@ -1,4 +1,4 @@
-# mswnlink 3.3
+# mswnlink v3.4
 
 A simple remote desktop for computers on your local network. One computer shares its screen, another views and controls it, directly over the LAN. No account, no cloud, no relay.
 
@@ -34,21 +34,23 @@ Then allow mswnlink under **Privacy & Security** for **Screen & System Audio Rec
 
 Builds are signed ad hoc inside-out (preserving Electron GPU/Renderer helper entitlements) and checked in CI so the signature is always valid. With your own Apple Developer ID, add `MAC_CSC_LINK`, `MAC_CSC_KEY_PASSWORD`, `APPLE_API_KEY`, `APPLE_API_KEY_ID` and `APPLE_API_ISSUER` as repository secrets and the workflow signs and notarizes automatically, which removes the prompt for everyone.
 
-## Windows: Task Manager and Administrator windows
+## Windows: Remote Desktop (`mstsc.exe`), Task Manager, and Administrator windows
 
-Windows blocks standard-user apps from moving or clicking the mouse when an elevated window such as **Task Manager** is in the foreground (UIPI). When remote control is enabled on a Windows host, mswnlink starts a lightweight native Win32 `SendInput` helper and asks once for UAC approval so you can click, drag, and type inside Task Manager and admin tools smoothly. If UAC is declined, mswnlink automatically falls back to standard-user mode with a UIPI foreground-escape guard so the mouse never gets stuck on Task Manager.
+**Using mswnlink after closing Windows Remote Desktop:** Closing a Windows Remote Desktop (`mstsc.exe`) window normally destroys the virtual RDP display adapter (`RDPDD`) and leaves the Windows session disconnected, which previously caused screen sharing to stop automatically. In v3.4, mswnlink detects Remote Desktop sessions, keeps its LAN host listener and WebRTC session alive when the RDP display ends, automatically transfers the disconnected session back to the unlocked local physical console (`tscon.exe /dest:console`) via the elevated Win32 helper, and hot-swaps capture onto the local Windows display. You can also click **Disconnect RDP & Keep Sharing** directly inside **Share this PC** (turn on *Connect without asking* first if nobody is sitting at the physical monitor).
+
+**Task Manager and Administrator windows:** Windows blocks standard-user apps from moving or clicking the mouse when an elevated window such as **Task Manager** is in the foreground (UIPI). When remote control or RDP keep-alive starts on a Windows host, mswnlink launches a lightweight native Win32 `SendInput` helper and asks once for UAC approval so you can control Task Manager and seamlessly hand off Remote Desktop sessions to the local console. If UAC is declined, mswnlink falls back to standard-user mode with a UIPI foreground-escape guard so the mouse never gets stuck on Task Manager.
 
 ## Copy, paste, and international keyboards
 
 Live clipboard sharing is enabled by default on both sides (using async Electron 45 clipboard synchronization so promises/objects never leak). Copy on either computer and press `Ctrl+V` (or `Cmd+V` on a Mac) in the remote window—mswnlink synchronizes the clipboard before injecting the host's native paste shortcut (`Ctrl+V` on Windows/Linux, `Cmd+V` on macOS), and also provides **Send clipboard** / **Get clipboard** buttons in the session bar.
 
-Dead-key accents, apostrophes/quotes (`'`, `"`), and non-Latin scripts such as Greek (`έχω`) compose natively in the viewer and are injected via Unicode/XKB keysyms on the host regardless of whether the host and viewer currently have the same keyboard layout selected.
+Dead-key accents, apostrophes/quotes (`'`, `"`), and non-Latin scripts such as Greek (`έχω`, tonos `;`+`ε`, dialytika `ϊ`/`ΐ`) compose deterministically on Fedora, Windows, and macOS clients and are injected via layout-aware evdev/Unicode keysyms on Fedora Wayland, X11, Windows, and macOS hosts regardless of which keyboard layout either computer currently has active.
 
 ## Fedora and other Linux desktops
 
 If the AppImage does not start: `sudo dnf install fuse fuse-libs`.
 
-On Wayland (the Fedora default) programs cannot fake input directly, so mswnlink uses XWayland + `WebRTCPipeWireCapturer` for capture and asks the desktop's *RemoteDesktop portal* (`xdg-desktop-portal-gnome` or `xdg-desktop-portal-kde`) for mouse and keyboard control, with HiDPI logical scaling, PipeWire stream keepalive, and automatic relative-pointer fallback. When sharing starts, turn on **Allow remote interaction** and choose the monitor you are sharing. Desktops that support persistence remember the approval.
+On Wayland (the Fedora default) programs cannot fake input directly, so mswnlink uses XWayland + `WebRTCPipeWireCapturer` for capture and asks the desktop's *RemoteDesktop portal* (`xdg-desktop-portal-gnome` or `xdg-desktop-portal-kde`) for mouse and keyboard control, with HiDPI logical scaling, PipeWire stream keepalive, GNOME top-bar work-area clamping, native fullscreen synchronization (so the top of the screen is never cut off on host or client), and automatic relative-pointer fallback. When sharing starts, turn on **Allow remote interaction** and choose the monitor you are sharing. Desktops that support persistence remember the approval.
 
 If capture is black, check that PipeWire and `xdg-desktop-portal` are running. `MSWNLINK_FORCE_NATIVE_WAYLAND=1` tries native Wayland; `MSWNLINK_DISABLE_GPU=1` forces software rendering.
 
@@ -66,7 +68,7 @@ RobotJS (input on macOS and X11) is optional; Windows uses the built-in Win32 `S
 
 ## Build the apps
 
-Push a tag like `v3.3` (or run the workflow from the **Actions** tab) to build every platform on GitHub and attach the files to a release. Locally: `npm run dist:fedora`, `dist:win`, `dist:mac`.
+Push a tag like `v3.4` (or run the workflow from the **Actions** tab) to build every platform on GitHub and attach the files to a release. Locally: `npm run dist:fedora`, `dist:win`, `dist:mac`.
 
 ## Security notes
 

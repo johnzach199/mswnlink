@@ -16,12 +16,14 @@ const allowedEvents = new Set([
   'local-clipboard-changed',
   'menu-edit-action',
   'mac-permissions-changed',
-  'window-state'
+  'window-state',
+  'host-display-changed'
 ]);
 
 contextBridge.exposeInMainWorld('lanAPI', {
   minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
   toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggle-maximize'),
+  setWindowFullscreen: (fullscreen) => ipcRenderer.invoke('window:set-fullscreen', Boolean(fullscreen)),
   closeWindow: () => ipcRenderer.invoke('window:close'),
   deviceInfo: () => ipcRenderer.invoke('device-info'),
   getMacPermissions: () => ipcRenderer.invoke('get-mac-permissions'),
@@ -36,6 +38,8 @@ contextBridge.exposeInMainWorld('lanAPI', {
   getSources: (options) => ipcRenderer.invoke('get-sources', options),
   chooseSource: (id) => ipcRenderer.invoke('choose-source', id),
   startHost: () => ipcRenderer.invoke('host-start'),
+  recoverWindowsCapture: () => ipcRenderer.invoke('recover-windows-capture'),
+  handoffWindowsRdp: () => ipcRenderer.invoke('handoff-windows-rdp'),
   makePairProof: (code, nonce) => ipcRenderer.invoke('make-pair-proof', code, nonce),
   signPairMessage: (code, nonce, message) => ipcRenderer.invoke('sign-pair-message', code, nonce, message),
   verifyPairMessage: (code, nonce, envelope) => ipcRenderer.invoke('verify-pair-message', code, nonce, envelope),

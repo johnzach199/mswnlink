@@ -40,6 +40,16 @@ if (isWaylandSession && forceNativeWayland) {
   }
 }
 
+if (process.platform === 'win32') {
+  // Keep Chromium's DXGI desktop capturer and WebRTC pipelines running when
+  // Windows Remote Desktop (mstsc) disconnects, transitions to console, or occludes windows.
+  args.push(
+    '--disable-features=CalculateNativeWinOcclusion',
+    '--disable-renderer-backgrounding',
+    '--disable-backgrounding-occluded-windows'
+  );
+}
+
 if (process.env.MSWNLINK_DISABLE_GPU === '1') {
   // This optional diagnostic mode applies switches before the Electron process
   // starts, instead of relying only on main-process initialization.

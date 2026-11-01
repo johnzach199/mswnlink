@@ -20,7 +20,8 @@ const {
   parseDarwinMajor,
   evaluateMacScreenPermission,
   normalizeClipboardText,
-  isLinuxWaylandEnv
+  isLinuxWaylandEnv,
+  isWindowsRdpEnv
 } = require('./lib/input-protocol');
 const isLinuxWaylandSession = Boolean(
   (LinuxWaylandInput && LinuxWaylandInput.isSupportedSession()) ||
@@ -31,11 +32,23 @@ if (isLinuxWaylandSession) {
   app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer');
 }
 
+if (process.platform === 'win32') {
+  // Prevent Chromium on Windows from pausing desktop capture or throttling WebRTC
+  // when Remote Desktop (mstsc.exe) disconnects or occludes the host window.
+  const existingDisabled = app.commandLine.getSwitchValue('disable-features');
+  const mergedDisabled = existingDisabled
+    ? `${existingDisabled},CalculateNativeWinOcclusion`
+    : 'CalculateNativeWinOcclusion';
+  app.commandLine.appendSwitch('disable-features', mergedDisabled);
+  app.commandLine.appendSwitch('disable-renderer-backgrounding');
+  app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+}
+
 // Optional fallback for Linux systems whose Mesa/GBM driver cannot be opened.
 // This must run before app.whenReady(); keep acceleration enabled by default.
 if (process.env.MSWNLINK_DISABLE_GPU === '1') {
   app.disableHardwareAcceleration();
-  app.commandLine.appendSwitch('disable-features', 'Vulkan');
+  app.commandLine.appendSwitch('disable-features', 'Vulkan,CalculateNativeWinOcclusion');
   console.warn('[mswnlink] Hardware acceleration disabled by MSWNLINK_DISABLE_GPU=1.');
 }
 
@@ -84,6 +97,8 @@ let mainClipboardPollInFlight = false;
 let clipboardFallbackBusy = false;
 let lastObservedMainClipboard = '';
 let displayMediaUsingSystemPicker = null;
+let linuxWorkAreaMaximized = false;
+let linuxNormalBounds = null;
 
 function featurePreferencesPath() {
   return path.join(app.getPath('userData'), 'feature-preferences.json');
@@ -141,7 +156,7 @@ function createWindow() {
     minWidth: minWindowWidth,
     minHeight: minWindowHeight,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#0d1110' : '#f2f5f4',
-    title: 'mswnlink',
+    title: 'mswnlink v3.4',
     ...(windowIconPath ? { icon: windowIconPath } : {}),
     // Replace the native title bar and default File/Edit/View menu with the
     // app's own draggable top bar in index.html. macOS keeps its native traffic
@@ -168,12 +183,74 @@ function createWindow() {
   }
 
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
-  mainWindow.once('ready-to-show', () => mainWindow.show());
-  const sendWindowState = () => sendToUI('window-state', { maximized: Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isMaximized()) });
-  mainWindow.on('maximize', sendWindowState);
-  mainWindow.on('unmaximize', sendWindowState);
+  mainWindow.once('ready-to-show', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (process.platform === 'linux') {
+      try {
+        const display = screen.getDisplayMatching(mainWindow.getBounds());
+        const b = mainWindow.getBounds();
+        if (b.y < display.workArea.y) {
+          mainWindow.setBounds({
+            x: Math.max(display.workArea.x, b.x),
+            y: display.workArea.y,
+            width: Math.min(b.width, display.workArea.width),
+            height: Math.min(b.height, display.workArea.height)
+          });
+        }
+      } catch {}
+    }
+    mainWindow.show();
+  });
+  const sendWindowState = () => {
+    const alive = Boolean(mainWindow && !mainWindow.isDestroyed());
+    sendToUI('window-state', {
+      maximized: alive && (mainWindow.isMaximized() || linuxWorkAreaMaximized),
+      fullscreen: alive && mainWindow.isFullScreen()
+    });
+  };
+  mainWindow.on('maximize', () => {
+    // On Fedora GNOME (Mutter + XWayland), maximizing a frameless BrowserWindow (`frame: false`)
+    // places y=0 underneath GNOME's 32px top panel, hiding the top bar on both Host and Client.
+    // Clamp non-fullscreen maximizes to `display.workArea` so the top bar is always visible.
+    if (process.platform === 'linux' && mainWindow && !mainWindow.isDestroyed() && !mainWindow.isFullScreen()) {
+      try {
+        const display = screen.getDisplayMatching(mainWindow.getBounds());
+        const b = mainWindow.getBounds();
+        if (b.y < display.workArea.y || b.height > display.workArea.height) {
+          mainWindow.unmaximize();
+          linuxWorkAreaMaximized = true;
+          mainWindow.setBounds(display.workArea);
+        }
+      } catch {}
+    }
+    sendWindowState();
+  });
+  mainWindow.on('unmaximize', () => {
+    linuxWorkAreaMaximized = false;
+    sendWindowState();
+  });
   mainWindow.on('enter-full-screen', sendWindowState);
-  mainWindow.on('leave-full-screen', sendWindowState);
+  mainWindow.on('leave-full-screen', () => {
+    if (process.platform === 'linux' && mainWindow && !mainWindow.isDestroyed()) {
+      try {
+        const display = screen.getDisplayMatching(mainWindow.getBounds());
+        if (linuxWorkAreaMaximized) {
+          mainWindow.setBounds(display.workArea);
+        } else {
+          const b = mainWindow.getBounds();
+          if (b.y < display.workArea.y) {
+            mainWindow.setBounds({
+              x: Math.max(display.workArea.x, b.x),
+              y: display.workArea.y,
+              width: Math.min(b.width, display.workArea.width),
+              height: Math.min(b.height, display.workArea.height)
+            });
+          }
+        }
+      } catch {}
+    }
+    sendWindowState();
+  });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https://')) shell.openExternal(url);
     return { action: 'deny' };
@@ -392,11 +469,22 @@ function getMacPermissionSnapshot() {
   };
 }
 
+function isWindowsRdpSession() {
+  if (process.platform !== 'win32') return false;
+  return isWindowsRdpEnv(
+    process.env,
+    process.platform,
+    Boolean(win32InputManager && win32InputManager.remoteSession)
+  );
+}
+
 function updateSessionPowerSaveBlocker() {
-  // Keep long remote sessions from being suspended or having the display blanked
-  // mid-session (a common source of apparent fullscreen freezes). Release it as
-  // soon as both the viewer session and host peer are inactive.
-  const active = viewerSessionActive || Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
+  // Keep active host shares and remote sessions from being suspended or having the
+  // local console display blanked (especially after closing Windows Remote Desktop).
+  const active =
+    viewerSessionActive ||
+    Boolean(wss) ||
+    Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
   syncMainClipboardWatcherState();
   try {
     if (active && sessionPowerSaveBlockerId === null) {
@@ -549,7 +637,7 @@ async function ensureLinuxDesktopIconIntegration() {
       const desktopEntry = [
         '[Desktop Entry]',
         'Type=Application',
-        'Name=mswnlink 3.3',
+        'Name=mswnlink v3.4',
         'Comment=Local-network remote desktop and file sharing',
         `Exec=${escapedExec} %U`,
         `Icon=${destIconPath}`,
@@ -583,8 +671,12 @@ async function ensureInputBackend(options = {}) {
       if (!win32InputManager) {
         win32InputManager = new WindowsInputBackend({ userDataPath: app.getPath('userData'), screen });
       }
+      if (wss) {
+        win32InputManager.setKeepConsoleAlive(true);
+      }
       try {
         await win32InputManager.start({ allowElevationPrompt });
+        if (wss) win32InputManager.setKeepConsoleAlive(true);
         return true;
       } catch (error) {
         console.warn('[mswnlink] Windows native SendInput helper could not start; checking RobotJS fallback:', error.message);
@@ -869,10 +961,24 @@ function bindConnection(socket, req) {
 
 async function startHost() {
   if (!persistentAccessCode) throw new Error('Set a permanent access code on the Share this PC screen before starting to share.');
+  if (process.platform === 'win32' && WindowsInputBackend) {
+    if (!win32InputManager) {
+      win32InputManager = new WindowsInputBackend({ userDataPath: app.getPath('userData'), screen });
+    }
+    win32InputManager.setKeepConsoleAlive(true);
+  }
   // Also verify input readiness when Start Sharing is clicked a second time or
   // the setting was enabled while the listener was already running.
   if (unattendedAccessEnabled) {
     await ensureInputBackend();
+  } else if (process.platform === 'win32' && WindowsInputBackend && isWindowsRdpSession()) {
+    // When starting host sharing inside a Windows Remote Desktop session, pre-start
+    // the elevated Win32 helper while the user is still connected to RDP so its
+    // WTSDisconnected watchdog can automatically run `tscon /dest:console` the
+    // moment Remote Desktop is closed.
+    ensureInputBackend({ allowElevationPrompt: true }).catch((error) => {
+      console.warn('[mswnlink] Windows RDP console-keepalive helper deferred:', error.message);
+    });
   } else if (isLinuxWaylandSession) {
     // Only pre-warm silently in the background when a saved one-use restore token
     // already exists; otherwise avoid stacking a second GNOME portal dialog right on
@@ -886,7 +992,11 @@ async function startHost() {
       });
     }
   }
-  if (wss) return { code: pairingCode, port: PORT, ips: getLanIPv4() };
+  if (wss) {
+    if (win32InputManager) win32InputManager.setKeepConsoleAlive(true);
+    updateSessionPowerSaveBlocker();
+    return { code: pairingCode, port: PORT, ips: getLanIPv4(), rdpSession: isWindowsRdpSession() };
+  }
   pairingCode = persistentAccessCode;
   const server = new WebSocketServer({ host: '0.0.0.0', port: PORT, maxPayload: MAX_SIGNAL_BYTES });
   wss = server;
@@ -905,13 +1015,16 @@ async function startHost() {
     try { server.close(); } catch {}
     wss = null;
     pairingCode = null;
+    updateSessionPowerSaveBlocker();
     throw new Error(error.code === 'EADDRINUSE'
       ? `Port ${PORT} is already in use. Close the other service and try again.`
       : `Could not start the LAN listener: ${error.message}`);
   }
+  if (win32InputManager) win32InputManager.setKeepConsoleAlive(true);
+  updateSessionPowerSaveBlocker();
   announcePresence();
   sendDiscoveredDevices();
-  return { code: pairingCode, port: PORT, ips: getLanIPv4() };
+  return { code: pairingCode, port: PORT, ips: getLanIPv4(), rdpSession: isWindowsRdpSession() };
 }
 
 async function stopHost() {
@@ -924,6 +1037,7 @@ async function stopHost() {
   const server = wss;
   wss = null;
   pairingCode = null;
+  updateSessionPowerSaveBlocker();
   if (server) {
     try { server.close(); } catch {}
   }
@@ -974,7 +1088,7 @@ function tryXdotoolType(text) {
   });
 }
 
-async function injectUnicodeTextOnDesktop(rawText) {
+async function injectUnicodeTextOnDesktop(rawText, meta = null) {
   const text = String(rawText || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 64);
   if (!text) return { ok: true };
 
@@ -982,7 +1096,12 @@ async function injectUnicodeTextOnDesktop(rawText) {
     if (!waylandInputManager || !waylandInputManager.isActive()) {
       throw new Error('Wayland remote input is not active. Approve the Fedora/GNOME remote interaction prompt.');
     }
-    const res = await waylandInputManager.inject({ kind: 'text', text });
+    const res = await waylandInputManager.inject({
+      kind: 'text',
+      text,
+      code: meta && typeof meta.code === 'string' ? meta.code : '',
+      shiftKey: Boolean(meta && meta.shiftKey)
+    });
     if (res && res.fallbackPaste && res.remainingText) {
       return injectTextViaClipboardFallback(
         res.remainingText,
@@ -1054,7 +1173,7 @@ async function injectInput(event) {
   }
   try {
     if (event.kind === 'text') {
-      return await injectUnicodeTextOnDesktop(event.text);
+      return await injectUnicodeTextOnDesktop(event.text, event);
     }
     if (isLinuxWaylandSession) {
       if (!waylandInputManager || !waylandInputManager.isActive()) {
@@ -1113,7 +1232,7 @@ async function injectInput(event) {
     } else if (event.kind === 'key') {
       if (event.textInput === true) {
         if (event.action === 'down') {
-          return await injectUnicodeTextOnDesktop(event.key);
+          return await injectUnicodeTextOnDesktop(event.key, event);
         }
         return { ok: true };
       }
@@ -1221,6 +1340,23 @@ function configureDisplayMediaHandler() {
 app.whenReady().then(async () => {
   if (process.platform === 'win32') {
     app.setAppUserModelId('com.mswnlink.lan');
+    let winDisplayNotifyTimer = null;
+    const notifyWindowsDisplayTopologyChange = () => {
+      if (!wss) return;
+      if (winDisplayNotifyTimer) clearTimeout(winDisplayNotifyTimer);
+      winDisplayNotifyTimer = setTimeout(() => {
+        winDisplayNotifyTimer = null;
+        if (!wss) return;
+        if (win32InputManager) {
+          try { win32InputManager.ensureConsoleSession(); } catch {}
+        }
+        sendToUI('host-display-changed', { rdpSession: isWindowsRdpSession() });
+      }, 320);
+      if (winDisplayNotifyTimer.unref) winDisplayNotifyTimer.unref();
+    };
+    screen.on('display-added', notifyWindowsDisplayTopologyChange);
+    screen.on('display-removed', notifyWindowsDisplayTopologyChange);
+    screen.on('display-metrics-changed', notifyWindowsDisplayTopologyChange);
   } else if (process.platform === 'linux') {
     ensureLinuxDesktopIconIntegration().catch(() => {});
   }
@@ -1258,9 +1394,49 @@ app.whenReady().then(async () => {
     return true;
   });
   ipcMain.handle('window:toggle-maximize', (event) => {
-    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return { maximized: false };
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return { maximized: false, fullscreen: false };
+    if (mainWindow.isFullScreen()) {
+      mainWindow.setFullScreen(false);
+      return { maximized: Boolean(mainWindow.isMaximized() || linuxWorkAreaMaximized), fullscreen: false };
+    }
+    if (process.platform === 'linux') {
+      const display = screen.getDisplayMatching(mainWindow.getBounds());
+      if (linuxWorkAreaMaximized || mainWindow.isMaximized()) {
+        linuxWorkAreaMaximized = false;
+        if (mainWindow.isMaximized()) mainWindow.unmaximize();
+        if (linuxNormalBounds) {
+          mainWindow.setBounds(linuxNormalBounds);
+        } else {
+          const w = Math.min(1240, Math.max(520, display.workArea.width - 64));
+          const h = Math.min(820, Math.max(440, display.workArea.height - 64));
+          mainWindow.setBounds({
+            x: display.workArea.x + Math.round((display.workArea.width - w) / 2),
+            y: display.workArea.y + Math.round((display.workArea.height - h) / 2),
+            width: w,
+            height: h
+          });
+        }
+      } else {
+        linuxNormalBounds = mainWindow.getBounds();
+        linuxWorkAreaMaximized = true;
+        mainWindow.setBounds(display.workArea);
+      }
+      sendToUI('window-state', { maximized: linuxWorkAreaMaximized, fullscreen: false });
+      return { maximized: linuxWorkAreaMaximized, fullscreen: false };
+    }
     if (mainWindow.isMaximized()) mainWindow.unmaximize(); else mainWindow.maximize();
-    return { maximized: mainWindow.isMaximized() };
+    return { maximized: mainWindow.isMaximized(), fullscreen: mainWindow.isFullScreen() };
+  });
+  ipcMain.handle('window:set-fullscreen', (event, requested) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+      return { fullscreen: false, maximized: false };
+    }
+    const want = Boolean(requested);
+    mainWindow.setFullScreen(want);
+    const fullscreen = mainWindow.isFullScreen();
+    const maximized = Boolean(mainWindow.isMaximized() || linuxWorkAreaMaximized);
+    sendToUI('window-state', { maximized, fullscreen });
+    return { fullscreen, maximized };
   });
   ipcMain.handle('window:close', (event) => {
     if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return false;
@@ -1375,6 +1551,7 @@ app.whenReady().then(async () => {
       osRelease: os.release(),
       darwinMajor: parseDarwinMajor(os.release()),
       waylandSession: isLinuxWaylandSession,
+      rdpSession: isWindowsRdpSession(),
       ips: getLanIPv4(),
       inputAvailable: hasInputBackend(),
       inputBackend: isLinuxWaylandSession
@@ -1387,64 +1564,111 @@ app.whenReady().then(async () => {
     };
   });
 
+  async function listDesktopScreenSources(options = {}) {
+    // On Fedora/GNOME Wayland, every desktopCapturer.getSources() call opens a
+    // system-modal XDG ScreenCast portal dialog (including on passive tab switches
+    // and viewer display-list-request messages, which disrupts active streams).
+    // Return native display geometry from `screen.getAllDisplays()` unless the
+    // caller explicitly requests an interactive portal picker.
+    if (isLinuxWaylandSession && (!options || options.allowWaylandPortal !== true)) {
+      const nativeDisplays = screen.getAllDisplays();
+      return nativeDisplays.map((display, index) => ({
+        id: `wayland-display:${display.id}`,
+        name: display.label
+          ? `${display.label} (${display.bounds.width}×${display.bounds.height})`
+          : `Display ${index + 1} (${display.bounds.width}×${display.bounds.height})`,
+        displayId: String(display.id),
+        bounds: {
+          x: display.bounds.x,
+          y: display.bounds.y,
+          width: display.bounds.width,
+          height: display.bounds.height
+        },
+        scaleFactor: Number(display.scaleFactor) || 1,
+        thumbnail: '',
+        waylandPortalManaged: true
+      }));
+    }
+
+    const thumbnailSize = options && options.thumbnailSize
+      ? options.thumbnailSize
+      : { width: 360, height: 220 };
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize,
+      fetchWindowIcons: false
+    });
+    const nativeDisplays = screen.getAllDisplays();
+    return sources.map((source, index) => {
+      let display = source.display_id
+        ? nativeDisplays.find(item => String(item.id) === String(source.display_id))
+        : null;
+      if (!display && nativeDisplays.length === sources.length) {
+        const match = String(source.name || '').match(/(?:screen|display|monitor)\s*#?\s*(\d+)/i);
+        if (match) {
+          const labelIndex = Number(match[1]) - 1;
+          if (Number.isInteger(labelIndex) && labelIndex >= 0 && labelIndex < nativeDisplays.length) display = nativeDisplays[labelIndex];
+        }
+        if (!display) display = nativeDisplays[index] || null;
+      }
+      return {
+        id: source.id,
+        name: source.name || `Display ${index + 1}`,
+        displayId: display ? String(display.id) : (source.display_id ? String(source.display_id) : ''),
+        bounds: display ? { x: display.bounds.x, y: display.bounds.y, width: display.bounds.width, height: display.bounds.height } : null,
+        scaleFactor: display ? Number(display.scaleFactor) || 1 : 1,
+        thumbnail: source.thumbnail && thumbnailSize.width > 0 ? source.thumbnail.toDataURL() : ''
+      };
+    });
+  }
+
   ipcMain.handle('get-sources', async (_event, options = {}) => {
     try {
-      // On Fedora/GNOME Wayland, every desktopCapturer.getSources() call opens a
-      // system-modal XDG ScreenCast portal dialog (including on passive tab switches
-      // and viewer display-list-request messages, which disrupts active streams).
-      // Return native display geometry from `screen.getAllDisplays()` unless the
-      // caller explicitly requests an interactive portal picker.
-      if (isLinuxWaylandSession && (!options || options.allowWaylandPortal !== true)) {
-        const nativeDisplays = screen.getAllDisplays();
-        return nativeDisplays.map((display, index) => ({
-          id: `wayland-display:${display.id}`,
-          name: display.label
-            ? `${display.label} (${display.bounds.width}×${display.bounds.height})`
-            : `Display ${index + 1} (${display.bounds.width}×${display.bounds.height})`,
-          displayId: String(display.id),
-          bounds: {
-            x: display.bounds.x,
-            y: display.bounds.y,
-            width: display.bounds.width,
-            height: display.bounds.height
-          },
-          scaleFactor: Number(display.scaleFactor) || 1,
-          thumbnail: '',
-          waylandPortalManaged: true
-        }));
-      }
-
-      const sources = await desktopCapturer.getSources({
-        types: ['screen'],
-        thumbnailSize: { width: 360, height: 220 },
-        fetchWindowIcons: false
-      });
-      const nativeDisplays = screen.getAllDisplays();
-      return sources.map((source, index) => {
-        let display = source.display_id
-          ? nativeDisplays.find(item => String(item.id) === String(source.display_id))
-          : null;
-        if (!display && nativeDisplays.length === sources.length) {
-          const match = String(source.name || '').match(/(?:screen|display|monitor)\s*#?\s*(\d+)/i);
-          if (match) {
-            const labelIndex = Number(match[1]) - 1;
-            if (Number.isInteger(labelIndex) && labelIndex >= 0 && labelIndex < nativeDisplays.length) display = nativeDisplays[labelIndex];
-          }
-          if (!display) display = nativeDisplays[index] || null;
-        }
-        return {
-          id: source.id,
-          name: source.name || `Display ${index + 1}`,
-          displayId: display ? String(display.id) : (source.display_id ? String(source.display_id) : ''),
-          bounds: display ? { x: display.bounds.x, y: display.bounds.y, width: display.bounds.width, height: display.bounds.height } : null,
-          scaleFactor: display ? Number(display.scaleFactor) || 1 : 1,
-          thumbnail: source.thumbnail ? source.thumbnail.toDataURL() : ''
-        };
-      });
+      return await listDesktopScreenSources(options);
     } catch (error) {
       const message = screenCaptureErrorMessage(error);
       console.warn('[mswnlink] Could not list screen sources:', message);
       throw new Error(message);
+    }
+  });
+
+  ipcMain.handle('recover-windows-capture', async () => {
+    if (process.platform !== 'win32') {
+      return { ok: false, sources: [], rdpSession: false };
+    }
+    try {
+      if (win32InputManager) {
+        win32InputManager.setKeepConsoleAlive(Boolean(wss));
+        win32InputManager.ensureConsoleSession();
+      }
+      const freshSources = await listDesktopScreenSources({ thumbnailSize: { width: 0, height: 0 } });
+      if (freshSources.length > 0) {
+        if (!chosenSourceId || !freshSources.some(item => item.id === chosenSourceId)) {
+          chosenSourceId = freshSources[0].id;
+        }
+      }
+      return { ok: freshSources.length > 0, sources: freshSources, rdpSession: isWindowsRdpSession() };
+    } catch (error) {
+      console.warn('[mswnlink] Windows capture recovery probe warning:', error && error.message ? error.message : error);
+      return { ok: false, sources: [], rdpSession: isWindowsRdpSession() };
+    }
+  });
+
+  ipcMain.handle('handoff-windows-rdp', async () => {
+    if (process.platform !== 'win32' || !WindowsInputBackend) {
+      return { ok: false, error: 'Windows Remote Desktop handoff is only needed on Windows.' };
+    }
+    try {
+      await ensureInputBackend({ allowElevationPrompt: true }).catch(() => {});
+      if (win32InputManager) {
+        if (wss) win32InputManager.setKeepConsoleAlive(true);
+        const res = await win32InputManager.handoffRdpToConsole();
+        return { ok: Boolean(res && res.ok), error: (res && res.error) || '' };
+      }
+      const fallbackRes = await WindowsInputBackend.handoffRdpSessionElevated();
+      return { ok: Boolean(fallbackRes && fallbackRes.ok), error: (fallbackRes && fallbackRes.error) || '' };
+    } catch (error) {
+      return { ok: false, error: error && error.message ? error.message : 'Could not transfer Remote Desktop to local console.' };
     }
   });
 

@@ -26,6 +26,7 @@ const { spawn, execFileSync } = require('node:child_process');
 const {
   shortcutDescriptorForPlatform,
   unicodeToXkbKeysym,
+  greekCharToEvdevSteps,
   isLinuxWaylandEnv
 } = require('./lib/input-protocol');
 
@@ -484,6 +485,79 @@ for raw_line in sys.stdin:
                 1500,
                 None
             )
+            hold_ms = float(msg.get('holdMs', 0) or 0)
+            if hold_ms > 0 and int(msg['state']) == 1:
+                time.sleep(min(0.05, hold_ms / 1000.0))
+        elif cmd == 'typeBatch':
+            active_layout = ''
+            try:
+                schema_src = Gio.SettingsSchemaSource.get_default()
+                if schema_src is not None and schema_src.lookup('org.gnome.desktop.input-sources', True) is not None:
+                    gs = Gio.Settings.new('org.gnome.desktop.input-sources')
+                    mru = gs.get_value('mru-sources').unpack()
+                    srcs = gs.get_value('sources').unpack()
+                    chosen = mru[0] if mru else (srcs[0] if srcs else None)
+                    if chosen and len(chosen) >= 2:
+                        active_layout = str(chosen[1]).split('+')[0].strip().lower()
+            except Exception:
+                active_layout = ''
+
+            def tap_evdev(kcode, with_shift=False):
+                if with_shift:
+                    conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                   GLib.Variant('(oa{sv}iu)', (session_handle, {}, 42, 1)),
+                                   None, Gio.DBusCallFlags.NONE, 1500, None)
+                    time.sleep(0.003)
+                conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                               GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(kcode), 1)),
+                               None, Gio.DBusCallFlags.NONE, 1500, None)
+                time.sleep(0.005)
+                conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                               GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(kcode), 0)),
+                               None, Gio.DBusCallFlags.NONE, 1500, None)
+                if with_shift:
+                    time.sleep(0.002)
+                    conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                   GLib.Variant('(oa{sv}iu)', (session_handle, {}, 42, 0)),
+                                   None, Gio.DBusCallFlags.NONE, 1500, None)
+                time.sleep(0.003)
+
+            def tap_sym(ksym, hold_sec):
+                conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeysym',
+                               GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(ksym), 1)),
+                               None, Gio.DBusCallFlags.NONE, 1500, None)
+                if hold_sec > 0:
+                    time.sleep(hold_sec)
+                conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeysym',
+                               GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(ksym), 0)),
+                               None, Gio.DBusCallFlags.NONE, 1500, None)
+                if hold_sec > 0:
+                    time.sleep(0.004)
+
+            phys_evdev = msg.get('physicalEvdev')
+            items = msg.get('items') or []
+            if active_layout == 'gr' and phys_evdev is not None and len(items) == 1:
+                tap_evdev(int(phys_evdev), bool(msg.get('shiftKey')))
+            else:
+                for item in items:
+                    cp = int(item.get('cp', 0))
+                    primary_sym = int(item.get('primarySym', 0))
+                    unicode_sym = int(item.get('unicodeSym', 0))
+                    greek_steps = item.get('greekSteps')
+                    if active_layout == 'gr' and greek_steps:
+                        for step in greek_steps:
+                            tap_evdev(int(step['keycode']), bool(step.get('shift')))
+                        continue
+                    if cp > 0x7f:
+                        # Prefer 0x01000000|cp (Uxxxx) with a 15ms hold so GNOME Mutter never
+                        # collides with inactive secondary XKB groups (e.g. group 1 'gr' while
+                        # group 0 'us' is active) and clients read the ephemeral keymap before keyup.
+                        try:
+                            tap_sym(unicode_sym, 0.015)
+                        except Exception:
+                            tap_sym(primary_sym, 0.015)
+                    else:
+                        tap_sym(primary_sym, 0.004)
         if req_id is not None:
             emit_json({'id': req_id, 'ok': True})
     except Exception as call_err:
@@ -1177,23 +1251,79 @@ class LinuxWaylandInput {
     }
   }
 
-  async injectTextKeysyms(text) {
+  async injectTextKeysyms(text, meta = null) {
     const chars = Array.from(String(text || '').slice(0, 64));
+    if (!chars.length) return { ok: true };
+
+    if (this.pyWorker && this.pyReady) {
+      const items = [];
+      for (const ch of chars) {
+        const cp = ch.codePointAt(0);
+        if (!cp || cp < 0x20 || cp === 0x7f) continue;
+        const primarySym = unicodeToXkbKeysym(cp);
+        if (!primarySym) continue;
+        items.push({
+          cp,
+          primarySym,
+          unicodeSym: (0x01000000 | cp) >>> 0,
+          greekSteps: greekCharToEvdevSteps(ch)
+        });
+      }
+      if (!items.length) return { ok: true };
+      const code = meta && typeof meta.code === 'string' ? meta.code : '';
+      const physicalEvdev = (
+        items.length === 1 &&
+        items[0].cp <= 0x7f &&
+        (/^Key[A-Z]$/.test(code) || code === 'Semicolon') &&
+        EVDEV_KEYCODES[code]
+      )
+        ? EVDEV_KEYCODES[code]
+        : null;
+      try {
+        await this._sendPyCommand({
+          cmd: 'typeBatch',
+          items,
+          physicalEvdev,
+          shiftKey: Boolean(meta && meta.shiftKey)
+        });
+        return { ok: true };
+      } catch (err) {
+        return {
+          ok: false,
+          fallbackPaste: true,
+          remainingText: chars.join(''),
+          reason: err && err.message ? err.message : 'Wayland typeBatch failed'
+        };
+      }
+    }
+
+    const holdKeymapSettle = () => (
+      this.dbusModule
+        ? Promise.resolve()
+        : new Promise(resolve => setTimeout(resolve, 12))
+    );
+
     for (let i = 0; i < chars.length; i += 1) {
       const ch = chars[i];
       const cp = ch.codePointAt(0);
       if (!cp || cp < 0x20 || cp === 0x7f) continue;
       const primarySym = unicodeToXkbKeysym(cp);
       const unicodeSym = (0x01000000 | cp) >>> 0;
-      if (!primarySym) continue;
+      // On real D-Bus (`!this.dbusModule`), prefer 0x01000000|cp for non-ASCII so GNOME
+      // Mutter never collides with inactive secondary XKB layout groups.
+      const preferredSym = (!this.dbusModule && cp > 0x7f) ? unicodeSym : primarySym;
+      const alternateSym = (!this.dbusModule && cp > 0x7f) ? primarySym : unicodeSym;
+      if (!preferredSym) continue;
       try {
-        await this._notifyKeyboardKeysym(primarySym, 1);
-        await this._notifyKeyboardKeysym(primarySym, 0);
+        await this._notifyKeyboardKeysym(preferredSym, 1);
+        if (cp > 0x7f) await holdKeymapSettle();
+        await this._notifyKeyboardKeysym(preferredSym, 0);
       } catch (err) {
-        if (primarySym !== unicodeSym) {
+        if (preferredSym !== alternateSym && alternateSym) {
           try {
-            await this._notifyKeyboardKeysym(unicodeSym, 1);
-            await this._notifyKeyboardKeysym(unicodeSym, 0);
+            await this._notifyKeyboardKeysym(alternateSym, 1);
+            if (cp > 0x7f) await holdKeymapSettle();
+            await this._notifyKeyboardKeysym(alternateSym, 0);
             continue;
           } catch {}
         }
@@ -1263,13 +1393,19 @@ class LinuxWaylandInput {
     }
 
     if (event.kind === 'text') {
-      return this.injectTextKeysyms(event.text);
+      return this.injectTextKeysyms(event.text, {
+        code: event.code || '',
+        shiftKey: Boolean(event.shiftKey)
+      });
     }
 
     if (event.kind === 'key') {
       if (event.textInput === true && typeof event.key === 'string' && event.key.length >= 1) {
         if (event.action === 'down') {
-          return this.injectTextKeysyms(event.key);
+          return this.injectTextKeysyms(event.key, {
+            code: event.code || '',
+            shiftKey: Boolean(event.shiftKey)
+          });
         }
         return { ok: true };
       }

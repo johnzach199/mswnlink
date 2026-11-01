@@ -318,11 +318,20 @@ test('Wayland Gio.DBusConnection Python worker compiles cleanly and multi-OS exe
 
   const rootDir = path.join(__dirname, '..');
   const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
+  assert.equal(pkg.version, '3.4.0');
+  assert.equal(pkg.build.win.artifactName, 'mswnlink-windows-v3.4-${arch}.${ext}');
+  assert.equal(pkg.build.mac.artifactName, 'mswnlink-macos-v3.4-${arch}.${ext}');
+  assert.equal(pkg.build.linux.artifactName, 'mswnlink-fedora-v3.4-${arch}.${ext}');
   assert.equal(pkg.build.win.icon, 'assets/mswnlink.ico');
   assert.equal(pkg.build.win.signAndEditExecutable, true);
   assert.equal(pkg.build.mac.icon, 'assets/mswnlink.icns');
   assert.equal(pkg.build.dmg.icon, 'assets/mswnlink.icns');
   assert.equal(pkg.build.linux.icon, 'assets/icons');
+
+  const svg = fs.readFileSync(path.join(rootDir, 'assets', 'mswnlink.svg'), 'utf8');
+  assert.match(svg, /#0b1020/i);
+  assert.match(svg, /#a99aff/i);
+  assert.match(svg, /#6de7bd/i);
 
   const ico = fs.readFileSync(path.join(rootDir, 'assets', 'mswnlink.ico'));
   assert.equal(ico.readUInt16LE(0), 0);
@@ -339,3 +348,95 @@ test('Wayland Gio.DBusConnection Python worker compiles cleanly and multi-OS exe
   }
 });
 
+test('Fedora Greek dead-key composition (;+ε -> έ, ¨+ι -> ϊ, ΐ) and XKB gr evdev steps work deterministically', () => {
+  const tonos = inputProtocol.detectDeadKeyAccent({ key: 'Dead', code: 'Semicolon', shiftKey: false });
+  assert.equal(tonos, 'acute');
+  assert.equal(inputProtocol.composeDeadKeyCharacter(tonos, 'ε'), 'έ');
+  assert.equal(inputProtocol.composeDeadKeyCharacter(tonos, 'Ω'), 'Ώ');
+
+  const dialytika = inputProtocol.detectDeadKeyAccent({ key: 'Dead', code: 'Semicolon', shiftKey: true });
+  assert.equal(dialytika, 'diaeresis');
+  assert.equal(inputProtocol.composeDeadKeyCharacter(dialytika, 'ι'), 'ϊ');
+
+  const dialytikaTonos = inputProtocol.detectDeadKeyAccent({ key: 'Dead', code: 'KeyW', shiftKey: true });
+  assert.equal(dialytikaTonos, 'dialytika_acute');
+  assert.equal(inputProtocol.composeDeadKeyCharacter(dialytikaTonos, 'ι'), 'ΐ');
+
+  const deadQuote = inputProtocol.detectDeadKeyAccent({ key: 'Dead', code: 'Quote', shiftKey: false });
+  assert.equal(inputProtocol.composeDeadKeyCharacter(deadQuote, ' '), "'");
+
+  assert.deepEqual(inputProtocol.greekCharToEvdevSteps('έ'), [
+    { keycode: 39, shift: false },
+    { keycode: 18, shift: false }
+  ]);
+  assert.deepEqual(inputProtocol.greekCharToEvdevSteps('χ'), [{ keycode: 45, shift: false }]);
+  assert.deepEqual(inputProtocol.greekCharToEvdevSteps('ω'), [{ keycode: 47, shift: false }]);
+  assert.deepEqual(inputProtocol.greekCharToEvdevSteps('ς'), [{ keycode: 17, shift: false }]);
+  assert.deepEqual(inputProtocol.greekCharToEvdevSteps('ΐ'), [
+    { keycode: 17, shift: true },
+    { keycode: 23, shift: false }
+  ]);
+});
+
+test('Windows Remote Desktop (mstsc.exe) detection, capture recovery decision, and console source selection', () => {
+  assert.equal(inputProtocol.isWindowsRdpEnv({ SESSIONNAME: 'RDP-Tcp#0' }, 'win32', false), true);
+  assert.equal(inputProtocol.isWindowsRdpEnv({ SESSIONNAME: 'Console', CLIENTNAME: 'LAPTOP' }, 'win32', false), false);
+  assert.equal(inputProtocol.isWindowsRdpEnv({ SESSIONNAME: '', CLIENTNAME: 'LAPTOP-PC' }, 'win32', false), true);
+  assert.equal(inputProtocol.isWindowsRdpEnv({ SESSIONNAME: 'Console' }, 'win32', true), true);
+  assert.equal(inputProtocol.isWindowsRdpEnv({ SESSIONNAME: 'RDP-Tcp#0' }, 'linux', true), false);
+
+  assert.equal(
+    inputProtocol.shouldRecoverCaptureOnTrackEnded({
+      platform: 'win32',
+      manualStop: false,
+      epochMatches: true,
+      hostActive: true
+    }),
+    true
+  );
+  assert.equal(
+    inputProtocol.shouldRecoverCaptureOnTrackEnded({
+      platform: 'win32',
+      manualStop: true,
+      epochMatches: true,
+      hostActive: true
+    }),
+    false
+  );
+  assert.equal(
+    inputProtocol.shouldRecoverCaptureOnTrackEnded({
+      platform: 'linux',
+      manualStop: false,
+      epochMatches: true,
+      hostActive: true
+    }),
+    false
+  );
+
+  const consoleSources = [
+    { id: 'wayland-display:1', name: 'Wayland Display', displayId: '1' },
+    { id: 'screen:console:0', name: 'Display 1', displayId: '10' },
+    { id: 'screen:1:0', name: 'Display 2', displayId: '20' }
+  ];
+  assert.equal(
+    inputProtocol.selectReplacementCaptureSource(consoleSources, 'screen:1:0', '10').id,
+    'screen:1:0'
+  );
+  assert.equal(
+    inputProtocol.selectReplacementCaptureSource(consoleSources, 'screen:rdp:0', '20').id,
+    'screen:1:0'
+  );
+  assert.equal(
+    inputProtocol.selectReplacementCaptureSource(consoleSources, 'screen:rdp:0', '99').id,
+    'screen:console:0'
+  );
+
+  const csharp = verifyWin32Worker.extractWorkerCSharp();
+  assert.match(csharp, /WTSQuerySessionInformation/);
+  assert.match(csharp, /RedirectSessionToConsole/);
+  assert.match(csharp, /SetKeepConsoleOnRdpDisconnect/);
+  assert.match(csharp, /SyncInputDesktop/);
+  assert.ok(!csharp.includes('System.IO.Pipes'));
+  assert.ok(!csharp.includes('System.Security.Principal'));
+  assert.ok(!csharp.includes('System.Diagnostics'));
+});
