@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Optional release tag to publish (for example v3.3). Leave blank to build downloadable test artifacts only."
+        description: "Optional release tag to publish (for example v3.4). Leave blank to build downloadable test artifacts only."
         required: false
         type: string
 
@@ -430,12 +430,12 @@ jobs:
           files: release-assets/*
           generate_release_notes: true
           body: |
-            ### What's Fixed in mswnlink 3.3
-            - **Fedora Wayland Client ↔ Host Interactivity & Stop-Sharing Fix**: Native Python3 `Gio.DBusConnection` (`UNIX_FD` `SCM_RIGHTS`) portal worker + hardened non-singleton `dbus-next` fallback eliminates `Tried to write a message to a closed stream`, stops duplicate GNOME ScreenCast popups (`DcSctpTransport4->OnAborted`), and makes **Start sharing / Stop sharing** instant and non-blocking.
-            - **Custom Executable Icons Across All Platforms**: Multi-resolution BMP/PNG `.ico` (Windows `.exe`), `.icns` + `.VolumeIcon.icns` (macOS `.dmg` & `.app`), and Freedesktop hicolor `.DirIcon` + GIO custom file icon integration (Fedora `.AppImage`).
-            - **Cross-OS Copy & Paste (Electron 45 Async Fix)**: Awaits Electron 45's async `clipboard.readText()` / `writeText()` (fixing `[object Promise]` paste), live two-way clipboard sync when unfocused, atomic `Ctrl+V` / `Cmd+V` paste sync, and macOS `Edit` menu routing.
-            - **International Keyboard, Quotes (`'`) & Greek (`έχω`)**: Hidden viewer IME/dead-key capture surface + cross-platform Unicode/XKB keysym text injection across Fedora Wayland, Windows, macOS, and X11.
-            - **macOS Screen Recording Permissions & Windows Task Manager Control**: Synchronous `getDisplayMedia()`, macOS 15 Sequoia picker fallback, inside-out ad-hoc Mach-O signing (Intel x64 + Apple Silicon), and Named-Pipe Win32 `SendInput` + UIPI escape guard.
+            ### What's Fixed in mswnlink v3.4
+            - **Windows Remote Desktop (`mstsc.exe`) Host Share Keep-Alive & Console Handoff**: Closing Windows Remote Desktop no longer stops `mswnlink` screen sharing automatically. The elevated Win32 helper watches `WTSQuerySessionInformation` to transfer disconnected RDP sessions back to the unlocked local console (`tscon.exe <SessionId> /dest:console` + `OpenInputDesktop`/`SetThreadDesktop`), while `renderer.js` keeps the LAN host & WebRTC peer alive with a standby stream and automatically hot-swaps capture (`replaceTrack`) onto the local Windows display (plus a one-click **Disconnect RDP & Keep Sharing** button in **Share this PC**).
+            - **Fedora Greek Keyboard Input (Client & Host)**: Deterministic client-side Greek dead-key composition (`;` + `ε` → `έ`, dialytika `ϊ`/`ΐ`) without XWayland/fullscreen `<textarea>` drops, paired with active GNOME XKB layout detection on Fedora Wayland hosts (`gr` physical evdev keycodes + `Uxxxx` keysyms with 15ms hold so Mutter never collides with inactive layout groups).
+            - **Fedora Fullscreen Top-of-Screen Visibility (Host & Client)**: Synchronizes viewer fullscreen with Electron's native `BrowserWindow.setFullScreen`, clamps frameless Linux windows to `display.workArea` so GNOME's 32px top bar never covers the app bar, and constrains `#remote-video` (`min-height: 0; max-height: 100%; object-fit: contain`) so the top of the shared screen is never clipped.
+            - **Restored Original mswnlink Logo Across App & All Executables**: Restores the classic 4-quadrant mswnlink emblem across the app UI (`assets/mswnlink.svg`, `mswnlink.png`) and all built executables (`mswnlink-windows-v3.4-x64.exe`, `mswnlink-macos-v3.4-arm64.dmg`, `mswnlink-macos-v3.4-x64.dmg`, and `mswnlink-fedora-v3.4-x86_64.AppImage`).
+            - **Wayland Portal Stability, Electron 45 Clipboard & Task Manager UIPI**: Preserves native Python3 `Gio.DBusConnection` portal worker, non-sticking **Start/Stop sharing**, async Electron 45 clipboard sync (no `[object]` paste), macOS Sequoia ScreenCaptureKit fallback, and Windows Task Manager `SendInput` helper.
 
             ### Install or Upgrade on macOS (clears Gatekeeper quarantine & refreshes stale TCC permissions)
             Paste into Terminal:
