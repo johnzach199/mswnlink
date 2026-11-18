@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, desktopCapturer, session, shell, safeStorage, clipboard, dialog, screen, Menu, powerSaveBlocker, nativeTheme, systemPreferences } = require('electron');
+const { app, BrowserWindow, ipcMain, desktopCapturer, session, shell, safeStorage, clipboard, dialog, screen, Menu, powerSaveBlocker, nativeTheme, nativeImage, systemPreferences } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('path');
 const os = require('os');
@@ -20,6 +20,15 @@ const {
   parseDarwinMajor,
   evaluateMacScreenPermission,
   normalizeClipboardText,
+  normalizeClipboardPayload,
+  clipboardPayloadSignature,
+  encodeWindowsDropFiles,
+  decodeWindowsDropFiles,
+  decodeWindowsFileNameW,
+  encodeMacFilenamesPlist,
+  decodeMacFilenamesPlist,
+  encodeUriList,
+  parseUriListPaths,
   isLinuxWaylandEnv,
   isWindowsRdpEnv
 } = require('./lib/input-protocol');
@@ -88,14 +97,19 @@ let discoveryTimer = null;
 const discoveredDevices = new Map();
 // Clipboard sync is enabled by default as requested; users can disable it in the UI.
 // Feature preferences are persisted so the settings survive app restarts.
-let localFeaturePreferences = { clipboard: true, fileTransfer: false, monitorSwitching: true };
+const CLIPBOARD_FILES_STAGING_DIR = path.join(os.tmpdir(), 'mswnlink-clipboard');
+let localFeaturePreferences = { clipboard: true, fileTransfer: true, monitorSwitching: true };
 const incomingFileHandles = new Map();
+const allowedClipboardSourcePaths = new Set();
 let viewerSessionActive = false;
 let sessionPowerSaveBlockerId = null;
 let mainClipboardWatcher = null;
 let mainClipboardPollInFlight = false;
+let mainClipboardPollCount = 0;
 let clipboardFallbackBusy = false;
 let lastObservedMainClipboard = '';
+let lastObservedMainClipboardSignature = '';
+let lastObservedImagePayload = null;
 let displayMediaUsingSystemPicker = null;
 let linuxWorkAreaMaximized = false;
 let linuxNormalBounds = null;
@@ -105,7 +119,7 @@ function featurePreferencesPath() {
 }
 
 async function loadLocalFeaturePreferences() {
-  const defaults = { clipboard: true, fileTransfer: false, monitorSwitching: true };
+  const defaults = { clipboard: true, fileTransfer: true, monitorSwitching: true };
   try {
     const raw = await fs.readFile(featurePreferencesPath(), 'utf8');
     const stored = JSON.parse(raw);
@@ -156,7 +170,7 @@ function createWindow() {
     minWidth: minWindowWidth,
     minHeight: minWindowHeight,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#0d1110' : '#f2f5f4',
-    title: 'mswnlink v3.4',
+    title: 'mswnlink v4',
     ...(windowIconPath ? { icon: windowIconPath } : {}),
     // Replace the native title bar and default File/Edit/View menu with the
     // app's own draggable top bar in index.html. macOS keeps its native traffic
@@ -401,6 +415,150 @@ function hasActiveSession() {
   return viewerSessionActive || Boolean(activeSocket && activeSocket.readyState === WebSocket.OPEN);
 }
 
+function isInsideClipboardStagingDir(filePath) {
+  if (typeof filePath !== 'string' || !filePath.trim()) return false;
+  const resolved = path.resolve(filePath);
+  const stagingRoot = path.resolve(CLIPBOARD_FILES_STAGING_DIR);
+  return resolved.startsWith(`${stagingRoot}${path.sep}`);
+}
+
+async function resolveUniquePath(targetDir, fileName) {
+  const parsed = path.parse(fileName);
+  const baseName = parsed.name || 'received-file';
+  const ext = parsed.ext || '';
+  for (let attempt = 0; attempt < 5000; attempt += 1) {
+    const candidateName = attempt === 0 ? `${baseName}${ext}` : `${baseName} (${attempt})${ext}`;
+    const candidatePath = path.join(targetDir, candidateName);
+    try {
+      await fs.access(candidatePath);
+    } catch {
+      return candidatePath;
+    }
+  }
+  return path.join(targetDir, `${baseName}-${Date.now()}${ext}`);
+}
+
+async function readOsClipboardFiles() {
+  let candidatePaths = [];
+  try {
+    const formats = typeof clipboard.availableFormats === 'function'
+      ? await Promise.resolve(clipboard.availableFormats())
+      : [];
+    const formatSet = new Set(Array.isArray(formats) ? formats.map(f => String(f || '').toLowerCase()) : []);
+    if (process.platform === 'win32') {
+      if (formatSet.has('cf_hdrop') || formatSet.size === 0) {
+        const hdropBuf = await Promise.resolve(clipboard.readBuffer('CF_HDROP'));
+        candidatePaths = decodeWindowsDropFiles(hdropBuf);
+      }
+      if (!candidatePaths.length && (formatSet.has('filenamew') || formatSet.size === 0)) {
+        const nameWBuf = await Promise.resolve(clipboard.readBuffer('FileNameW'));
+        candidatePaths = decodeWindowsFileNameW(nameWBuf);
+      }
+    } else if (process.platform === 'darwin') {
+      if (formatSet.has('nsfilenamespboardtype') || formatSet.size === 0) {
+        const rawPlist = await Promise.resolve(clipboard.read('NSFilenamesPboardType'));
+        candidatePaths = decodeMacFilenamesPlist(typeof rawPlist === 'string' ? rawPlist : '');
+      }
+      if (!candidatePaths.length && formatSet.has('public.file-url')) {
+        const rawUrl = await Promise.resolve(clipboard.read('public.file-url'));
+        candidatePaths = parseUriListPaths(typeof rawUrl === 'string' ? rawUrl : '');
+      }
+    } else if (process.platform === 'linux') {
+      if (formatSet.has('x-special/gnome-copied-files')) {
+        const gnomeBuf = await Promise.resolve(clipboard.readBuffer('x-special/gnome-copied-files'));
+        if (Buffer.isBuffer(gnomeBuf) && gnomeBuf.length > 0) {
+          candidatePaths = parseUriListPaths(gnomeBuf.toString('utf8'), { gnomeCopiedFiles: true });
+        }
+      }
+      if (!candidatePaths.length && formatSet.has('text/uri-list')) {
+        const uriBuf = await Promise.resolve(clipboard.readBuffer('text/uri-list'));
+        if (Buffer.isBuffer(uriBuf) && uriBuf.length > 0) {
+          candidatePaths = parseUriListPaths(uriBuf.toString('utf8'));
+        }
+      }
+    }
+  } catch {}
+
+  if (!candidatePaths.length) return [];
+  const verified = [];
+  for (const rawPath of candidatePaths.slice(0, 32)) {
+    try {
+      const resolved = path.resolve(rawPath);
+      const stat = await fs.stat(resolved);
+      if (!stat.isFile() || stat.size > MAX_FILE_TRANSFER_BYTES) continue;
+      verified.push({ path: resolved, name: path.basename(resolved), size: stat.size });
+      allowedClipboardSourcePaths.add(resolved);
+    } catch {}
+  }
+  while (allowedClipboardSourcePaths.size > 256) {
+    const oldest = allowedClipboardSourcePaths.values().next().value;
+    if (!oldest) break;
+    allowedClipboardSourcePaths.delete(oldest);
+  }
+  return verified;
+}
+
+async function readOsClipboardPayload(options = {}) {
+  const checkFiles = options.checkFiles !== false && Boolean(localFeaturePreferences.fileTransfer);
+  const checkImages = options.checkImages !== false;
+
+  if (checkFiles) {
+    const files = await readOsClipboardFiles();
+    if (files.length > 0) {
+      lastObservedImagePayload = null;
+      return normalizeClipboardPayload({ kind: 'files', files });
+    }
+  }
+
+  const rawText = await Promise.resolve(clipboard.readText());
+  const text = normalizeClipboardText(rawText, MAX_CLIPBOARD_CHARS);
+  let html = '';
+  try {
+    if (typeof clipboard.readHTML === 'function') {
+      const rawHtml = await Promise.resolve(clipboard.readHTML());
+      if (typeof rawHtml === 'string' && rawHtml.trim()) {
+        html = rawHtml.slice(0, MAX_CLIPBOARD_CHARS);
+      }
+    }
+  } catch {}
+
+  let hasImageFormat = false;
+  try {
+    const formats = typeof clipboard.availableFormats === 'function'
+      ? await Promise.resolve(clipboard.availableFormats())
+      : [];
+    hasImageFormat = Array.isArray(formats) && formats.some(f => String(f || '').toLowerCase().startsWith('image/'));
+  } catch {}
+
+  if (hasImageFormat && !text.trim()) {
+    if (!checkImages && lastObservedImagePayload) {
+      return lastObservedImagePayload;
+    }
+    try {
+      const image = await Promise.resolve(clipboard.readImage());
+      if (image && typeof image.isEmpty === 'function' && !image.isEmpty()) {
+        const png = image.toPNG();
+        if (Buffer.isBuffer(png) && png.length > 0 && png.length <= 6 * 1024 * 1024) {
+          const payload = normalizeClipboardPayload({
+            kind: 'image',
+            text,
+            html: '',
+            imageBase64: png.toString('base64')
+          });
+          lastObservedImagePayload = payload;
+          return payload;
+        }
+      }
+    } catch {}
+  }
+
+  lastObservedImagePayload = null;
+  if (html && text.trim()) {
+    return normalizeClipboardPayload({ kind: 'context', text, html });
+  }
+  return normalizeClipboardPayload({ kind: 'text', text, html: '' });
+}
+
 async function readOsClipboardText() {
   // Electron 45+ changed clipboard.readText() to return Promise<string>.
   // Always await Promise.resolve(...) and normalize so "[object Promise]" is impossible.
@@ -408,26 +566,82 @@ async function readOsClipboardText() {
   return normalizeClipboardText(raw, MAX_CLIPBOARD_CHARS);
 }
 
-async function writeOsClipboardText(value) {
-  const safe = normalizeClipboardText(value, MAX_CLIPBOARD_CHARS);
-  await Promise.resolve(clipboard.writeText(safe));
-  return safe;
+async function writeOsClipboardPayload(value) {
+  const payload = normalizeClipboardPayload(value, { maxTextChars: MAX_CLIPBOARD_CHARS });
+  lastObservedMainClipboard = payload.text;
+  lastObservedMainClipboardSignature = clipboardPayloadSignature(payload);
+
+  if (payload.kind === 'image' && payload.imageBase64) {
+    const img = nativeImage.createFromBuffer(Buffer.from(payload.imageBase64, 'base64'));
+    if (!img.isEmpty()) {
+      lastObservedImagePayload = payload;
+      await Promise.resolve(clipboard.write({
+        image: img,
+        ...(payload.text ? { text: payload.text } : {}),
+        ...(payload.html ? { html: payload.html } : {})
+      }));
+      return payload;
+    }
+  }
+  lastObservedImagePayload = null;
+  if (payload.kind === 'context' && payload.html) {
+    await Promise.resolve(clipboard.write({ text: payload.text || '', html: payload.html }));
+    return payload;
+  }
+  await Promise.resolve(clipboard.writeText(payload.text || ''));
+  return payload;
+}
+
+async function writeOsClipboardFiles(filePaths = []) {
+  const valid = [];
+  for (const rawPath of (Array.isArray(filePaths) ? filePaths : []).slice(0, 32)) {
+    try {
+      const resolved = path.resolve(String(rawPath || ''));
+      const stat = await fs.stat(resolved);
+      if (stat.isFile()) valid.push({ path: resolved, name: path.basename(resolved), size: stat.size });
+    } catch {}
+  }
+  if (!valid.length) throw new Error('No valid files to place on the clipboard.');
+  const payload = normalizeClipboardPayload({ kind: 'files', files: valid });
+  lastObservedImagePayload = null;
+  lastObservedMainClipboard = '';
+  lastObservedMainClipboardSignature = clipboardPayloadSignature(payload);
+
+  const absPaths = valid.map(item => item.path);
+  if (process.platform === 'win32') {
+    await Promise.resolve(clipboard.writeBuffer('CF_HDROP', encodeWindowsDropFiles(absPaths)));
+  } else if (process.platform === 'darwin') {
+    await Promise.resolve(clipboard.writeBuffer('NSFilenamesPboardType', Buffer.from(encodeMacFilenamesPlist(absPaths), 'utf8')));
+  } else {
+    await Promise.resolve(clipboard.writeBuffer('text/uri-list', Buffer.from(encodeUriList(absPaths), 'utf8')));
+  }
+  return { ok: true, files: valid, payload };
 }
 
 function syncMainClipboardWatcherState() {
   const shouldWatch = hasActiveSession() && Boolean(localFeaturePreferences.clipboard);
   if (shouldWatch && !mainClipboardWatcher) {
-    readOsClipboardText()
-      .then((initial) => { lastObservedMainClipboard = initial; })
-      .catch(() => { lastObservedMainClipboard = ''; });
+    mainClipboardPollCount = 0;
+    readOsClipboardPayload({ checkImages: true })
+      .then((initial) => {
+        lastObservedMainClipboard = initial.text;
+        lastObservedMainClipboardSignature = clipboardPayloadSignature(initial);
+      })
+      .catch(() => {
+        lastObservedMainClipboard = '';
+        lastObservedMainClipboardSignature = '';
+      });
     mainClipboardWatcher = setInterval(async () => {
       if (mainClipboardPollInFlight || clipboardFallbackBusy || !hasActiveSession() || !localFeaturePreferences.clipboard) return;
       mainClipboardPollInFlight = true;
+      mainClipboardPollCount = (mainClipboardPollCount + 1) % 3;
       try {
-        const current = await readOsClipboardText();
-        if (current !== lastObservedMainClipboard) {
-          lastObservedMainClipboard = current;
-          sendToUI('local-clipboard-changed', { text: current });
+        const current = await readOsClipboardPayload({ checkImages: mainClipboardPollCount === 0 });
+        const sig = clipboardPayloadSignature(current);
+        if (sig !== lastObservedMainClipboardSignature) {
+          lastObservedMainClipboard = current.text;
+          lastObservedMainClipboardSignature = sig;
+          sendToUI('local-clipboard-changed', { text: current.text, payload: current });
         }
       } catch {}
       finally {
@@ -637,7 +851,7 @@ async function ensureLinuxDesktopIconIntegration() {
       const desktopEntry = [
         '[Desktop Entry]',
         'Type=Application',
-        'Name=mswnlink v3.4',
+        'Name=mswnlink v4',
         'Comment=Local-network remote desktop and file sharing',
         `Exec=${escapedExec} %U`,
         `Icon=${destIconPath}`,
@@ -1790,22 +2004,55 @@ app.whenReady().then(async () => {
   ipcMain.handle('read-local-clipboard', async () => {
     if (!localFeaturePreferences.clipboard) return { ok: false, error: 'Enable clipboard sharing on this device first.' };
     try {
-      const text = await readOsClipboardText();
-      lastObservedMainClipboard = text;
-      return { ok: true, text };
+      const payload = await readOsClipboardPayload({ checkImages: true });
+      lastObservedMainClipboard = payload.text;
+      lastObservedMainClipboardSignature = clipboardPayloadSignature(payload);
+      return { ok: true, text: payload.text, payload };
     } catch (error) {
       return { ok: false, error: error && error.message ? error.message : 'Could not read the local clipboard.' };
     }
   });
   ipcMain.handle('write-local-clipboard', async (_event, value) => {
     if (!localFeaturePreferences.clipboard) return { ok: false, error: 'Clipboard sharing is disabled on this device.' };
-    if (typeof value !== 'string' || value.length > MAX_CLIPBOARD_CHARS) return { ok: false, error: 'Clipboard text is invalid or too large.' };
+    const payload = normalizeClipboardPayload(value, { maxTextChars: MAX_CLIPBOARD_CHARS });
     try {
-      lastObservedMainClipboard = value;
-      await writeOsClipboardText(value);
+      await writeOsClipboardPayload(payload);
       return { ok: true };
     } catch (error) {
       return { ok: false, error: error && error.message ? error.message : 'Could not update the local clipboard.' };
+    }
+  });
+  ipcMain.handle('write-clipboard-files', async (_event, rawPaths) => {
+    if (!localFeaturePreferences.clipboard || !localFeaturePreferences.fileTransfer) {
+      return { ok: false, error: 'Clipboard and file sharing must both be enabled.' };
+    }
+    const list = Array.isArray(rawPaths) ? rawPaths : [];
+    const safePaths = list.filter(item => isInsideClipboardStagingDir(item));
+    if (!safePaths.length) return { ok: false, error: 'No staged clipboard files were provided.' };
+    try {
+      await writeOsClipboardFiles(safePaths);
+      return { ok: true, count: safePaths.length };
+    } catch (error) {
+      return { ok: false, error: error && error.message ? error.message : 'Could not place files on the clipboard.' };
+    }
+  });
+  ipcMain.handle('read-file-from-path', async (_event, filePath) => {
+    if (!hasActiveSession()) return { ok: false, error: 'No active remote session.' };
+    if (!localFeaturePreferences.fileTransfer) return { ok: false, error: 'File transfers are disabled on this device.' };
+    if (typeof filePath !== 'string' || !filePath.trim()) return { ok: false, error: 'Invalid file path.' };
+    const resolved = path.resolve(filePath);
+    if (!allowedClipboardSourcePaths.has(resolved)) {
+      return { ok: false, error: 'File is not in the current clipboard selection.' };
+    }
+    try {
+      const stat = await fs.stat(resolved);
+      if (!stat.isFile()) return { ok: false, error: 'Only regular files can be transferred.' };
+      if (stat.size > MAX_FILE_TRANSFER_BYTES) return { ok: false, error: 'Files must be 100 MB or smaller.' };
+      const bytes = await fs.readFile(resolved);
+      const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      return { ok: true, name: path.basename(resolved), size: stat.size, data };
+    } catch (error) {
+      return { ok: false, error: error && error.message ? error.message : 'Could not read copied file.' };
     }
   });
   ipcMain.handle('pick-file-to-send', async () => {
@@ -1826,13 +2073,27 @@ app.whenReady().then(async () => {
     const name = safeTransferFileName(details && details.name);
     const size = Number(details && details.size);
     if (!Number.isSafeInteger(size) || size < 0 || size > MAX_FILE_TRANSFER_BYTES) return { ok: false, error: 'File must be 100 MB or smaller.' };
-    const choice = await dialog.showSaveDialog(mainWindow, { title: 'Save incoming file', defaultPath: name, buttonLabel: 'Accept file' });
-    if (choice.canceled || !choice.filePath) return { ok: false, cancelled: true };
+
+    const mode = details && ['drop', 'clipboard', 'dialog'].includes(details.mode) ? details.mode : 'drop';
+    let targetPath = '';
+    if (mode === 'clipboard') {
+      await fs.mkdir(CLIPBOARD_FILES_STAGING_DIR, { recursive: true, mode: 0o700 });
+      targetPath = await resolveUniquePath(CLIPBOARD_FILES_STAGING_DIR, name);
+    } else if (mode === 'drop') {
+      const downloadsDir = app.getPath('downloads');
+      await fs.mkdir(downloadsDir, { recursive: true });
+      targetPath = await resolveUniquePath(downloadsDir, name);
+    } else {
+      const choice = await dialog.showSaveDialog(mainWindow, { title: 'Save incoming file', defaultPath: name, buttonLabel: 'Accept file' });
+      if (choice.canceled || !choice.filePath) return { ok: false, cancelled: true };
+      targetPath = choice.filePath;
+    }
+
     const token = crypto.randomBytes(18).toString('hex');
-    const temporaryPath = `${choice.filePath}.mswnlink-${token}.part`;
+    const temporaryPath = `${targetPath}.mswnlink-${token}.part`;
     const handle = await fs.open(temporaryPath, 'wx', 0o600);
-    incomingFileHandles.set(token, { handle, temporaryPath, finalPath: choice.filePath, expected: size, written: 0 });
-    return { ok: true, token };
+    incomingFileHandles.set(token, { handle, temporaryPath, finalPath: targetPath, mode, expected: size, written: 0 });
+    return { ok: true, token, targetPath, mode };
   });
   ipcMain.handle('write-file-chunk', async (_event, token, data) => {
     const transfer = incomingFileHandles.get(String(token || ''));
@@ -1858,7 +2119,7 @@ app.whenReady().then(async () => {
         if (process.platform === 'win32') { await fs.copyFile(transfer.temporaryPath, transfer.finalPath); await fs.unlink(transfer.temporaryPath); }
         else throw error;
       }
-      return { ok: true, path: transfer.finalPath };
+      return { ok: true, path: transfer.finalPath, mode: transfer.mode, name: path.basename(transfer.finalPath) };
     } catch (error) {
       try { await transfer.handle.close(); } catch {}
       try { await fs.unlink(transfer.temporaryPath); } catch {}
@@ -1893,6 +2154,7 @@ app.on('before-quit', () => {
     transfer.handle.close().catch(() => {});
     fs.unlink(transfer.temporaryPath).catch(() => {});
   }
+  fs.rm(CLIPBOARD_FILES_STAGING_DIR, { recursive: true, force: true }).catch(() => {});
   stopHost().catch(error => console.warn('[mswnlink] Shutdown cleanup failed:', error.message));
 });
 

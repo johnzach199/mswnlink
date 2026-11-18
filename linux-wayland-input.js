@@ -77,6 +77,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import gi
 from gi.repository import Gio, GLib
 
@@ -502,62 +503,102 @@ for raw_line in sys.stdin:
             except Exception:
                 active_layout = ''
 
+            held_shifts = [
+                int(c) for c in (msg.get('heldShiftCodes') or [])
+                if int(c) in (42, 54)
+            ]
+
             def tap_evdev(kcode, with_shift=False):
-                if with_shift:
+                pressed_shift = False
+                released_shifts = []
+                pressed_key = False
+                try:
+                    if with_shift and not held_shifts:
+                        conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                       GLib.Variant('(oa{sv}iu)', (session_handle, {}, 42, 1)),
+                                       None, Gio.DBusCallFlags.NONE, 1500, None)
+                        pressed_shift = True
+                        time.sleep(0.003)
+                    elif not with_shift and held_shifts:
+                        for sc in held_shifts:
+                            conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                           GLib.Variant('(oa{sv}iu)', (session_handle, {}, sc, 0)),
+                                           None, Gio.DBusCallFlags.NONE, 1500, None)
+                            released_shifts.append(sc)
+                        time.sleep(0.002)
+
                     conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
-                                   GLib.Variant('(oa{sv}iu)', (session_handle, {}, 42, 1)),
+                                   GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(kcode), 1)),
                                    None, Gio.DBusCallFlags.NONE, 1500, None)
-                    time.sleep(0.003)
-                conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
-                               GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(kcode), 1)),
-                               None, Gio.DBusCallFlags.NONE, 1500, None)
-                time.sleep(0.005)
-                conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
-                               GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(kcode), 0)),
-                               None, Gio.DBusCallFlags.NONE, 1500, None)
-                if with_shift:
-                    time.sleep(0.002)
-                    conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
-                                   GLib.Variant('(oa{sv}iu)', (session_handle, {}, 42, 0)),
-                                   None, Gio.DBusCallFlags.NONE, 1500, None)
+                    pressed_key = True
+                    time.sleep(0.005)
+                finally:
+                    if pressed_key:
+                        try:
+                            conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                           GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(kcode), 0)),
+                                           None, Gio.DBusCallFlags.NONE, 1500, None)
+                        except Exception:
+                            pass
+                    if pressed_shift:
+                        time.sleep(0.002)
+                        try:
+                            conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                           GLib.Variant('(oa{sv}iu)', (session_handle, {}, 42, 0)),
+                                           None, Gio.DBusCallFlags.NONE, 1500, None)
+                        except Exception:
+                            pass
+                    if released_shifts:
+                        time.sleep(0.002)
+                        for sc in released_shifts:
+                            try:
+                                conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                               GLib.Variant('(oa{sv}iu)', (session_handle, {}, sc, 1)),
+                                               None, Gio.DBusCallFlags.NONE, 1500, None)
+                            except Exception:
+                                pass
                 time.sleep(0.003)
 
             def tap_sym(ksym, hold_sec):
                 conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeysym',
                                GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(ksym), 1)),
                                None, Gio.DBusCallFlags.NONE, 1500, None)
-                if hold_sec > 0:
-                    time.sleep(hold_sec)
-                conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeysym',
-                               GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(ksym), 0)),
-                               None, Gio.DBusCallFlags.NONE, 1500, None)
+                try:
+                    if hold_sec > 0:
+                        time.sleep(hold_sec)
+                finally:
+                    conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeysym',
+                                   GLib.Variant('(oa{sv}iu)', (session_handle, {}, int(ksym), 0)),
+                                   None, Gio.DBusCallFlags.NONE, 1500, None)
                 if hold_sec > 0:
                     time.sleep(0.004)
 
-            phys_evdev = msg.get('physicalEvdev')
             items = msg.get('items') or []
-            if active_layout == 'gr' and phys_evdev is not None and len(items) == 1:
-                tap_evdev(int(phys_evdev), bool(msg.get('shiftKey')))
-            else:
-                for item in items:
-                    cp = int(item.get('cp', 0))
-                    primary_sym = int(item.get('primarySym', 0))
-                    unicode_sym = int(item.get('unicodeSym', 0))
-                    greek_steps = item.get('greekSteps')
-                    if active_layout == 'gr' and greek_steps:
-                        for step in greek_steps:
-                            tap_evdev(int(step['keycode']), bool(step.get('shift')))
-                        continue
-                    if cp > 0x7f:
-                        # Prefer 0x01000000|cp (Uxxxx) with a 15ms hold so GNOME Mutter never
-                        # collides with inactive secondary XKB groups (e.g. group 1 'gr' while
-                        # group 0 'us' is active) and clients read the ephemeral keymap before keyup.
-                        try:
-                            tap_sym(unicode_sym, 0.015)
-                        except Exception:
-                            tap_sym(primary_sym, 0.015)
-                    else:
+            for item in items:
+                cp = int(item.get('cp', 0))
+                primary_sym = int(item.get('primarySym', 0))
+                unicode_sym = int(item.get('unicodeSym', 0))
+                greek_steps = item.get('greekSteps')
+                if active_layout == 'gr' and greek_steps:
+                    for step in greek_steps:
+                        tap_evdev(int(step['keycode']), bool(step.get('shift')))
+                    continue
+                if cp > 0x7f:
+                    # Prefer 0x01000000|cp (Uxxxx) with a 15ms hold so GNOME Mutter never
+                    # collides with inactive secondary XKB groups (e.g. group 1 'gr' while
+                    # group 0 'us' is active) and clients read the ephemeral keymap before keyup.
+                    try:
+                        tap_sym(unicode_sym, 0.015)
+                    except Exception:
+                        tap_sym(primary_sym, 0.015)
+                else:
+                    try:
                         tap_sym(primary_sym, 0.004)
+                    except Exception:
+                        if unicode_sym and unicode_sym != primary_sym:
+                            tap_sym(unicode_sym, 0.004)
+                        else:
+                            raise
         if req_id is not None:
             emit_json({'id': req_id, 'ok': True})
     except Exception as call_err:
@@ -1270,21 +1311,14 @@ class LinuxWaylandInput {
         });
       }
       if (!items.length) return { ok: true };
-      const code = meta && typeof meta.code === 'string' ? meta.code : '';
-      const physicalEvdev = (
-        items.length === 1 &&
-        items[0].cp <= 0x7f &&
-        (/^Key[A-Z]$/.test(code) || code === 'Semicolon') &&
-        EVDEV_KEYCODES[code]
-      )
-        ? EVDEV_KEYCODES[code]
-        : null;
+      const heldShiftCodes = [];
+      if (this.heldKeys.has(EVDEV_KEYCODES.ShiftLeft)) heldShiftCodes.push(EVDEV_KEYCODES.ShiftLeft);
+      if (this.heldKeys.has(EVDEV_KEYCODES.ShiftRight)) heldShiftCodes.push(EVDEV_KEYCODES.ShiftRight);
       try {
         await this._sendPyCommand({
           cmd: 'typeBatch',
           items,
-          physicalEvdev,
-          shiftKey: Boolean(meta && meta.shiftKey)
+          heldShiftCodes
         });
         return { ok: true };
       } catch (err) {

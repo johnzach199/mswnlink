@@ -18,32 +18,43 @@ case "$(uname -m)" in
   *) echo "Unsupported Mac architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-echo "Looking up the latest mswnlink release…"
-RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")"
-URL="$(printf '%s' "$RELEASE_JSON" | grep -o '"browser_download_url"[^,}]*' | sed 's/.*: *"//; s/"$//' | grep -i "macos" | grep -i "$ARCH" | grep -i '\.dmg$' | head -n 1 || true)"
-if [ -z "$URL" ]; then
-  echo "Could not find a macOS $ARCH download in the latest release: https://github.com/$REPO/releases/latest" >&2
-  exit 1
-fi
-
+LOCAL_DMG="${1:-}"
 WORK="$(mktemp -d)"
 MOUNT="$WORK/mount"
 mkdir -p "$MOUNT"
-cleanup() { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; rm -rf "$WORK"; }
+cleanup() { hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || hdiutil detach "$MOUNT" -force -quiet >/dev/null 2>&1 || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-echo "Downloading $(basename "$URL")…"
-curl -fL --progress-bar -o "$WORK/mswnlink.dmg" "$URL"
+DMG_PATH="$WORK/mswnlink.dmg"
+if [ -n "$LOCAL_DMG" ]; then
+  if [ ! -f "$LOCAL_DMG" ]; then
+    echo "DMG file not found: $LOCAL_DMG" >&2
+    exit 1
+  fi
+  echo "Installing from local DMG $(basename "$LOCAL_DMG")…"
+  cp "$LOCAL_DMG" "$DMG_PATH"
+  xattr -cr "$DMG_PATH" 2>/dev/null || true
+else
+  echo "Looking up the latest mswnlink release…"
+  RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null || curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=1")"
+  URL="$(printf '%s' "$RELEASE_JSON" | grep -o '"browser_download_url"[^,}]*' | sed 's/.*: *"//; s/"$//' | grep -i "macos" | grep -i "$ARCH" | grep -i '\.dmg$' | head -n 1 || true)"
+  if [ -z "$URL" ]; then
+    echo "Could not find a macOS $ARCH download in the latest release: https://github.com/$REPO/releases" >&2
+    exit 1
+  fi
+  echo "Downloading $(basename "$URL")…"
+  curl -fL --progress-bar -o "$DMG_PATH" "$URL"
+fi
 
 echo "Installing to /Applications…"
-hdiutil attach "$WORK/mswnlink.dmg" -mountpoint "$MOUNT" -nobrowse -quiet
+hdiutil attach "$DMG_PATH" -mountpoint "$MOUNT" -nobrowse -quiet
 if [ ! -d "$MOUNT/$APP" ]; then echo "$APP was not found inside the download." >&2; exit 1; fi
 pkill -x mswnlink 2>/dev/null || true
 HAD_EXISTING=0
 if [ -d "/Applications/$APP" ]; then HAD_EXISTING=1; fi
 rm -rf "/Applications/$APP"
 cp -R "$MOUNT/$APP" "/Applications/$APP"
-# Belt and braces: make sure no quarantine flag is present.
+# Clear Gatekeeper quarantine so Sequoia / Tahoe never reports an ad-hoc build as damaged.
 xattr -cr "/Applications/$APP" 2>/dev/null || true
 
 # Ad-hoc signed builds change CDHash on each release. Resetting stale TCC entries

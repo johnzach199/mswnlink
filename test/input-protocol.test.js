@@ -318,10 +318,10 @@ test('Wayland Gio.DBusConnection Python worker compiles cleanly and multi-OS exe
 
   const rootDir = path.join(__dirname, '..');
   const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '3.4.0');
-  assert.equal(pkg.build.win.artifactName, 'mswnlink-windows-v3.4-${arch}.${ext}');
-  assert.equal(pkg.build.mac.artifactName, 'mswnlink-macos-v3.4-${arch}.${ext}');
-  assert.equal(pkg.build.linux.artifactName, 'mswnlink-fedora-v3.4-${arch}.${ext}');
+  assert.equal(pkg.version, '4.0.0');
+  assert.equal(pkg.build.win.artifactName, 'mswnlink-windows-v4-${arch}.${ext}');
+  assert.equal(pkg.build.mac.artifactName, 'mswnlink-macos-v4-${arch}.${ext}');
+  assert.equal(pkg.build.linux.artifactName, 'mswnlink-fedora-v4-${arch}.${ext}');
   assert.equal(pkg.build.win.icon, 'assets/mswnlink.ico');
   assert.equal(pkg.build.win.signAndEditExecutable, true);
   assert.equal(pkg.build.mac.icon, 'assets/mswnlink.icns');
@@ -439,4 +439,258 @@ test('Windows Remote Desktop (mstsc.exe) detection, capture recovery decision, a
   assert.ok(!csharp.includes('System.IO.Pipes'));
   assert.ok(!csharp.includes('System.Security.Principal'));
   assert.ok(!csharp.includes('System.Diagnostics'));
+});
+
+test('Fedora-to-Fedora keyboard fix (import time, try/finally key release, no ASCII->Greek clobber) & crosshair removal', () => {
+  const { execFileSync } = require('node:child_process');
+  const pyScript = LinuxWaylandInput.WAYLAND_PORTAL_PY_SCRIPT;
+  assert.match(pyScript, /^import time$/m);
+  assert.ok(!pyScript.includes('phys_evdev'), 'ASCII keys must never be overwritten by physicalEvdev on gr host');
+  assert.ok(!fs.readFileSync(path.join(__dirname, '..', 'linux-wayland-input.js'), 'utf8').includes('physicalEvdev'));
+
+  const stylesCss = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
+  assert.ok(!stylesCss.includes('cursor: crosshair'), 'crosshair cursor must be removed from remote screen');
+  assert.match(stylesCss, /#remote-video\.control-enabled\s*\{\s*cursor:\s*default;\s*\}/);
+
+  const rendererJs = fs.readFileSync(path.join(__dirname, '..', 'renderer.js'), 'utf8');
+  assert.match(rendererJs, /function focusRemoteViewerInput\(\)\s*\{\s*const video = \$\('#remote-video'\)/);
+  assert.match(rendererJs, /imeCaptureAllowedUntil/);
+
+  // Runtime execution test of Python typeBatch loop under simulated GNOME 'gr' layout + held Shift
+  const harness = `
+import io, json, sys, types
+script = sys.stdin.read()
+calls = []
+fake_conn = types.SimpleNamespace(
+    get_unique_name=lambda: ':1.55',
+    signal_subscribe=lambda *a: 1,
+    signal_unsubscribe=lambda *a: None,
+    call_sync=lambda bus, path, iface, method, variant, *rest: (
+        calls.append((method, variant.value)) or fake_variant('(o)', ('/org/freedesktop/portal/desktop/request/1_55/r',))
+    )
+)
+class fake_variant:
+    def __init__(self, sig, val):
+        self.sig = sig
+        self.value = val
+    def unpack(self):
+        return self.value
+class fake_settings:
+    @staticmethod
+    def new(_schema):
+        return types.SimpleNamespace(get_value=lambda key: fake_variant('a(ss)', [('xkb', 'gr')]))
+fake_gio = types.SimpleNamespace(
+    BusType=types.SimpleNamespace(SESSION=0),
+    DBusSignalFlags=types.SimpleNamespace(NONE=0),
+    DBusCallFlags=types.SimpleNamespace(NONE=0),
+    bus_get_sync=lambda *a: fake_conn,
+    SettingsSchemaSource=types.SimpleNamespace(get_default=lambda: types.SimpleNamespace(lookup=lambda *a: object())),
+    Settings=fake_settings
+)
+fake_glib = types.SimpleNamespace(
+    Variant=fake_variant,
+    VariantType=lambda s: s,
+    MainLoop=lambda: types.SimpleNamespace(run=lambda: None, quit=lambda: None)
+)
+gi_mod = types.ModuleType('gi')
+gi_repo = types.ModuleType('gi.repository')
+gi_repo.Gio = fake_gio
+gi_repo.GLib = fake_glib
+gi_mod.repository = gi_repo
+sys.modules['gi'] = gi_mod
+sys.modules['gi.repository'] = gi_repo
+
+# Slice out from 'elif cmd == "typeBatch":' logic or run stdin loop with mocked portal handshake
+portal_body_idx = script.index('EMPTY_OPTS =')
+prefix = script[:script.index('try:\\n    sess_tok')]
+loop_code = script[portal_body_idx:].replace('cleanup_and_exit(0)', '')
+ns = {}
+exec(prefix, ns)
+ns['session_handle'] = '/org/freedesktop/portal/desktop/session/1_55/s1'
+ns['gst_proc'] = None
+ns['cleanup_and_exit'] = lambda c=0: None
+sys.stdout = io.StringIO()
+sys.stdin = io.StringIO(json.dumps({
+    'id': 1,
+    'cmd': 'typeBatch',
+    'heldShiftCodes': [42],
+    'items': [
+        {'cp': ord('h'), 'primarySym': 0x0068, 'unicodeSym': 0x01000068, 'greekSteps': None},
+        {'cp': ord("'"), 'primarySym': 0x0027, 'unicodeSym': 0x01000027, 'greekSteps': None},
+        {'cp': ord('έ'), 'primarySym': 0x07b2, 'unicodeSym': 0x010007b2, 'greekSteps': [{'keycode': 39, 'shift': False}, {'keycode': 18, 'shift': False}]}
+    ]
+}) + '\\n')
+exec(loop_code, ns)
+out = json.loads(sys.stdout.getvalue().strip())
+assert out == {'id': 1, 'ok': True}, f'unexpected output: {out}'
+# 1) 'h' must press+release XK_h (0x0068), NEVER evdev 35 ('η')!
+sym_calls = [(c[1][2], c[1][3]) for c in calls if c[0] == 'NotifyKeyboardKeysym']
+assert sym_calls == [(0x0068, 1), (0x0068, 0), (0x0027, 1), (0x0027, 0)], sym_calls
+# 2) 'έ' uses greekSteps with heldShift (42) temporarily released, keys 39 & 18 tapped, and 42 restored
+kc_calls = [(c[1][2], c[1][3]) for c in calls if c[0] == 'NotifyKeyboardKeycode']
+assert (35, 1) not in kc_calls
+assert kc_calls[0] == (42, 0) and kc_calls[-1] == (42, 1), kc_calls
+assert (39, 1) in kc_calls and (39, 0) in kc_calls and (18, 1) in kc_calls and (18, 0) in kc_calls
+`;
+  try {
+    execFileSync('python3', ['-c', harness], {
+      input: pyScript,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 5000
+    });
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') throw err;
+  }
+});
+
+test('cross-OS clipboard file codecs (DropFiles, NSFilenamesPboardType, URI-list) and rich context normalization', () => {
+  // 1. Windows CF_HDROP (DROPFILES) UTF-16LE roundtrip & FileNameW
+  const winPaths = ['C:\\Users\\demo\\Docs\\έχω note.txt', 'D:\\Share\\report #1.pdf'];
+  const dropBuf = inputProtocol.encodeWindowsDropFiles(winPaths);
+  assert.equal(dropBuf.readUInt32LE(0), 20);
+  assert.equal(dropBuf.readUInt32LE(16), 1);
+  assert.deepEqual(inputProtocol.decodeWindowsDropFiles(dropBuf), winPaths);
+
+  const singleBuf = Buffer.from('C:\\Temp\\archive.zip\0\0', 'utf16le');
+  assert.deepEqual(inputProtocol.decodeWindowsFileNameW(singleBuf), ['C:\\Temp\\archive.zip']);
+
+  // 2. macOS NSFilenamesPboardType XML plist escaping & roundtrip
+  const macPaths = ['/Users/demo/Docs/Notes & Plans.md', "/Users/demo/Pictures/O'Brien <1>.png"];
+  const plistXml = inputProtocol.encodeMacFilenamesPlist(macPaths);
+  assert.match(plistXml, /<plist version="1\.0">/);
+  assert.match(plistXml, /&amp;/);
+  assert.match(plistXml, /&apos;/);
+  assert.deepEqual(inputProtocol.decodeMacFilenamesPlist(plistXml), macPaths);
+
+  // 3. Linux text/uri-list & x-special/gnome-copied-files roundtrip (with # ? spaces & comments)
+  const linuxPaths = ['/home/fedora/Desktop/έχω notes #1?.txt', '/home/fedora/Downloads/file 2.tar.gz'];
+  const uriList = inputProtocol.encodeUriList(linuxPaths);
+  assert.deepEqual(inputProtocol.parseUriListPaths(`# comment line\n${uriList}`), linuxPaths);
+  const gnomeCopied = inputProtocol.encodeUriList(linuxPaths, { gnomeCopiedFiles: true });
+  assert.match(gnomeCopied, /^copy\n/);
+  assert.deepEqual(inputProtocol.parseUriListPaths(gnomeCopied, { gnomeCopiedFiles: true }), linuxPaths);
+  assert.deepEqual(
+    inputProtocol.parseUriListPaths('cut\nfile:///home/fedora/move%20me.txt', { gnomeCopiedFiles: true }),
+    ['/home/fedora/move me.txt']
+  );
+
+  // 4. normalizeClipboardPayload & echo-safe signature (path-independent for staged files)
+  assert.equal(inputProtocol.normalizeClipboardPayload(Promise.resolve('bad')).text, '');
+  const richContext = inputProtocol.normalizeClipboardPayload({
+    text: 'Formatted heading',
+    html: '<b>Formatted heading</b>'
+  });
+  assert.equal(richContext.kind, 'context');
+  assert.equal(richContext.html, '<b>Formatted heading</b>');
+
+  const imgPayload = inputProtocol.normalizeClipboardPayload({
+    imageBase64: 'data:image/png;base64,iVBORw0KGgo='
+  });
+  assert.equal(imgPayload.kind, 'image');
+  assert.equal(imgPayload.imageBase64, 'iVBORw0KGgo=');
+
+  const srcFilesSig = inputProtocol.clipboardPayloadSignature({
+    kind: 'files',
+    files: [
+      { path: 'C:\\Users\\Alice\\Desktop\\demo.pdf', name: 'demo.pdf', size: 4096 },
+      { path: 'C:\\Users\\Alice\\Desktop\\img.png', name: 'img.png', size: 1024 }
+    ]
+  });
+  const stagedFilesSig = inputProtocol.clipboardPayloadSignature({
+    kind: 'files',
+    files: [
+      { path: '/tmp/mswnlink-clipboard/batch-1/demo.pdf', name: 'demo.pdf', size: 4096 },
+      { path: '/tmp/mswnlink-clipboard/batch-1/img.png', name: 'img.png', size: 1024 }
+    ]
+  });
+  assert.equal(srcFilesSig, stagedFilesSig);
+});
+
+test('manual clipboard/file buttons are removed and buttonless drag-and-drop & clipboard file batching are wired', () => {
+  const rootDir = path.join(__dirname, '..');
+  const indexHtml = fs.readFileSync(path.join(rootDir, 'index.html'), 'utf8');
+  const rendererJs = fs.readFileSync(path.join(rootDir, 'renderer.js'), 'utf8');
+  const mainJs = fs.readFileSync(path.join(rootDir, 'main.js'), 'utf8');
+  const preloadJs = fs.readFileSync(path.join(rootDir, 'preload.js'), 'utf8');
+  const stylesCss = fs.readFileSync(path.join(rootDir, 'styles.css'), 'utf8');
+
+  for (const removedId of [
+    'host-send-clipboard-button',
+    'host-get-clipboard-button',
+    'host-send-file-button',
+    'send-clipboard-button',
+    'get-clipboard-button',
+    'send-file-button'
+  ]) {
+    assert.ok(!indexHtml.includes(removedId), `Manual button #${removedId} must be removed from index.html`);
+    assert.ok(!rendererJs.includes(removedId), `Manual button #${removedId} must be removed from renderer.js`);
+  }
+
+  assert.match(indexHtml, /id="viewer-drop-overlay"/);
+  assert.match(stylesCss, /\.viewer-stage\.is-drop-target/);
+  assert.match(preloadJs, /writeClipboardFiles/);
+  assert.match(preloadJs, /readFileFromPath/);
+  assert.match(mainJs, /CLIPBOARD_FILES_STAGING_DIR/);
+  assert.match(mainJs, /write-clipboard-files/);
+  assert.match(mainJs, /read-file-from-path/);
+  assert.match(mainJs, /mode === 'clipboard'/);
+  assert.match(rendererJs, /enqueueChannelFileTransfer/);
+  assert.match(rendererJs, /sendDroppedFilesOverChannel/);
+  assert.match(rendererJs, /sendClipboardFilesOverChannel/);
+  assert.match(rendererJs, /clipboard-file-batch-start/);
+  assert.match(rendererJs, /clipboard-file-batch-end/);
+});
+
+test('mswnlink v4 visual fixes: theme-switch flash guard, dark select options, toast non-overlap, mobile bar spacing, and v4 branding', () => {
+  const rootDir = path.join(__dirname, '..');
+  const indexHtml = fs.readFileSync(path.join(rootDir, 'index.html'), 'utf8');
+  const stylesCss = fs.readFileSync(path.join(rootDir, 'styles.css'), 'utf8');
+  const rendererJs = fs.readFileSync(path.join(rootDir, 'renderer.js'), 'utf8');
+  const mainJs = fs.readFileSync(path.join(rootDir, 'main.js'), 'utf8');
+
+  assert.match(indexHtml, /<title>mswnlink v4<\/title>/);
+  assert.match(indexHtml, /<span class="wordmark">mswnlink v4<\/span>/);
+  assert.match(mainJs, /title:\s*'mswnlink v4'/);
+  assert.match(mainJs, /Name=mswnlink v4/);
+
+  assert.match(stylesCss, /:root\[data-theme-switching="true"\]\s+\*/);
+  assert.match(stylesCss, /select option\s*\{[^}]*background-color:\s*var\(--surface\)/);
+  assert.match(stylesCss, /\.fullscreen-exit-overlay\s*\{[^}]*top:\s*42px;/);
+  assert.match(stylesCss, /body\[data-current-page="share"\]\s+\.toast\s*\{\s*bottom:\s*88px;\s*\}/);
+  assert.match(stylesCss, /body\[data-current-page="session"\]\s+\.toast\s*\{[^}]*top:\s*calc\(var\(--bar-h\)\s*\+\s*64px\)/);
+  assert.match(rendererJs, /dataset\.themeSwitching\s*=\s*'true'/);
+});
+
+test('macOS Sequoia/Tahoe DMG packaging fix: APFS+UDZO config, xattr cleanup, stapler target, and strict hdiutil verify', () => {
+  const rootDir = path.join(__dirname, '..');
+  const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
+  const workflowYml = fs.readFileSync(path.join(rootDir, '.github', 'workflows', 'main.yml'), 'utf8');
+  const afterPackJs = fs.readFileSync(path.join(rootDir, 'scripts', 'after-pack.cjs'), 'utf8');
+  const installMacSh = fs.readFileSync(path.join(rootDir, 'scripts', 'install-mac.sh'), 'utf8');
+
+  assert.equal(pkg.build.mac.gatekeeperAssess, false);
+  assert.equal(pkg.build.dmg.filesystem, 'APFS');
+  assert.equal(pkg.build.dmg.format, 'UDZO');
+  assert.equal(pkg.build.dmg.sign, false);
+
+  assert.match(afterPackJs, /run\('xattr',\s*\['-cr',\s*appPath\]\)/);
+  assert.match(afterPackJs, /\.DS_Store/);
+  assert.match(afterPackJs, /fs\.chmodSync\(.*0o755\)/s);
+
+  assert.ok(!workflowYml.includes('-noverify'), 'main.yml must never hide broken DMGs via hdiutil attach -noverify');
+  assert.ok(!workflowYml.includes('-noautofsck'), 'main.yml must never skip fsck on mounted DMGs');
+  assert.ok(!workflowYml.includes('xcrun stapler validate "$DMG_PATH"'), 'stapler validate must target $APP_PATH, not $DMG_PATH');
+  assert.match(workflowYml, /xcrun stapler validate "\$APP_PATH"/);
+  assert.match(workflowYml, /hdiutil verify "\$dmg_file"/);
+  assert.match(workflowYml, /hdiutil verify "\$dmg"/);
+  assert.match(workflowYml, /hdiutil create -volname "mswnlink" -srcfolder "\$stage_dir" -fs APFS -format UDZO -ov "\$dmg_file"/);
+  assert.match(workflowYml, /filesystem:\s*"APFS"/);
+  assert.match(workflowYml, /format:\s*"UDZO"/);
+  assert.match(workflowYml, /test -x "\$APP\/Contents\/MacOS\/mswnlink"/);
+  assert.match(workflowYml, /plutil -lint "\$PLIST"/);
+  assert.match(workflowYml, /com\.apple\.quarantine/);
+
+  assert.match(installMacSh, /LOCAL_DMG="\$\{1:-\}"/);
+  assert.match(installMacSh, /xattr -cr "\/Applications\/\$APP"/);
+  assert.match(installMacSh, /releases\?per_page=1/);
 });

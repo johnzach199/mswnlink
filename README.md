@@ -1,4 +1,4 @@
-# mswnlink v3.4
+# mswnlink v4
 
 A simple remote desktop for computers on your local network. One computer shares its screen, another views and controls it, directly over the LAN. No account, no cloud, no relay.
 
@@ -36,13 +36,13 @@ Builds are signed ad hoc inside-out (preserving Electron GPU/Renderer helper ent
 
 ## Windows: Remote Desktop (`mstsc.exe`), Task Manager, and Administrator windows
 
-**Using mswnlink after closing Windows Remote Desktop:** Closing a Windows Remote Desktop (`mstsc.exe`) window normally destroys the virtual RDP display adapter (`RDPDD`) and leaves the Windows session disconnected, which previously caused screen sharing to stop automatically. In v3.4, mswnlink detects Remote Desktop sessions, keeps its LAN host listener and WebRTC session alive when the RDP display ends, automatically transfers the disconnected session back to the unlocked local physical console (`tscon.exe /dest:console`) via the elevated Win32 helper, and hot-swaps capture onto the local Windows display. You can also click **Disconnect RDP & Keep Sharing** directly inside **Share this PC** (turn on *Connect without asking* first if nobody is sitting at the physical monitor).
+**Using mswnlink after closing Windows Remote Desktop:** Closing a Windows Remote Desktop (`mstsc.exe`) window normally destroys the virtual RDP display adapter (`RDPDD`) and leaves the Windows session disconnected, which previously caused screen sharing to stop automatically. `mswnlink` detects Remote Desktop sessions, keeps its LAN host listener and WebRTC session alive when the RDP display ends, automatically transfers the disconnected session back to the unlocked local physical console (`tscon.exe /dest:console`) via the elevated Win32 helper, and hot-swaps capture onto the local Windows display. You can also click **Disconnect RDP & Keep Sharing** directly inside **Share this PC** (turn on *Connect without asking* first if nobody is sitting at the physical monitor).
 
 **Task Manager and Administrator windows:** Windows blocks standard-user apps from moving or clicking the mouse when an elevated window such as **Task Manager** is in the foreground (UIPI). When remote control or RDP keep-alive starts on a Windows host, mswnlink launches a lightweight native Win32 `SendInput` helper and asks once for UAC approval so you can control Task Manager and seamlessly hand off Remote Desktop sessions to the local console. If UAC is declined, mswnlink falls back to standard-user mode with a UIPI foreground-escape guard so the mouse never gets stuck on Task Manager.
 
 ## Copy, paste, and international keyboards
 
-Live clipboard sharing is enabled by default on both sides (using async Electron 45 clipboard synchronization so promises/objects never leak). Copy on either computer and press `Ctrl+V` (or `Cmd+V` on a Mac) in the remote window—mswnlink synchronizes the clipboard before injecting the host's native paste shortcut (`Ctrl+V` on Windows/Linux, `Cmd+V` on macOS), and also provides **Send clipboard** / **Get clipboard** buttons in the session bar.
+Live clipboard sharing and file transfers are enabled by default on both sides (using async Electron 45 clipboard synchronization so promises/objects never leak). Copy text, rich context (HTML/images), or files on either computer and press `Ctrl+V` (or `Cmd+V` on a Mac), or drag and drop files straight onto the remote desktop window to save them automatically into Downloads without manual transfer buttons.
 
 Dead-key accents, apostrophes/quotes (`'`, `"`), and non-Latin scripts such as Greek (`έχω`, tonos `;`+`ε`, dialytika `ϊ`/`ΐ`) compose deterministically on Fedora, Windows, and macOS clients and are injected via layout-aware evdev/Unicode keysyms on Fedora Wayland, X11, Windows, and macOS hosts regardless of which keyboard layout either computer currently has active.
 
@@ -68,7 +68,7 @@ RobotJS (input on macOS and X11) is optional; Windows uses the built-in Win32 `S
 
 ## Build the apps
 
-Push a tag like `v3.4` (or run the workflow from the **Actions** tab) to build every platform on GitHub and attach the files to a release. Locally: `npm run dist:fedora`, `dist:win`, `dist:mac`.
+Push a tag like `v4` (or run the workflow from the **Actions** tab) to build every platform on GitHub and attach the files to a release. Locally: `npm run dist:fedora`, `dist:win`, `dist:mac`.
 
 ## Security notes
 

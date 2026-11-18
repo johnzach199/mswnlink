@@ -51,10 +51,12 @@ let connectTimeout = null;
 let hostDataChannel = null;
 let hostEnqueueInput = null;
 let macPermissionsState = null;
-let localFeaturePreferences = { clipboard: false, fileTransfer: false, monitorSwitching: false };
+let localFeaturePreferences = { clipboard: true, fileTransfer: true, monitorSwitching: true };
 let remoteFeaturePreferences = { clipboard: false, fileTransfer: false, monitorSwitching: false };
 const incomingFileTransfers = new Map();
 const incomingFileQueues = new Map();
+const outgoingFileQueues = new WeakMap();
+const incomingClipboardFileBatches = new Map();
 let activeCompositeCapture = null;
 let lastCompositeDisplayId = null;
 const ALL_DISPLAY_ID = '__all_displays__';
@@ -63,6 +65,7 @@ const pendingClipboardRequests = new Map();
 const clipboardBaselineByChannel = new WeakMap();
 const CLIPBOARD_SYNC_INTERVAL_MS = 180;
 const CLIPBOARD_SYNC_MAX_CHARS = 1_000_000;
+const CLIPBOARD_PAYLOAD_MAX_CHARS = 10_000_000;
 const CLIPBOARD_FRAGMENT_CHARS = 4500;
 const incomingClipboardFragments = new Map();
 let clipboardSyncTimer = null;
@@ -83,9 +86,31 @@ let lastAutoQualityProfile = '';
 
 const THEME_STORAGE_KEY = 'mswnlink.ui-theme';
 
+let themeSwitchRafA = 0;
+let themeSwitchRafB = 0;
+let themeSwitchTimeout = 0;
+
 function applyTheme(theme, persist = false) {
   const nextTheme = theme === 'dark' ? 'dark' : 'light';
-  document.documentElement.dataset.theme = nextTheme;
+  const root = document.documentElement;
+  const previousTheme = root.dataset.theme;
+  if (previousTheme && previousTheme !== nextTheme) {
+    root.dataset.themeSwitching = 'true';
+    if (themeSwitchRafA) cancelAnimationFrame(themeSwitchRafA);
+    if (themeSwitchRafB) cancelAnimationFrame(themeSwitchRafB);
+    if (themeSwitchTimeout) clearTimeout(themeSwitchTimeout);
+    const clearSwitching = () => {
+      delete root.dataset.themeSwitching;
+      themeSwitchRafA = 0;
+      themeSwitchRafB = 0;
+      themeSwitchTimeout = 0;
+    };
+    themeSwitchRafA = requestAnimationFrame(() => {
+      themeSwitchRafB = requestAnimationFrame(clearSwitching);
+    });
+    themeSwitchTimeout = setTimeout(clearSwitching, 80);
+  }
+  root.dataset.theme = nextTheme;
   document.body.dataset.theme = nextTheme;
   const dark = nextTheme === 'dark';
   const button = $('#theme-toggle');
@@ -98,7 +123,7 @@ function applyTheme(theme, persist = false) {
   if (label) label.textContent = dark ? 'Light mode' : 'Dark mode';
   const icon = $('#theme-toggle-icon');
   if (icon) icon.textContent = dark ? '☀' : '☾';
-  document.documentElement.style.colorScheme = nextTheme;
+  root.style.colorScheme = nextTheme;
   if (persist) {
     try { localStorage.setItem(THEME_STORAGE_KEY, nextTheme); }
     catch (error) { console.warn('[mswnlink] Could not persist theme preference:', error); }
@@ -339,25 +364,18 @@ function updateSessionFeatureUI() {
   if ($('#session-clipboard-toggle')) $('#session-clipboard-toggle').checked = clipboardEnabled;
   if ($('#session-file-toggle')) $('#session-file-toggle').checked = fileEnabled;
   if ($('#session-monitor-toggle')) $('#session-monitor-toggle').checked = monitorEnabled;
-  if ($('#send-clipboard-button')) $('#send-clipboard-button').disabled = !connected || !clipboardEnabled || !remoteFeaturePreferences.clipboard;
-  if ($('#get-clipboard-button')) $('#get-clipboard-button').disabled = !connected || !remoteFeaturePreferences.clipboard || !clipboardEnabled;
-  if ($('#send-file-button')) $('#send-file-button').disabled = !connected || !fileEnabled || !remoteFeaturePreferences.fileTransfer;
   if ($('#viewer-monitor-select')) $('#viewer-monitor-select').disabled = !connected || !monitorEnabled || !remoteFeaturePreferences.monitorSwitching || !remoteDisplays.length;
-  const hostChannelOpen = Boolean(hostDataChannel && hostDataChannel.readyState === 'open' && hostPeerDetails);
-  if ($('#host-send-clipboard-button')) $('#host-send-clipboard-button').disabled = !hostChannelOpen || !clipboardEnabled || !remoteFeaturePreferences.clipboard;
-  if ($('#host-get-clipboard-button')) $('#host-get-clipboard-button').disabled = !hostChannelOpen || !remoteFeaturePreferences.clipboard || !clipboardEnabled;
-  if ($('#host-send-file-button')) $('#host-send-file-button').disabled = !hostChannelOpen || !fileEnabled || !remoteFeaturePreferences.fileTransfer;
   if ($('#viewer-quality-select')) $('#viewer-quality-select').disabled = !connected;
   const status = $('#transfer-status');
   if (status && !status.dataset.busy) {
     if (clipboardEnabled && remoteFeaturePreferences.clipboard) {
       status.textContent = fileEnabled && remoteFeaturePreferences.fileTransfer
-        ? 'Live clipboard sync active · files ready. Copy and paste normally on either PC.'
-        : 'Live clipboard sync active · copy and paste normally on either PC.';
+        ? 'Seamless copy/paste (text, formatting, images, files) & drag-and-drop active.'
+        : 'Live rich clipboard sync active · copy and paste normally on either PC.';
     } else if (fileEnabled && remoteFeaturePreferences.fileTransfer) {
-      status.textContent = 'File transfer ready. Enable live clipboard sync on both devices for instant copy/paste.';
+      status.textContent = 'Drag & drop files onto the screen to save directly to Downloads.';
     } else {
-      status.textContent = 'Live clipboard sync is off on one or both devices. Enable it on both to copy/paste normally.';
+      status.textContent = 'Clipboard and file sync are off on one or both devices. Enable them to copy/paste or drop files.';
     }
   }
   updateShareUI();
@@ -382,11 +400,83 @@ function extractClipboardString(value) {
   return '';
 }
 
+function extractClipboardPayload(value) {
+  const empty = { kind: 'text', text: '', html: '', imageBase64: '', files: [] };
+  if (typeof value === 'string') {
+    return { ...empty, text: value.slice(0, CLIPBOARD_SYNC_MAX_CHARS) };
+  }
+  if (!value || typeof value !== 'object' || typeof value.then === 'function') {
+    return empty;
+  }
+  if (value.payload && typeof value.payload === 'object') {
+    return extractClipboardPayload(value.payload);
+  }
+  const text = typeof value.text === 'string' ? value.text.slice(0, CLIPBOARD_SYNC_MAX_CHARS) : '';
+  const html = typeof value.html === 'string' ? value.html.slice(0, CLIPBOARD_SYNC_MAX_CHARS) : '';
+  let imageBase64 = typeof value.imageBase64 === 'string' ? value.imageBase64.trim() : '';
+  if (imageBase64.startsWith('data:image/png;base64,')) {
+    imageBase64 = imageBase64.slice('data:image/png;base64,'.length);
+  }
+  if (imageBase64.length > 8_500_000) imageBase64 = '';
+  const files = Array.isArray(value.files)
+    ? value.files
+        .filter(item => item && typeof item === 'object' && (typeof item.name === 'string' || typeof item.path === 'string'))
+        .slice(0, 32)
+        .map(item => ({
+          path: typeof item.path === 'string' ? item.path : '',
+          name: String(item.name || item.path.split(/[/\\]/).pop() || '').slice(0, 200),
+          size: Number.isSafeInteger(Number(item.size)) && Number(item.size) >= 0 ? Number(item.size) : 0
+        }))
+        .filter(item => item.name)
+    : [];
+  let kind = 'text';
+  if (files.length > 0) kind = 'files';
+  else if (imageBase64) kind = 'image';
+  else if (html) kind = 'context';
+  return { kind, text, html, imageBase64, files };
+}
+
+function hashQuickStr(str) {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < str.length; i += 1) {
+    const code = str.charCodeAt(i);
+    h1 ^= code;
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= code + ((i & 255) << 4);
+    h2 = Math.imul(h2, 0x85ebca6b);
+  }
+  return `${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+function clipboardPayloadKey(value) {
+  const p = extractClipboardPayload(value);
+  if (p.kind === 'files') {
+    const entries = p.files.map(f => `${f.name}:${f.size}`).join('|');
+    return `files:${p.files.length}:${hashQuickStr(entries)}`;
+  }
+  if (p.kind === 'image') {
+    return `image:${p.imageBase64.length}:${hashQuickStr(p.imageBase64)}`;
+  }
+  if (p.kind === 'context') {
+    return `context:${p.html.length}:${hashQuickStr(p.html)}:${p.text.length}:${hashQuickStr(p.text)}`;
+  }
+  return `text:${p.text.length}:${hashQuickStr(p.text)}`;
+}
+
+function isClipboardPayloadEmpty(payload) {
+  const p = extractClipboardPayload(payload);
+  return p.kind === 'text' && !p.text;
+}
+
 async function primeClipboardBaseline(channel) {
   if (!channel || channel.readyState !== 'open' || !localFeaturePreferences.clipboard || !remoteFeaturePreferences.clipboard) return;
   try {
     const result = await window.lanAPI.readLocalClipboard();
-    if (result && result.ok) clipboardBaselineByChannel.set(channel, extractClipboardString(result.text));
+    if (result && result.ok) {
+      const payload = extractClipboardPayload(result.payload || result.text);
+      clipboardBaselineByChannel.set(channel, clipboardPayloadKey(payload));
+    }
   } catch (error) { console.debug('[mswnlink] Could not prime clipboard sync:', error.message || error); }
 }
 
@@ -403,17 +493,112 @@ function splitClipboardText(text) {
   return chunks;
 }
 
-async function sendAutomaticClipboard(channel, text) {
+async function sendClipboardFilesOverChannel(channel, files = [], options = {}) {
   if (!channel || channel.readyState !== 'open') return false;
-  if (text.length <= CLIPBOARD_FRAGMENT_CHARS) return sendChannelMessage(channel, { kind: 'clipboard-auto', text });
+  if (!localFeaturePreferences.fileTransfer || !remoteFeaturePreferences.fileTransfer) return false;
+  if (typeof window.lanAPI.readFileFromPath !== 'function') return false;
+  const list = Array.isArray(files) ? files.filter(f => f && f.path && f.size <= MAX_TRANSFER_BYTES).slice(0, 32) : [];
+  if (!list.length) return false;
+
+  const autoPaste = Boolean(options.autoPaste);
+  return enqueueChannelFileTransfer(channel, async () => {
+    const readItems = [];
+    for (const item of list) {
+      const res = await window.lanAPI.readFileFromPath(item.path);
+      if (res && res.ok && res.data) {
+        readItems.push({ name: res.name || item.name, size: Number(res.size), data: res.data });
+      }
+    }
+    if (!readItems.length) return false;
+
+    const batchId = crypto.randomUUID();
+    if (!sendChannelMessage(channel, {
+      kind: 'clipboard-file-batch-start',
+      batchId,
+      count: readItems.length,
+      files: readItems.map(item => ({ name: item.name, size: item.size })),
+      autoPaste
+    })) {
+      return false;
+    }
+
+    let transferred = 0;
+    for (const item of readItems) {
+      const ok = await sendFileBufferOverChannel(channel, {
+        name: item.name,
+        size: item.size,
+        data: item.data,
+        mode: 'clipboard',
+        batchId
+      });
+      if (ok) transferred += 1;
+    }
+
+    sendChannelMessage(channel, { kind: 'clipboard-file-batch-end', batchId, autoPaste });
+    return transferred > 0;
+  });
+}
+
+async function sendAutomaticClipboard(channel, value, options = {}) {
+  if (!channel || channel.readyState !== 'open') return false;
+  const payload = extractClipboardPayload(value);
+  const autoPaste = Boolean(options.autoPaste);
+
+  if (payload.kind === 'files' && payload.files.length > 0) {
+    if (!localFeaturePreferences.fileTransfer || !remoteFeaturePreferences.fileTransfer) return false;
+    return sendClipboardFilesOverChannel(channel, payload.files, { autoPaste });
+  }
+
+  const wirePayload = {
+    kind: payload.kind,
+    text: payload.text,
+    ...(payload.html ? { html: payload.html } : {}),
+    ...(payload.imageBase64 ? { imageBase64: payload.imageBase64 } : {})
+  };
+  const isPlainText = wirePayload.kind === 'text' && !wirePayload.html && !wirePayload.imageBase64;
+
+  if (isPlainText && wirePayload.text.length <= CLIPBOARD_FRAGMENT_CHARS) {
+    return sendChannelMessage(channel, autoPaste
+      ? { kind: 'clipboard-paste-shortcut', text: wirePayload.text }
+      : { kind: 'clipboard-auto', text: wirePayload.text });
+  }
+
+  const serialized = isPlainText ? wirePayload.text : JSON.stringify(wirePayload);
+  const format = isPlainText ? 'text' : 'payload';
+
+  if (format === 'payload' && serialized.length <= CLIPBOARD_FRAGMENT_CHARS) {
+    return sendChannelMessage(channel, autoPaste
+      ? { kind: 'clipboard-paste-shortcut', payload: wirePayload, text: wirePayload.text }
+      : { kind: 'clipboard-auto', payload: wirePayload, text: wirePayload.text });
+  }
+
   const id = crypto.randomUUID();
-  const chunks = splitClipboardText(text);
-  if (chunks.length > 256) throw new Error('Clipboard text is too large to sync.');
-  if (!sendChannelMessage(channel, { kind: 'clipboard-auto-start', id, total: chunks.length, length: text.length })) return false;
+  const chunks = splitClipboardText(serialized);
+  if (chunks.length > 2600 || serialized.length > CLIPBOARD_PAYLOAD_MAX_CHARS) {
+    throw new Error('Clipboard content is too large to sync.');
+  }
+  if (!sendChannelMessage(channel, {
+    kind: 'clipboard-auto-start',
+    id,
+    total: chunks.length,
+    length: serialized.length,
+    format,
+    autoPaste
+  })) {
+    return false;
+  }
   for (let index = 0; index < chunks.length; index += 1) {
     if (channel.readyState !== 'open') return false;
     if (channel.bufferedAmount > 128 * 1024) await waitForChannelBuffer(channel, 512 * 1024);
-    if (!sendChannelMessage(channel, { kind: 'clipboard-auto-chunk', id, index, total: chunks.length, text: chunks[index] })) return false;
+    if (!sendChannelMessage(channel, {
+      kind: 'clipboard-auto-chunk',
+      id,
+      index,
+      total: chunks.length,
+      text: chunks[index]
+    })) {
+      return false;
+    }
   }
   return true;
 }
@@ -424,38 +609,57 @@ function clearClipboardFragments(channel) {
   incomingClipboardFragments.delete(channel);
 }
 
-async function applyAutomaticClipboardText(channel, value) {
+async function applyAutomaticClipboardPayload(channel, value, options = {}) {
   if (!localFeaturePreferences.clipboard || !remoteFeaturePreferences.clipboard) return false;
-  if (typeof value !== 'string') return false;
-  const text = extractClipboardString(value);
-  clipboardBaselineByChannel.set(channel, text);
-  const existing = await window.lanAPI.readLocalClipboard();
-  if (existing && existing.ok && extractClipboardString(existing.text) === text) return true;
-  const result = await window.lanAPI.writeLocalClipboard(text);
+  const payload = extractClipboardPayload(value);
+  if (payload.kind === 'files') return false;
+  const sig = clipboardPayloadKey(payload);
+  clipboardBaselineByChannel.set(channel, sig);
+
+  const wirePayload = {
+    kind: payload.kind,
+    text: payload.text,
+    ...(payload.html ? { html: payload.html } : {}),
+    ...(payload.imageBase64 ? { imageBase64: payload.imageBase64 } : {})
+  };
+  if (!options.force) {
+    const existing = await window.lanAPI.readLocalClipboard();
+    if (existing && existing.ok) {
+      const existingSig = clipboardPayloadKey(existing.payload || existing.text);
+      if (existingSig === sig) return true;
+    }
+  }
+  const writeArg = (wirePayload.kind === 'text' && !wirePayload.html && !wirePayload.imageBase64)
+    ? wirePayload.text
+    : wirePayload;
+  const result = await window.lanAPI.writeLocalClipboard(writeArg);
   if (!result || !result.ok) {
-    showToast(result && result.error ? result.error : 'Could not sync clipboard text.');
+    showToast(result && result.error ? result.error : 'Could not sync clipboard content.');
     return false;
   }
-  clipboardBaselineByChannel.set(channel, text);
+  clipboardBaselineByChannel.set(channel, sig);
   return true;
 }
 
-async function pushLocalClipboardImmediately(explicitText = null) {
+async function pushLocalClipboardImmediately(explicitValue = null) {
   const channels = activeChannels().filter(channel => channel.readyState === 'open' && localFeaturePreferences.clipboard && remoteFeaturePreferences.clipboard);
   if (!channels.length) return;
-  let text = explicitText;
-  if (typeof text !== 'string') {
+  let payload = null;
+  if (explicitValue !== null && explicitValue !== undefined) {
+    payload = extractClipboardPayload(explicitValue);
+  } else {
     const result = await window.lanAPI.readLocalClipboard();
-    if (!result || !result.ok || typeof result.text !== 'string') return;
-    text = result.text;
+    if (!result || !result.ok) return;
+    payload = extractClipboardPayload(result.payload || result.text);
   }
-  text = extractClipboardString(text);
+  const sig = clipboardPayloadKey(payload);
   for (const channel of channels) {
     if (channel.bufferedAmount > 512 * 1024) continue;
-    if (clipboardBaselineByChannel.get(channel) === text) continue;
-    if (await sendAutomaticClipboard(channel, text)) {
-      clipboardBaselineByChannel.set(channel, text);
-    }
+    if (clipboardBaselineByChannel.get(channel) === sig) continue;
+    if (payload.kind === 'files' && (!localFeaturePreferences.fileTransfer || !remoteFeaturePreferences.fileTransfer)) continue;
+    clipboardBaselineByChannel.set(channel, sig);
+    const ok = await sendAutomaticClipboard(channel, payload).catch(() => false);
+    if (!ok) clipboardBaselineByChannel.delete(channel);
   }
 }
 
@@ -477,14 +681,18 @@ async function clipboardSyncTick() {
     for (const channel of channels) {
       if (channel.bufferedAmount > 512 * 1024) continue;
       const result = await window.lanAPI.readLocalClipboard();
-      if (!result || !result.ok || typeof result.text !== 'string') continue;
-      const text = extractClipboardString(result.text);
+      if (!result || !result.ok) continue;
+      const payload = extractClipboardPayload(result.payload || result.text);
+      const sig = clipboardPayloadKey(payload);
       if (!clipboardBaselineByChannel.has(channel)) {
-        clipboardBaselineByChannel.set(channel, text);
+        clipboardBaselineByChannel.set(channel, sig);
         continue;
       }
-      if (clipboardBaselineByChannel.get(channel) !== text) {
-        if (await sendAutomaticClipboard(channel, text)) clipboardBaselineByChannel.set(channel, text);
+      if (clipboardBaselineByChannel.get(channel) !== sig) {
+        if (payload.kind === 'files' && (!localFeaturePreferences.fileTransfer || !remoteFeaturePreferences.fileTransfer)) continue;
+        clipboardBaselineByChannel.set(channel, sig);
+        const ok = await sendAutomaticClipboard(channel, payload).catch(() => false);
+        if (!ok) clipboardBaselineByChannel.delete(channel);
       }
     }
   } catch (error) { console.debug('[mswnlink] Live clipboard polling failed:', error.message || error); }
@@ -512,53 +720,12 @@ function setTransferStatus(message, busy = false) {
   status.dataset.busy = busy ? 'true' : '';
 }
 
-function setPendingClipboard(id, mode, channel) {
-  const timer = setTimeout(() => {
-    pendingClipboardRequests.delete(id);
-    showToast('Clipboard request timed out. Check the clipboard permissions on both devices.');
-  }, 15000);
-  pendingClipboardRequests.set(id, { mode, timer, channel });
-}
-
-async function sendLocalClipboard(channel) {
-  if (!channel || channel.readyState !== 'open') throw new Error('The remote session is not connected.');
-  if (!localFeaturePreferences.clipboard) throw new Error('Enable clipboard sharing on this device first.');
-  if (!remoteFeaturePreferences.clipboard) throw new Error('Enable clipboard sharing on the receiving computer first.');
-  const result = await window.lanAPI.readLocalClipboard();
-  if (!result || !result.ok) throw new Error(result && result.error ? result.error : 'Could not read the local clipboard.');
-  const id = crypto.randomUUID();
-  const textToSend = extractClipboardString(result.text);
-  setPendingClipboard(id, 'send', channel);
-  if (!sendChannelMessage(channel, { kind: 'clipboard-set', id, text: textToSend })) {
-    const pending = pendingClipboardRequests.get(id); if (pending) clearTimeout(pending.timer);
-    pendingClipboardRequests.delete(id);
-    throw new Error('Could not send clipboard text.');
-  }
-  clipboardBaselineByChannel.set(channel, textToSend);
-  showToast('Sending clipboard text to the remote computer…');
-}
-
-async function requestRemoteClipboard(channel) {
-  if (!channel || channel.readyState !== 'open') throw new Error('The remote session is not connected.');
-  if (!localFeaturePreferences.clipboard) throw new Error('Enable Allow clipboard on this device to receive clipboard text.');
-  if (!remoteFeaturePreferences.clipboard) throw new Error('Enable clipboard sharing on the remote computer first.');
-  const id = crypto.randomUUID();
-  setPendingClipboard(id, 'get', channel);
-  if (!sendChannelMessage(channel, { kind: 'clipboard-get', id })) {
-    const pending = pendingClipboardRequests.get(id); if (pending) clearTimeout(pending.timer);
-    pendingClipboardRequests.delete(id);
-    throw new Error('Could not request the remote clipboard.');
-  }
-  showToast('Requesting text from the remote clipboard…');
-}
-
 function makeDeferred() {
   let resolve;
   let reject;
   const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
   return { promise, resolve, reject };
 }
-
 
 function failPendingTransfersForChannel(channel, reason = 'The remote session closed.') {
   for (const pending of pendingFileTransfers.values()) {
@@ -576,6 +743,13 @@ function clearPendingClipboardForChannel(channel) {
   }
 }
 
+function enqueueChannelFileTransfer(channel, task) {
+  const previous = outgoingFileQueues.get(channel) || Promise.resolve();
+  const next = previous.catch(() => {}).then(() => task());
+  outgoingFileQueues.set(channel, next);
+  return next;
+}
+
 function waitForChannelBuffer(channel, maximum = 1024 * 1024) {
   if (channel.bufferedAmount <= maximum) return Promise.resolve();
   channel.bufferedAmountLowThreshold = 512 * 1024;
@@ -588,45 +762,61 @@ function waitForChannelBuffer(channel, maximum = 1024 * 1024) {
   });
 }
 
-async function sendFileOverChannel(channel) {
+async function sendFileBufferOverChannel(channel, fileItem) {
   if (!channel || channel.readyState !== 'open') throw new Error('The remote session is not connected.');
   if (!localFeaturePreferences.fileTransfer) throw new Error('Enable file transfers on this device first.');
   if (!remoteFeaturePreferences.fileTransfer) throw new Error('Enable file transfers on the receiving computer first.');
-  const picked = await window.lanAPI.pickFileToSend();
-  if (!picked || picked.cancelled) return;
-  if (!picked.ok) throw new Error(picked.error || 'Could not read the selected file.');
-  if (picked.size > MAX_TRANSFER_BYTES) throw new Error('Files must be 100 MB or smaller.');
+  if (!fileItem || !fileItem.name || !(fileItem.data instanceof ArrayBuffer || ArrayBuffer.isView(fileItem.data))) {
+    throw new Error('Invalid file data.');
+  }
+  const bytes = fileItem.data instanceof ArrayBuffer
+    ? new Uint8Array(fileItem.data)
+    : new Uint8Array(fileItem.data.buffer, fileItem.data.byteOffset, fileItem.data.byteLength);
+  const size = Number.isSafeInteger(Number(fileItem.size)) ? Number(fileItem.size) : bytes.byteLength;
+  if (size > MAX_TRANSFER_BYTES) throw new Error(`${fileItem.name} is larger than 100 MB.`);
+
+  const mode = ['drop', 'clipboard'].includes(fileItem.mode) ? fileItem.mode : 'drop';
+  const batchId = typeof fileItem.batchId === 'string' ? fileItem.batchId : '';
   const id = crypto.randomUUID();
   const acceptWaiter = makeDeferred();
   const finishWaiter = makeDeferred();
   const record = { acceptWaiter, finishWaiter, accepted: false, channel };
   pendingFileTransfers.set(id, record);
-  let timer = setTimeout(() => acceptWaiter.resolve({ ok: false, reason: 'The receiver did not respond to the file request.' }), 90000);
-  setTransferStatus(`Waiting for ${picked.name} to be accepted…`, true);
-  if (!sendChannelMessage(channel, { kind: 'file-start', id, name: picked.name, size: picked.size, type: picked.type || 'application/octet-stream' })) {
-    clearTimeout(timer); pendingFileTransfers.delete(id); throw new Error('Could not initiate the file transfer.');
+  let timer = setTimeout(() => acceptWaiter.resolve({ ok: false, reason: 'The receiver did not respond to the file transfer.' }), 30000);
+  setTransferStatus(`Sending ${fileItem.name}…`, true);
+  if (!sendChannelMessage(channel, {
+    kind: 'file-start',
+    id,
+    name: fileItem.name,
+    size,
+    type: fileItem.type || 'application/octet-stream',
+    mode,
+    batchId
+  })) {
+    clearTimeout(timer);
+    pendingFileTransfers.delete(id);
+    throw new Error('Could not start the file transfer.');
   }
   try {
     const acceptance = await acceptWaiter.promise;
     clearTimeout(timer);
-    if (!acceptance || !acceptance.ok) throw new Error(acceptance && acceptance.reason ? acceptance.reason : 'The receiver declined the transfer.');
+    if (!acceptance || !acceptance.ok) throw new Error(acceptance && acceptance.reason ? acceptance.reason : 'The receiver could not accept the transfer.');
     record.accepted = true;
-    const bytes = new Uint8Array(picked.data);
     const total = bytes.byteLength;
     for (let offset = 0; offset < total; offset += FILE_CHUNK_BYTES) {
       await waitForChannelBuffer(channel);
       if (channel.readyState !== 'open') throw new Error('The connection closed during file transfer.');
       const chunk = bytes.slice(offset, Math.min(total, offset + FILE_CHUNK_BYTES));
       channel.send(chunk.buffer);
-      setTransferStatus(`Sending ${picked.name} · ${Math.min(total, offset + chunk.length).toLocaleString()} / ${total.toLocaleString()} bytes`, true);
+      setTransferStatus(`Sending ${fileItem.name} · ${Math.min(total, offset + chunk.length).toLocaleString()} / ${total.toLocaleString()} bytes`, true);
     }
-    timer = setTimeout(() => finishWaiter.resolve({ ok: false, reason: 'Timed out waiting for the receiver to finish saving the file.' }), 90000);
+    timer = setTimeout(() => finishWaiter.resolve({ ok: false, reason: 'Timed out waiting for the receiver to save the file.' }), 90000);
     if (!sendChannelMessage(channel, { kind: 'file-end', id })) throw new Error('Could not finish sending the file.');
     const complete = await finishWaiter.promise;
     clearTimeout(timer);
     if (!complete || !complete.ok) throw new Error(complete && complete.reason ? complete.reason : 'The receiver could not save the file.');
-    setTransferStatus(`${picked.name} sent successfully.`, false);
-    showToast(`Sent ${picked.name} to the remote computer.`);
+    setTransferStatus(mode === 'clipboard' ? `Synced ${fileItem.name} to remote clipboard.` : `Sent ${fileItem.name} to remote Downloads.`, false);
+    return true;
   } catch (error) {
     clearTimeout(timer);
     setTransferStatus(`File transfer failed: ${error.message || 'unknown error'}`, false);
@@ -634,6 +824,37 @@ async function sendFileOverChannel(channel) {
   } finally {
     pendingFileTransfers.delete(id);
   }
+}
+
+async function sendDroppedFilesOverChannel(channel, fileList) {
+  if (!channel || channel.readyState !== 'open') {
+    showToast('Connect a remote session before dropping files.');
+    return false;
+  }
+  if (!localFeaturePreferences.fileTransfer || !remoteFeaturePreferences.fileTransfer) {
+    showToast('Enable File transfers on both computers to drag and drop files.');
+    return false;
+  }
+  const files = Array.from(fileList || []).filter(item => item && typeof item.name === 'string');
+  if (!files.length) return false;
+  for (const file of files) {
+    if (file.size > MAX_TRANSFER_BYTES) {
+      showToast(`${file.name} is larger than 100 MB and was skipped.`);
+      continue;
+    }
+    const buffer = await file.arrayBuffer();
+    await enqueueChannelFileTransfer(channel, () => sendFileBufferOverChannel(channel, {
+      name: file.name,
+      size: buffer.byteLength,
+      type: file.type || 'application/octet-stream',
+      data: buffer,
+      mode: 'drop'
+    }));
+  }
+  showToast(files.length === 1
+    ? `Sent ${files[0].name} to the remote Downloads folder.`
+    : `Sent ${files.length} files to the remote Downloads folder.`);
+  return true;
 }
 
 async function handleIncomingBinary(channel, payload) {
@@ -656,7 +877,6 @@ async function handleIncomingBinary(channel, payload) {
   }
 }
 
-
 function queueIncomingBinary(channel, payload) {
   const previous = incomingFileQueues.get(channel) || Promise.resolve();
   const next = previous.then(() => handleIncomingBinary(channel, payload)).catch(error => {
@@ -678,27 +898,27 @@ async function handleSessionDataMessage(side, channel, data) {
       sendChannelMessage(channel, { kind: 'display-list-request' });
     }
     await primeClipboardBaseline(channel);
-    // Sync the viewer's pre-existing clipboard on connect so text copied right
-    // before opening the remote session can be pasted immediately with Ctrl+V/Cmd+V.
+    // Sync the viewer's pre-existing clipboard on connect so context or files copied
+    // right before opening the session can be pasted immediately with Ctrl+V/Cmd+V.
     if (side === 'client' && localFeaturePreferences.clipboard && remoteFeaturePreferences.clipboard) {
       try {
         const initial = await window.lanAPI.readLocalClipboard();
-        const text = initial && initial.ok ? extractClipboardString(initial.text) : '';
-        if (text) {
-          await sendAutomaticClipboard(channel, text);
-          clipboardBaselineByChannel.set(channel, text);
+        const payload = initial && initial.ok ? extractClipboardPayload(initial.payload || initial.text) : null;
+        if (payload && !isClipboardPayloadEmpty(payload) && payload.kind !== 'files') {
+          clipboardBaselineByChannel.set(channel, clipboardPayloadKey(payload));
+          await sendAutomaticClipboard(channel, payload);
         }
       } catch {}
     }
     return true;
   }
   if (data.kind === 'clipboard-paste-shortcut' && side === 'host') {
-    if (localFeaturePreferences.clipboard && remoteFeaturePreferences.clipboard && typeof data.text === 'string' && data.text.length <= CLIPBOARD_SYNC_MAX_CHARS) {
-      const safeText = extractClipboardString(data.text);
-      clipboardBaselineByChannel.set(channel, safeText);
-      await window.lanAPI.writeLocalClipboard(safeText);
-      // Give Wayland/X11/macOS/Windows clipboard selection ownership a brief tick to settle before Ctrl+V/Cmd+V.
-      await new Promise(resolve => setTimeout(resolve, 20));
+    if (localFeaturePreferences.clipboard && remoteFeaturePreferences.clipboard) {
+      const incoming = data.payload ? extractClipboardPayload(data.payload) : extractClipboardPayload(data.text);
+      if (incoming.kind !== 'files') {
+        await applyAutomaticClipboardPayload(channel, incoming, { force: true });
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
     }
     if (typeof hostEnqueueInput === 'function') {
       hostEnqueueInput({ kind: 'shortcut', action: 'paste' });
@@ -706,9 +926,8 @@ async function handleSessionDataMessage(side, channel, data) {
     return true;
   }
   if (data.kind === 'clipboard-auto') {
-    if (typeof data.text === 'string') {
-      await applyAutomaticClipboardText(channel, data.text);
-    }
+    const incoming = data.payload ? extractClipboardPayload(data.payload) : extractClipboardPayload(data.text);
+    await applyAutomaticClipboardPayload(channel, incoming);
     return true;
   }
   if (data.kind === 'clipboard-auto-start') {
@@ -716,10 +935,20 @@ async function handleSessionDataMessage(side, channel, data) {
     const id = String(data.id || '');
     const total = Number(data.total);
     const length = Number(data.length);
-    if (!id || id.length > 100 || !Number.isInteger(total) || total < 1 || total > 256 || !Number.isInteger(length) || length < 0 || length > CLIPBOARD_SYNC_MAX_CHARS) return true;
+    if (!id || id.length > 100 || !Number.isInteger(total) || total < 1 || total > 2600 || !Number.isInteger(length) || length < 0 || length > CLIPBOARD_PAYLOAD_MAX_CHARS) return true;
     clearClipboardFragments(channel);
-    const entry = { id, total, length, chunks: new Array(total), received: 0, receivedParts: 0, timer: null };
-    entry.timer = setTimeout(() => { clearClipboardFragments(channel); }, 12000);
+    const entry = {
+      id,
+      total,
+      length,
+      format: data.format === 'payload' ? 'payload' : 'text',
+      autoPaste: Boolean(data.autoPaste),
+      chunks: new Array(total),
+      received: 0,
+      receivedParts: 0,
+      timer: null
+    };
+    entry.timer = setTimeout(() => { clearClipboardFragments(channel); }, 15000);
     incomingClipboardFragments.set(channel, entry);
     return true;
   }
@@ -732,13 +961,63 @@ async function handleSessionDataMessage(side, channel, data) {
       pending.chunks[index] = data.text;
       pending.receivedParts += 1;
       pending.received += data.text.length;
-      if (pending.received > pending.length || pending.received > CLIPBOARD_SYNC_MAX_CHARS) { clearClipboardFragments(channel); return true; }
+      if (pending.received > pending.length || pending.received > CLIPBOARD_PAYLOAD_MAX_CHARS) { clearClipboardFragments(channel); return true; }
     }
     if (pending.receivedParts === pending.total) {
-      const text = pending.chunks.join('');
+      const joined = pending.chunks.join('');
       const expectedLength = pending.length;
+      const format = pending.format;
+      const autoPaste = pending.autoPaste;
       clearClipboardFragments(channel);
-      if (text.length === expectedLength) await applyAutomaticClipboardText(channel, text);
+      if (joined.length === expectedLength) {
+        let payload = joined;
+        if (format === 'payload') {
+          try { payload = extractClipboardPayload(JSON.parse(joined)); } catch { return true; }
+        }
+        await applyAutomaticClipboardPayload(channel, payload, { force: autoPaste });
+        if (autoPaste && side === 'host' && typeof hostEnqueueInput === 'function') {
+          await new Promise(resolve => setTimeout(resolve, 25));
+          hostEnqueueInput({ kind: 'shortcut', action: 'paste' });
+        }
+      }
+    }
+    return true;
+  }
+  if (data.kind === 'clipboard-file-batch-start') {
+    if (!localFeaturePreferences.clipboard || !remoteFeaturePreferences.clipboard || !localFeaturePreferences.fileTransfer || !remoteFeaturePreferences.fileTransfer) {
+      return true;
+    }
+    const batchId = String(data.batchId || '');
+    if (!batchId) return true;
+    incomingClipboardFileBatches.set(channel, {
+      batchId,
+      expectedFiles: Array.isArray(data.files) ? data.files : [],
+      stagedPaths: [],
+      stagedMeta: [],
+      autoPaste: Boolean(data.autoPaste)
+    });
+    return true;
+  }
+  if (data.kind === 'clipboard-file-batch-end') {
+    const batch = incomingClipboardFileBatches.get(channel);
+    if (!batch || batch.batchId !== String(data.batchId || '')) return true;
+    incomingClipboardFileBatches.delete(channel);
+    if (batch.stagedPaths.length > 0 && typeof window.lanAPI.writeClipboardFiles === 'function') {
+      const expectedSig = clipboardPayloadKey({ kind: 'files', files: batch.stagedMeta });
+      clipboardBaselineByChannel.set(channel, expectedSig);
+      const written = await window.lanAPI.writeClipboardFiles(batch.stagedPaths);
+      if (written && written.ok) {
+        if ((batch.autoPaste || data.autoPaste) && side === 'host' && typeof hostEnqueueInput === 'function') {
+          await new Promise(resolve => setTimeout(resolve, 35));
+          hostEnqueueInput({ kind: 'shortcut', action: 'paste' });
+          setTransferStatus(`Pasted ${batch.stagedPaths.length} file(s) to remote computer.`, false);
+        } else {
+          showToast(batch.stagedPaths.length === 1
+            ? `Copied ${batch.stagedMeta[0].name} from remote PC — press Ctrl+V / Cmd+V to paste.`
+            : `Copied ${batch.stagedPaths.length} files from remote PC — press Ctrl+V / Cmd+V to paste.`);
+          setTransferStatus(`${batch.stagedPaths.length} copied file(s) ready — press Ctrl+V / Cmd+V to paste.`, false);
+        }
+      }
     }
     return true;
   }
@@ -794,54 +1073,11 @@ async function handleSessionDataMessage(side, channel, data) {
     else showToast(data.reason || 'The host could not switch displays.');
     return true;
   }
-  if (data.kind === 'clipboard-set') {
-    if (!localFeaturePreferences.clipboard) {
-      sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: false, reason: 'Clipboard sharing is disabled on the receiving device.' });
-      return true;
-    }
-    if (typeof data.text !== 'string') {
-      sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: false, reason: 'Invalid clipboard text payload.' });
-      return true;
-    }
-    const incomingText = extractClipboardString(data.text);
-    clipboardBaselineByChannel.set(channel, incomingText);
-    const result = await window.lanAPI.writeLocalClipboard(incomingText);
-    sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: Boolean(result && result.ok), reason: result && result.error ? result.error : '' });
-    return true;
-  }
-  if (data.kind === 'clipboard-get') {
-    if (!localFeaturePreferences.clipboard) {
-      sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: false, reason: 'Clipboard sharing is disabled on the remote device.' });
-      return true;
-    }
-    const result = await window.lanAPI.readLocalClipboard();
-    if (!result || !result.ok) sendChannelMessage(channel, { kind: 'clipboard-result', id: data.id, ok: false, reason: result && result.error ? result.error : 'Could not read clipboard.' });
-    else sendChannelMessage(channel, { kind: 'clipboard-value', id: data.id, text: extractClipboardString(result.text) });
-    return true;
-  }
-  if (data.kind === 'clipboard-value') {
-    const pending = pendingClipboardRequests.get(String(data.id || ''));
-    if (!pending || pending.mode !== 'get') return true;
-    clearTimeout(pending.timer); pendingClipboardRequests.delete(String(data.id));
-    if (!localFeaturePreferences.clipboard) { showToast('Enable Allow clipboard to receive clipboard text.'); return true; }
-    if (typeof data.text !== 'string') return true;
-    const receivedText = extractClipboardString(data.text);
-    clipboardBaselineByChannel.set(channel, receivedText);
-    const result = await window.lanAPI.writeLocalClipboard(receivedText);
-    if (!result || !result.ok) showToast(result && result.error ? result.error : 'Could not update the local clipboard.');
-    else showToast('Remote clipboard copied to this device.');
-    return true;
-  }
-  if (data.kind === 'clipboard-result') {
-    const pending = pendingClipboardRequests.get(String(data.id || ''));
-    if (pending) { clearTimeout(pending.timer); pendingClipboardRequests.delete(String(data.id)); }
-    if (!data.ok) showToast(data.reason || 'Clipboard operation failed.');
-    else showToast(pending && pending.mode === 'send' ? 'Clipboard sent to the remote device.' : 'Clipboard operation completed.');
-    return true;
-  }
   if (data.kind === 'file-start') {
     const id = String(data.id || '');
     const size = Number(data.size);
+    const mode = data.mode === 'clipboard' ? 'clipboard' : 'drop';
+    const batchId = typeof data.batchId === 'string' ? data.batchId : '';
     if (!id || !Number.isSafeInteger(size) || size < 0 || size > MAX_TRANSFER_BYTES || typeof data.name !== 'string') {
       sendChannelMessage(channel, { kind: 'file-result', id, ok: false, reason: 'Invalid file transfer request.' });
       return true;
@@ -854,14 +1090,14 @@ async function handleSessionDataMessage(side, channel, data) {
       sendChannelMessage(channel, { kind: 'file-result', id, ok: false, reason: 'Another file transfer is already active.' });
       return true;
     }
-    const result = await window.lanAPI.beginFileReceive({ name: data.name, size });
+    const result = await window.lanAPI.beginFileReceive({ name: data.name, size, mode });
     if (!result || !result.ok) {
-      sendChannelMessage(channel, { kind: 'file-result', id, ok: false, reason: result && result.cancelled ? 'File transfer cancelled by the receiver.' : (result && result.error ? result.error : 'The receiver declined the file.') });
+      sendChannelMessage(channel, { kind: 'file-result', id, ok: false, reason: result && result.error ? result.error : 'The receiver could not prepare the file.' });
       return true;
     }
-    incomingFileTransfers.set(channel, { id, token: result.token, name: data.name, expected: size, received: 0 });
+    incomingFileTransfers.set(channel, { id, token: result.token, name: data.name, expected: size, received: 0, mode, batchId });
     sendChannelMessage(channel, { kind: 'file-accept', id, ok: true });
-    setTransferStatus(`Receiving ${data.name} · 0 / ${size.toLocaleString()} bytes`, true);
+    setTransferStatus(mode === 'clipboard' ? `Copying ${data.name}…` : `Receiving ${data.name} · 0 / ${size.toLocaleString()} bytes`, true);
     return true;
   }
   if (data.kind === 'file-accept') {
@@ -872,7 +1108,7 @@ async function handleSessionDataMessage(side, channel, data) {
   if (data.kind === 'file-result') {
     const pending = pendingFileTransfers.get(String(data.id || ''));
     if (pending) {
-      if (!pending.accepted) pending.acceptWaiter.resolve({ ok: false, reason: data.reason || 'The receiver rejected the file.' });
+      if (!pending.accepted) pending.acceptWaiter.resolve({ ok: false, reason: data.reason || 'The receiver could not accept the file.' });
       else pending.finishWaiter.resolve({ ok: Boolean(data.ok), reason: data.reason || '' });
     }
     return true;
@@ -890,8 +1126,17 @@ async function handleSessionDataMessage(side, channel, data) {
     incomingFileTransfers.delete(channel);
     const result = await window.lanAPI.finishFileReceive(transfer.token);
     sendChannelMessage(channel, { kind: 'file-result', id: transfer.id, ok: Boolean(result && result.ok), reason: result && result.error ? result.error : '' });
-    setTransferStatus(result && result.ok ? `Received ${transfer.name} successfully.` : `Could not save ${transfer.name}: ${result && result.error ? result.error : 'unknown error'}`, false);
-    if (result && result.ok) showToast(`Received ${transfer.name}.`);
+    if (result && result.ok && transfer.mode === 'clipboard') {
+      const batch = incomingClipboardFileBatches.get(channel);
+      if (batch && (!transfer.batchId || batch.batchId === transfer.batchId) && result.path) {
+        batch.stagedPaths.push(result.path);
+        batch.stagedMeta.push({ path: result.path, name: result.name || transfer.name, size: transfer.expected });
+      }
+      setTransferStatus(`Staged ${transfer.name} for clipboard paste.`, false);
+    } else {
+      setTransferStatus(result && result.ok ? `Saved ${result.name || transfer.name} to Downloads.` : `Could not save ${transfer.name}: ${result && result.error ? result.error : 'unknown error'}`, false);
+      if (result && result.ok) showToast(`Saved ${result.name || transfer.name} to Downloads.`);
+    }
     return true;
   }
   return false;
@@ -2001,6 +2246,7 @@ async function createHostPeer() {
         hostEnqueueInput = null;
       }
       clearClipboardFragments(channel);
+      incomingClipboardFileBatches.delete(channel);
       const transfer = incomingFileTransfers.get(channel);
       if (transfer) {
         incomingFileTransfers.delete(channel);
@@ -2609,6 +2855,7 @@ let remoteDeadKeyPending = false;
 let pendingDeadAccent = null;
 let lastDirectFlushedText = '';
 let lastDirectFlushedAt = 0;
+let imeCaptureAllowedUntil = 0;
 
 const CLIENT_DEAD_ACUTE_MAP = new Map([
   ['α', 'ά'], ['ε', 'έ'], ['η', 'ή'], ['ι', 'ί'], ['ο', 'ό'], ['υ', 'ύ'], ['ω', 'ώ'],
@@ -2683,15 +2930,23 @@ function composeClientDeadKey(accent, baseKey) {
 }
 
 function focusRemoteViewerInput() {
+  const video = $('#remote-video');
+  if (video) {
+    try { video.focus({ preventScroll: true }); return; }
+    catch { try { video.focus(); return; } catch {} }
+  }
+  const capture = document.getElementById(REMOTE_CAPTURE_ID);
+  if (capture) {
+    try { capture.focus({ preventScroll: true }); }
+    catch { try { capture.focus(); } catch {} }
+  }
+}
+
+function focusRemoteImeCapture() {
   const capture = document.getElementById(REMOTE_CAPTURE_ID);
   if (capture) {
     try { capture.focus({ preventScroll: true }); return; }
     catch { try { capture.focus(); return; } catch {} }
-  }
-  const video = $('#remote-video');
-  if (video) {
-    try { video.focus({ preventScroll: true }); }
-    catch { try { video.focus(); } catch {} }
   }
 }
 
@@ -2725,19 +2980,28 @@ function detectViewerShortcut(event) {
   return null;
 }
 
-async function triggerRemoteEditShortcut(action, explicitPasteText = null) {
+async function triggerRemoteEditShortcut(action, explicitPastePayload = null) {
   if (!clientConnected || !controlGranted || !clientChannel || clientChannel.readyState !== 'open') return false;
   if (action === 'paste') {
     if (localFeaturePreferences.clipboard && remoteFeaturePreferences.clipboard) {
-      let text = explicitPasteText;
-      if (typeof text !== 'string') {
+      let payload = null;
+      if (explicitPastePayload !== null && explicitPastePayload !== undefined) {
+        payload = extractClipboardPayload(explicitPastePayload);
+      } else {
         const local = await window.lanAPI.readLocalClipboard();
-        if (local && local.ok) text = extractClipboardString(local.text);
+        if (local && local.ok) {
+          payload = extractClipboardPayload(local.payload || local.text);
+        }
       }
-      if (typeof text === 'string' && text.length <= CLIPBOARD_SYNC_MAX_CHARS) {
-        const cleanText = extractClipboardString(text);
-        clipboardBaselineByChannel.set(clientChannel, cleanText);
-        return sendChannelMessage(clientChannel, { kind: 'clipboard-paste-shortcut', text: cleanText });
+      if (payload) {
+        if (payload.kind === 'files' && payload.files.length > 0 && localFeaturePreferences.fileTransfer && remoteFeaturePreferences.fileTransfer) {
+          clipboardBaselineByChannel.set(clientChannel, clipboardPayloadKey(payload));
+          return sendClipboardFilesOverChannel(clientChannel, payload.files, { autoPaste: true });
+        }
+        if (payload.kind !== 'files') {
+          clipboardBaselineByChannel.set(clientChannel, clipboardPayloadKey(payload));
+          return sendAutomaticClipboard(clientChannel, payload, { autoPaste: true });
+        }
       }
     }
     return sendInput({ kind: 'shortcut', action: 'paste' });
@@ -2851,9 +3115,10 @@ function handleRemoteKey(event, action) {
   if (isImeComposition) {
     if (action === 'down') {
       remoteDeadKeyPending = true;
+      imeCaptureAllowedUntil = performance.now() + 5000;
       const capture = document.getElementById(REMOTE_CAPTURE_ID);
       if (capture && document.activeElement !== capture) {
-        focusRemoteViewerInput();
+        focusRemoteImeCapture();
       }
     }
     return;
@@ -2941,23 +3206,35 @@ function installRemoteKeyboardCapture() {
     capture.addEventListener('compositionstart', () => {
       remoteComposing = true;
       remoteDeadKeyPending = true;
+      imeCaptureAllowedUntil = performance.now() + 10000;
     });
     capture.addEventListener('compositionend', (event) => {
+      const wasComposing = remoteComposing;
       remoteComposing = false;
       remoteDeadKeyPending = false;
       pendingDeadAccent = null;
       const text = capture.value || (event && typeof event.data === 'string' ? event.data : '');
       capture.value = '';
-      flushCapturedRemoteText(text);
+      const now = performance.now();
+      if ((wasComposing || now <= imeCaptureAllowedUntil) && (now - lastDirectFlushedAt) >= 250) {
+        flushCapturedRemoteText(text);
+      }
+      imeCaptureAllowedUntil = 0;
+      focusRemoteViewerInput();
     });
     capture.addEventListener('input', (event) => {
       if (remoteComposing || (event && event.isComposing)) return;
       remoteDeadKeyPending = false;
       pendingDeadAccent = null;
       const text = capture.value;
-      if (!text) return;
       capture.value = '';
+      if (!text) return;
+      const now = performance.now();
+      // Ignore asynchronous GTK/IBus textarea commits for regular keydowns handled directly above.
+      if (now > imeCaptureAllowedUntil || (now - lastDirectFlushedAt) < 250) return;
+      imeCaptureAllowedUntil = 0;
       flushCapturedRemoteText(text);
+      focusRemoteViewerInput();
     });
   }
   // Install once at renderer startup, not during each connection. This avoids
@@ -2967,9 +3244,39 @@ function installRemoteKeyboardCapture() {
   window.addEventListener('paste', (event) => {
     if (!clientConnected || !controlGranted || !pages.session.classList.contains('page-active')) return;
     if (isEditableLocalElement(event.target)) return;
-    const pasted = event.clipboardData ? event.clipboardData.getData('text/plain') : '';
     event.preventDefault();
-    triggerRemoteEditShortcut('paste', typeof pasted === 'string' ? pasted : null).catch(() => {});
+    const dt = event.clipboardData;
+    const droppedFiles = dt && dt.files && dt.files.length ? Array.from(dt.files) : [];
+    if (droppedFiles.length > 0 && localFeaturePreferences.fileTransfer && remoteFeaturePreferences.fileTransfer) {
+      (async () => {
+        const batchId = crypto.randomUUID();
+        const fileMeta = droppedFiles.filter(f => f.size <= MAX_TRANSFER_BYTES).slice(0, 32);
+        if (!fileMeta.length) return;
+        await enqueueChannelFileTransfer(clientChannel, async () => {
+          sendChannelMessage(clientChannel, {
+            kind: 'clipboard-file-batch-start',
+            batchId,
+            count: fileMeta.length,
+            files: fileMeta.map(f => ({ name: f.name, size: f.size })),
+            autoPaste: true
+          });
+          for (const file of fileMeta) {
+            const buffer = await file.arrayBuffer();
+            await sendFileBufferOverChannel(clientChannel, {
+              name: file.name,
+              size: buffer.byteLength,
+              type: file.type || 'application/octet-stream',
+              data: buffer,
+              mode: 'clipboard',
+              batchId
+            });
+          }
+          sendChannelMessage(clientChannel, { kind: 'clipboard-file-batch-end', batchId, autoPaste: true });
+        });
+      })().catch(() => {});
+      return;
+    }
+    triggerRemoteEditShortcut('paste').catch(() => {});
   }, true);
 }
 
@@ -3021,8 +3328,10 @@ async function initialize() {
     updateSessionFeatureUI();
   });
   window.lanAPI.on('local-clipboard-changed', (payload) => {
-    const text = payload && typeof payload.text === 'string' ? payload.text : null;
-    pushLocalClipboardImmediately(text).catch(() => {});
+    const incoming = payload && payload.payload
+      ? payload.payload
+      : (payload && typeof payload.text === 'string' ? payload.text : null);
+    if (incoming !== null) pushLocalClipboardImmediately(incoming).catch(() => {});
   });
   window.lanAPI.on('menu-edit-action', ({ action } = {}) => {
     if (!action) return;
@@ -3085,12 +3394,67 @@ async function initialize() {
       catch (error) { showToast(error.message || 'That action could not be completed.'); }
     });
   };
-  wireAction('send-clipboard-button', () => sendLocalClipboard(clientChannel));
-  wireAction('get-clipboard-button', () => requestRemoteClipboard(clientChannel));
-  wireAction('send-file-button', () => sendFileOverChannel(clientChannel));
-  wireAction('host-send-clipboard-button', () => sendLocalClipboard(hostDataChannel));
-  wireAction('host-get-clipboard-button', () => requestRemoteClipboard(hostDataChannel));
-  wireAction('host-send-file-button', () => sendFileOverChannel(hostDataChannel));
+  const installDropTarget = (element, overlayEl, getChannel, isEnabledFn) => {
+    if (!element) return;
+    let dragDepth = 0;
+    const hasFilesDrag = (event) => {
+      const types = event.dataTransfer && event.dataTransfer.types;
+      return Boolean(types && Array.from(types).includes('Files'));
+    };
+    const clearDropVisual = () => {
+      dragDepth = 0;
+      element.classList.remove('is-drop-target');
+      if (overlayEl) overlayEl.hidden = true;
+    };
+    element.addEventListener('dragenter', (event) => {
+      if (!isEnabledFn() || !hasFilesDrag(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      dragDepth += 1;
+      element.classList.add('is-drop-target');
+      if (overlayEl) overlayEl.hidden = false;
+    });
+    element.addEventListener('dragover', (event) => {
+      if (!isEnabledFn() || !hasFilesDrag(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+      element.classList.add('is-drop-target');
+      if (overlayEl) overlayEl.hidden = false;
+    });
+    element.addEventListener('dragleave', (event) => {
+      if (!hasFilesDrag(event) && dragDepth === 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) clearDropVisual();
+    });
+    element.addEventListener('drop', (event) => {
+      clearDropVisual();
+      if (!hasFilesDrag(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const ch = getChannel();
+      const dropped = event.dataTransfer && event.dataTransfer.files;
+      if (dropped && dropped.length > 0) {
+        sendDroppedFilesOverChannel(ch, dropped).catch((err) => {
+          showToast(err && err.message ? err.message : 'File drop failed.');
+        });
+      }
+    });
+  };
+  installDropTarget(
+    $('#viewer-stage'),
+    $('#viewer-drop-overlay'),
+    () => clientChannel,
+    () => Boolean(clientConnected && clientChannel && clientChannel.readyState === 'open')
+  );
+  installDropTarget(
+    $('#page-share'),
+    null,
+    () => hostDataChannel,
+    () => Boolean(hostDataChannel && hostDataChannel.readyState === 'open' && hostPeerDetails)
+  );
   wireAction('mac-request-permission', async () => {
     if (typeof window.lanAPI.requestMacScreenPermission !== 'function') return;
     const snapshot = await window.lanAPI.requestMacScreenPermission();

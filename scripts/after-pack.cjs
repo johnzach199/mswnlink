@@ -133,6 +133,21 @@ function signMacAdHoc(context) {
 
   console.log(`[after-pack] Ad-hoc signing ${appPath} inside-out (${context.arch || process.arch})`);
 
+  // Strip extended attributes (FinderInfo, ResourceFork, provenance, quarantine) and stray
+  // .DS_Store files before signing so modern macOS Gatekeeper / codesign strict seal checks
+  // never report "resource fork or detritus not allowed" / "app is damaged".
+  try { run('xattr', ['-cr', appPath]); } catch {}
+  try { run('find', [appPath, '-name', '.DS_Store', '-delete']); } catch {}
+  try { run('chmod', ['-R', 'a+rX', appPath]); } catch {}
+  const mainMacOsDir = path.join(appPath, 'Contents', 'MacOS');
+  if (fs.existsSync(mainMacOsDir)) {
+    for (const entry of fs.readdirSync(mainMacOsDir, { withFileTypes: true })) {
+      if (entry.isFile()) {
+        try { fs.chmodSync(path.join(mainMacOsDir, entry.name), 0o755); } catch {}
+      }
+    }
+  }
+
   // 1. Sign unpacked native addons (.node / .dylib) inside Contents/Resources first.
   const resourcesDir = path.join(appPath, 'Contents', 'Resources');
   for (const file of collectMachOFiles(resourcesDir)) {
@@ -172,6 +187,9 @@ function signMacAdHoc(context) {
       const helperAppPath = path.join(frameworksDir, entry.name);
       const helperName = entry.name.replace(/\.app$/, '');
       const helperMainExec = path.join(helperAppPath, 'Contents', 'MacOS', helperName);
+      if (fs.existsSync(helperMainExec) && fs.lstatSync(helperMainExec).isFile()) {
+        try { fs.chmodSync(helperMainExec, 0o755); } catch {}
+      }
 
       for (const leaf of collectMachOFiles(helperAppPath, { skipBundles: true })) {
         if (path.resolve(leaf) === path.resolve(helperMainExec)) continue;
