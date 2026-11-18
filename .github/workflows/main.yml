@@ -15,6 +15,23 @@ on:
         description: "Optional release tag to publish (for example v4). Leave blank to build downloadable test artifacts only."
         required: false
         type: string
+      macos_arm64_runner:
+        description: "macOS Apple Silicon runner image (default macos-latest avoids macos-15 runner exhaustion)"
+        required: false
+        default: "macos-latest"
+        type: choice
+        options:
+          - macos-latest
+          - macos-26
+          - macos-15
+      macos_intel_runner:
+        description: "macOS Intel x64 runner image"
+        required: false
+        default: "macos-15-intel"
+        type: choice
+        options:
+          - macos-15-intel
+          - macos-26-intel
 
 concurrency:
   group: mswnlink-${{ github.workflow }}-${{ github.ref }}
@@ -40,11 +57,11 @@ jobs:
             arch: x64
             dist_args: "--win portable --x64"
             label: windows-x64
-          - os: macos-15-intel
+          - os: ${{ inputs.macos_intel_runner || 'macos-15-intel' }}
             arch: x64
             dist_args: "--mac dmg --x64"
             label: macos-intel-x64
-          - os: macos-15
+          - os: ${{ inputs.macos_arm64_runner || 'macos-latest' }}
             arch: arm64
             dist_args: "--mac dmg --arm64"
             label: macos-apple-silicon-arm64
@@ -161,6 +178,9 @@ jobs:
 
       - name: Build native RobotJS input backend for Electron
         shell: bash
+        env:
+          CFLAGS: -Wno-deprecated-declarations
+          CXXFLAGS: -Wno-deprecated-declarations
         run: npx electron-rebuild -f -w robotjs --arch ${{ matrix.arch }}
 
       - name: Verify compiled RobotJS native input backend
