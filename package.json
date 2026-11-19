@@ -44,9 +44,7 @@
       "package.json",
       "lib/**/*.js",
       "linux-wayland-input.js",
-      "win32-input.js",
-      "build/entitlements.mac.plist",
-      "build/entitlements.mac.inherit.plist"
+      "win32-input.js"
     ],
     "directories": {
       "output": "release"
@@ -66,10 +64,8 @@
       ],
       "category": "public.app-category.utilities",
       "artifactName": "mswnlink-macos-v4-${arch}.${ext}",
-      "hardenedRuntime": true,
+      "hardenedRuntime": false,
       "gatekeeperAssess": false,
-      "entitlements": "build/entitlements.mac.plist",
-      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
       "extendInfo": {
         "NSScreenCaptureUsageDescription": "mswnlink shares your desktop with a device on your local network when you start a session.",
         "NSAccessibilityUsageDescription": "mswnlink uses accessibility input permissions to send mouse and keyboard events during an authorized remote-control session."

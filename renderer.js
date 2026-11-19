@@ -2136,6 +2136,7 @@ async function createHostPeer() {
         if (!parameters.encodings || !parameters.encodings.length) parameters.encodings = [{}];
         parameters.encodings[0].maxBitrate = profile.maxBitrate;
         parameters.encodings[0].maxFramerate = profile.maxFramerate;
+        try { parameters.encodings[0].networkPriority = 'high'; } catch {}
         parameters.degradationPreference = 'maintain-resolution';
         await sender.setParameters(parameters);
       } catch (error) {
@@ -2230,7 +2231,7 @@ async function createHostPeer() {
       let data;
       try { data = JSON.parse(messageEvent.data); } catch { return; }
       if (!data || typeof data !== 'object') return;
-      const validKinds = new Set(['move', 'mouse', 'wheel', 'key', 'text', 'shortcut', 'releaseAll']);
+      const validKinds = new Set(['move', 'mouse', 'wheel', 'key', 'text', 'shortcut', 'keyboard-layout', 'releaseAll']);
       if (!validKinds.has(data.kind)) {
         handleSessionDataMessage('host', channel, data).catch(error => {
           console.warn('[mswnlink] Session feature message failed:', error.message || error);
@@ -2437,9 +2438,9 @@ function startRemoteVideoWatchdog() {
     if (video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
       try { await video.play(); } catch (error) { console.debug('[mswnlink] Video playback resume deferred:', error.message || error); }
     }
-    // Recover the HTML video decoder if frames stop arriving while WebRTC is
-    // still connected (e.g. after fullscreen/display power transitions).
-    if (typeof video.requestVideoFrameCallback === 'function' && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && performance.now() - lastRemoteVideoFrameAt > 15000) {
+    // Recover the HTML video decoder promptly (4.5s) if frames stall while WebRTC
+    // is still connected (common during Fedora Wayland PipeWire/fullscreen transitions).
+    if (typeof video.requestVideoFrameCallback === 'function' && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && performance.now() - lastRemoteVideoFrameAt > 4500) {
       const liveTracks = video.srcObject.getVideoTracks().filter(track => track.readyState === 'live');
       if (liveTracks.length) {
         try {
@@ -2450,7 +2451,7 @@ function startRemoteVideoWatchdog() {
       }
       lastRemoteVideoFrameAt = performance.now();
     }
-  }, 4000);
+  }, 2000);
 }
 
 async function startClientPeer() {
@@ -2472,6 +2473,7 @@ async function startClientPeer() {
     updateSessionFeatureUI();
     if (controlGranted && clientConnected) {
       focusRemoteViewerInput();
+      detectAndSyncViewerKeyboardLanguage('channel-open').catch(() => {});
     }
     if (controlGranted) showToast('Remote desktop ready. Click the screen to send input.');
   };
@@ -2501,6 +2503,12 @@ async function startClientPeer() {
     updateSessionFeatureUI();
   };
   peer.ontrack = (event) => {
+    if (event.receiver) {
+      try {
+        if ('playoutDelayHint' in event.receiver) event.receiver.playoutDelayHint = 0;
+        if ('jitterBufferTarget' in event.receiver) event.receiver.jitterBufferTarget = 0;
+      } catch {}
+    }
     const video = $('#remote-video');
     if (event.streams && event.streams[0]) video.srcObject = event.streams[0];
     else {
@@ -2520,6 +2528,7 @@ async function startClientPeer() {
     clearConnectTimer();
     updateClientControlUI();
     updateSessionFeatureUI();
+    detectAndSyncViewerKeyboardLanguage('track-ready').catch(() => {});
     if ($('#viewer-quality-select').value === 'auto') startAdaptiveQualityMonitor();
     if (video.videoWidth && video.videoHeight) $('#viewer-resolution').textContent = `${video.videoWidth} × ${video.videoHeight}`;
   };
@@ -2696,6 +2705,8 @@ function cleanupClient(sendHangup = false) {
   clientPairKey = '';
   clientNonce = null;
   remoteDisplays = [];
+  lastSyncedViewerKeyboardLanguage = '';
+  updateViewerLanguageIndicator('');
   remoteFeaturePreferences = { clipboard: false, fileTransfer: false, monitorSwitching: false };
   for (const pending of pendingClipboardRequests.values()) clearTimeout(pending.timer);
   pendingClipboardRequests.clear();
@@ -2856,6 +2867,84 @@ let pendingDeadAccent = null;
 let lastDirectFlushedText = '';
 let lastDirectFlushedAt = 0;
 let imeCaptureAllowedUntil = 0;
+let lastSyncedViewerKeyboardLanguage = '';
+let viewerLangRefreshTimer = null;
+
+function updateViewerLanguageIndicator(lang) {
+  const pill = $('#viewer-language-indicator');
+  if (!pill) return;
+  const code = String(lang || '').trim().toUpperCase();
+  pill.textContent = code ? `KB: ${code}` : 'KB: Auto';
+}
+
+function detectScriptLangFromSample(ch) {
+  const s = String(ch || '');
+  if (!s) return '';
+  if (/[\u0370-\u03ff\u1f00-\u1fff]/.test(s)) return 'el';
+  if (/[\u0400-\u04ff]/.test(s)) return /[іїєґІЇЄҐ]/.test(s) ? 'uk' : 'ru';
+  if (/[\u0600-\u06ff]/.test(s)) return 'ar';
+  if (/[\u0590-\u05ff]/.test(s)) return 'he';
+  if (/[\uac00-\ud7af\u1100-\u11ff]/.test(s)) return 'ko';
+  if (/[\u3040-\u30ff]/.test(s)) return 'ja';
+  if (/[\u4e00-\u9fff]/.test(s)) return 'zh';
+  return '';
+}
+
+function inferViewerKeyboardLanguageFromEvent(event) {
+  if (!event || event.ctrlKey || event.metaKey || (event.altKey && String(event.key || '').length > 1)) return '';
+  const key = String(event.key || '');
+  const code = String(event.code || '');
+  if (!key || key === 'Dead' || key === 'Process' || key === 'Unidentified' || key.length > 2) return '';
+  const script = detectScriptLangFromSample(key);
+  if (script) return script;
+  if (/^Key[A-Z]$/.test(code) && /^[a-zA-Z]$/.test(key)) {
+    const lower = key.toLowerCase();
+    if ((code === 'KeyQ' && lower === 'a') || (code === 'KeyW' && lower === 'z')) return 'fr';
+    if ((code === 'KeyY' && lower === 'z') || (code === 'KeyZ' && lower === 'y')) return 'de';
+    return 'en';
+  }
+  if (code === 'Semicolon' && (key === 'ñ' || key === 'Ñ')) return 'es';
+  return '';
+}
+
+function syncViewerKeyboardLanguage(lang, source = 'auto') {
+  const norm = String(lang || '').trim().toLowerCase();
+  if (!norm) return;
+  updateViewerLanguageIndicator(norm);
+  if (!clientConnected || !controlGranted || !clientChannel || clientChannel.readyState !== 'open') return;
+  if (norm === lastSyncedViewerKeyboardLanguage) return;
+  lastSyncedViewerKeyboardLanguage = norm;
+  sendInput({ kind: 'keyboard-layout', language: norm, source });
+}
+
+async function detectAndSyncViewerKeyboardLanguage(source = 'layoutmap') {
+  let detected = '';
+  try {
+    if (navigator.keyboard && typeof navigator.keyboard.getLayoutMap === 'function') {
+      const map = await navigator.keyboard.getLayoutMap();
+      const getVal = code => String(map.get(code) || '');
+      const keyA = getVal('KeyA');
+      const keyS = getVal('KeyS');
+      const keyQ = getVal('KeyQ');
+      const keyW = getVal('KeyW');
+      const keyY = getVal('KeyY');
+      const keyZ = getVal('KeyZ');
+      const keySemi = getVal('Semicolon');
+      for (const sample of [keyA, keyS, keyQ, keyW, keyY, keyZ]) {
+        const script = detectScriptLangFromSample(sample);
+        if (script) { detected = script; break; }
+      }
+      if (!detected) {
+        if (keyQ.toLowerCase() === 'a' && keyW.toLowerCase() === 'z') detected = 'fr';
+        else if (keyY.toLowerCase() === 'z' && keyZ.toLowerCase() === 'y') detected = 'de';
+        else if (keySemi.toLowerCase() === 'ñ') detected = 'es';
+        else if (keyA.toLowerCase() === 'a') detected = 'en';
+      }
+    }
+  } catch {}
+  if (detected) syncViewerKeyboardLanguage(detected, source);
+  return detected;
+}
 
 const CLIENT_DEAD_ACUTE_MAP = new Map([
   ['α', 'ά'], ['ε', 'έ'], ['η', 'ή'], ['ι', 'ί'], ['ο', 'ό'], ['υ', 'ύ'], ['ω', 'ώ'],
@@ -3058,6 +3147,27 @@ function handleRemoteKey(event, action) {
   const code = String(event.code || '');
   const key = String(event.key || '');
 
+  // Schedule a layout map re-check when modifier/layout-toggle keys release (Super+Space, Alt+Shift, Ctrl+Shift).
+  if (action === 'up' && /^(Alt|Shift|Meta|Control)(Left|Right)?$|^Space$|^CapsLock$/.test(code)) {
+    if (viewerLangRefreshTimer) clearTimeout(viewerLangRefreshTimer);
+    viewerLangRefreshTimer = setTimeout(() => {
+      viewerLangRefreshTimer = null;
+      detectAndSyncViewerKeyboardLanguage('shortcut-keyup').catch(() => {});
+    }, 65);
+  }
+
+  // Sync viewer -> shared PC keyboard language on the first printable/dead key in a new script/layout.
+  if (action === 'down' && !event.repeat) {
+    const inferredLang = inferViewerKeyboardLanguageFromEvent(event);
+    if (inferredLang) syncViewerKeyboardLanguage(inferredLang, 'key-infer');
+    else if (key === 'Dead' && code === 'Semicolon' && !event.altKey && !event.ctrlKey && !event.metaKey) {
+      // Semicolon acts as Greek tonos/dialytika dead key when typing on Greek layout.
+      if (lastSyncedViewerKeyboardLanguage !== 'el') {
+        detectAndSyncViewerKeyboardLanguage('deadkey').catch(() => {});
+      }
+    }
+  }
+
   // Always deliver matching keyup for any key whose keydown was sent as a raw VK/evdev event.
   if (action === 'up' && code && sentRawKeyCodes.has(code)) {
     sentRawKeyCodes.delete(code);
@@ -3241,6 +3351,11 @@ function installRemoteKeyboardCapture() {
   // lost/duplicated key handlers after reconnecting or recreating a peer.
   window.addEventListener('keydown', event => handleRemoteKey(event, 'down'), true);
   window.addEventListener('keyup', event => handleRemoteKey(event, 'up'), true);
+  if (navigator.keyboard && typeof navigator.keyboard.addEventListener === 'function') {
+    navigator.keyboard.addEventListener('layoutchange', () => {
+      detectAndSyncViewerKeyboardLanguage('layoutchange').catch(() => {});
+    });
+  }
   window.addEventListener('paste', (event) => {
     if (!clientConnected || !controlGranted || !pages.session.classList.contains('page-active')) return;
     if (isEditableLocalElement(event.target)) return;
@@ -3793,10 +3908,20 @@ async function initialize() {
   window.addEventListener('blur', releaseRemoteInput);
   window.addEventListener('focus', () => {
     clipboardSyncTick().catch(() => {});
+    if (clientConnected && controlGranted) {
+      lastSyncedViewerKeyboardLanguage = '';
+      detectAndSyncViewerKeyboardLanguage('window-focus').catch(() => {});
+    }
     if (deviceInfo.platform === 'darwin') refreshMacPermissionState().catch(() => {});
   });
   window.addEventListener('pagehide', releaseRemoteInput);
-  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseRemoteInput(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) releaseRemoteInput();
+    else if (clientConnected && controlGranted) {
+      lastSyncedViewerKeyboardLanguage = '';
+      detectAndSyncViewerKeyboardLanguage('visibility').catch(() => {});
+    }
+  });
   window.addEventListener('beforeunload', () => {
     cleanupClient(true);
     if (hostInfo) window.lanAPI.stopHost();

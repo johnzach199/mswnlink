@@ -34,7 +34,9 @@ const { spawn, execFileSync } = require('node:child_process');
 const {
   mapWin32VirtualKey,
   shortcutDescriptorForPlatform,
-  isWindowsRdpEnv
+  isWindowsRdpEnv,
+  normalizeLanguageTag,
+  win32LangIdForLayout
 } = require('./lib/input-protocol');
 
 const WORKER_SCRIPT = String.raw`
@@ -246,6 +248,33 @@ public static class MswnlinkWin32Worker {
 
     [DllImport("shell32.dll")]
     public static extern bool IsUserAnAdmin();
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GUITHREADINFO {
+        public int cbSize;
+        public uint flags;
+        public IntPtr hwndActive;
+        public IntPtr hwndFocus;
+        public IntPtr hwndCapture;
+        public IntPtr hwndMenuOwner;
+        public IntPtr hwndMoveSize;
+        public IntPtr hwndCaret;
+        public RECT rcCaret;
+    }
+
+    public const uint WM_INPUTLANGCHANGEREQUEST = 0x0050;
+
+    [DllImport("user32.dll")]
+    public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO lpgui);
+
+    [DllImport("user32.dll")]
+    public static extern int GetKeyboardLayoutList(int nBuff, [Out] IntPtr[] lpList);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetKeyboardLayout(uint idThread);
+
+    [DllImport("user32.dll")]
+    public static extern bool PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
     private static Dictionary<int, bool> heldButtons = new Dictionary<int, bool>();
     private static Dictionary<ushort, bool> heldKeys = new Dictionary<ushort, bool>();
@@ -606,6 +635,47 @@ public static class MswnlinkWin32Worker {
         }
         heldButtons.Clear();
     }
+
+    public static bool SwitchKeyboardLanguage(int primaryLangId) {
+        if (primaryLangId <= 0) return false;
+        try {
+            IntPtr fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero) return false;
+            uint pid = 0;
+            uint tid = GetWindowThreadProcessId(fg, out pid);
+            IntPtr currentHkl = GetKeyboardLayout(tid);
+            int currentPrimary = (int)(((long)currentHkl) & 0xFFFFL) & 0x03FF;
+            if (currentPrimary == primaryLangId) return true;
+
+            int count = GetKeyboardLayoutList(0, null);
+            if (count <= 0) return false;
+            IntPtr[] list = new IntPtr[count];
+            int filled = GetKeyboardLayoutList(count, list);
+            IntPtr matched = IntPtr.Zero;
+            for (int i = 0; i < filled; i++) {
+                int candPrimary = (int)(((long)list[i]) & 0xFFFFL) & 0x03FF;
+                if (candPrimary == primaryLangId) {
+                    matched = list[i];
+                    break;
+                }
+            }
+            if (matched == IntPtr.Zero) return false;
+
+            IntPtr target = fg;
+            GUITHREADINFO gti = new GUITHREADINFO();
+            gti.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (GetGUIThreadInfo(tid, ref gti) && gti.hwndFocus != IntPtr.Zero) {
+                target = gti.hwndFocus;
+            }
+            bool posted = PostMessageW(target, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, matched);
+            if (target != fg) {
+                PostMessageW(fg, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, matched);
+            }
+            return posted;
+        } catch {
+            return false;
+        }
+    }
 }
 "@
 
@@ -640,6 +710,7 @@ try {
       'keepConsole' { [MswnlinkWin32Worker]::SetKeepConsoleOnRdpDisconnect([bool]$cmd.enabled) }
       'ensureConsole' { [void][MswnlinkWin32Worker]::EnsureConsoleActive() }
       'handoffRdp' { [void][MswnlinkWin32Worker]::RedirectSessionToConsole() }
+      'switchLayout' { [void][MswnlinkWin32Worker]::SwitchKeyboardLanguage([int]$cmd.primaryLangId) }
       'releaseAll' { [MswnlinkWin32Worker]::ReleaseAll() }
       'stop' { [MswnlinkWin32Worker]::SetKeepConsoleOnRdpDisconnect($false); [MswnlinkWin32Worker]::ReleaseAll(); break }
     }
@@ -981,6 +1052,13 @@ class WindowsInputBackend {
           down: event.action === 'down'
         })
       };
+    }
+    if (event.kind === 'keyboard-layout') {
+      const norm = normalizeLanguageTag(event.language || event.layout || '');
+      const meta = norm ? win32LangIdForLayout(norm) : null;
+      if (!meta) return { ok: true };
+      this.send({ op: 'switchLayout', primaryLangId: meta.primaryLangId, klid: meta.klid });
+      return { ok: true, language: norm };
     }
     return { ok: false, reason: 'Unknown input event.' };
   }

@@ -27,7 +27,13 @@ const {
   shortcutDescriptorForPlatform,
   unicodeToXkbKeysym,
   greekCharToEvdevSteps,
-  isLinuxWaylandEnv
+  isLinuxWaylandEnv,
+  normalizeLanguageTag,
+  xkbLayoutForLanguage,
+  LANGUAGE_LAYOUT_TABLE,
+  parseGtkAccelToEvdev,
+  resolveWaylandPointerTarget,
+  shouldReanchorRelativePointer
 } = require('./lib/input-protocol');
 
 function loadDbus(override) {
@@ -74,6 +80,7 @@ const WAYLAND_PORTAL_PY_SCRIPT = String.raw`
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -327,7 +334,7 @@ try:
                 None
             )
             fd_idx = int(res_var.unpack()[0])
-            if out_fd_list is not None:
+            if out_fd_list is not None and shutil.which('gst-launch-1.0'):
                 pw_fd_held = out_fd_list.get(fd_idx)
                 os.set_inheritable(pw_fd_held, True)
                 gst_proc = subprocess.Popen(
@@ -347,7 +354,17 @@ try:
                     stderr=subprocess.DEVNULL,
                     pass_fds=(pw_fd_held,)
                 )
-                pw_consumer_alive = True
+                if gst_proc.poll() is None:
+                    pw_consumer_alive = True
+                else:
+                    gst_proc = None
+                    pw_consumer_alive = False
+            elif out_fd_list is not None:
+                try:
+                    os.close(out_fd_list.get(fd_idx))
+                except Exception:
+                    pass
+                pw_consumer_alive = False
         except Exception:
             pw_consumer_alive = False
 
@@ -599,6 +616,111 @@ for raw_line in sys.stdin:
                             tap_sym(unicode_sym, 0.004)
                         else:
                             raise
+        elif cmd == 'switchLayout':
+            target_aliases = [str(a).strip().lower() for a in (msg.get('aliases') or []) if a]
+            target_xkb = str(msg.get('xkbLayout') or '').strip().lower()
+            if target_xkb and target_xkb not in target_aliases:
+                target_aliases.insert(0, target_xkb)
+
+            def matches_alias(layout_id):
+                raw = str(layout_id or '').strip().lower()
+                if raw.startswith('xkb:'):
+                    raw = raw[4:].split(':')[0]
+                base = raw.split('+')[0].split('(')[0].split('@')[0].split('_')[0]
+                return raw in target_aliases or base in target_aliases
+
+            desktop_env = os.environ.get('XDG_CURRENT_DESKTOP', '').lower()
+            if 'kde' in desktop_env and shutil.which('gdbus') and target_xkb:
+                try:
+                    subprocess.run(
+                        ['gdbus', 'call', '--session', '--dest', 'org.kde.keyboard', '--object-path', '/Layouts', '--method', 'org.kde.KeyboardLayouts.setLayout', target_xkb],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1.5
+                    )
+                except Exception:
+                    pass
+
+            try:
+                schema_src = Gio.SettingsSchemaSource.get_default()
+                if schema_src is not None and schema_src.lookup('org.gnome.desktop.input-sources', True) is not None:
+                    gs = Gio.Settings.new('org.gnome.desktop.input-sources')
+                    srcs = list(gs.get_value('sources').unpack() or [])
+                    mru = list(gs.get_value('mru-sources').unpack() or [])
+                    target_idx = -1
+                    target_entry = None
+                    for idx, entry in enumerate(srcs):
+                        if len(entry) >= 2 and matches_alias(entry[1]):
+                            target_idx = idx
+                            target_entry = entry
+                            break
+
+                    active_entry = mru[0] if mru else (srcs[0] if srcs else None)
+                    already_active = bool(active_entry and len(active_entry) >= 2 and matches_alias(active_entry[1]))
+
+                    if not already_active and target_idx >= 0 and len(srcs) >= 2:
+                        # 1. Try Shyriiwook GNOME Shell extension D-Bus if installed (instant deterministic switch)
+                        switched_via_dbus = False
+                        try:
+                            conn.call_sync(
+                                'org.gnome.Shell',
+                                '/me/madhead/Shyriiwook',
+                                'me.madhead.Shyriiwook',
+                                'activate',
+                                GLib.Variant('(u)', (target_idx,)),
+                                None, Gio.DBusCallFlags.NONE, 400, None
+                            )
+                            switched_via_dbus = True
+                        except Exception:
+                            switched_via_dbus = False
+
+                        # 2. Tap the configured GNOME switch-input-source shortcut via RemoteDesktop portal
+                        if not switched_via_dbus:
+                            accels = list(msg.get('accels') or [])
+                            chosen_accel = accels[0] if accels else {'modifiers': [125], 'keycode': 57}
+                            mods = [int(m) for m in (chosen_accel.get('modifiers') or [])]
+                            kcode = int(chosen_accel.get('keycode') or 57)
+
+                            for _step in range(min(len(srcs), 6)):
+                                pressed_mods = []
+                                pressed_main = False
+                                try:
+                                    for mc in mods:
+                                        conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                                       GLib.Variant('(oa{sv}iu)', (session_handle, {}, mc, 1)),
+                                                       None, Gio.DBusCallFlags.NONE, 1500, None)
+                                        pressed_mods.append(mc)
+                                    time.sleep(0.008)
+                                    conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                                   GLib.Variant('(oa{sv}iu)', (session_handle, {}, kcode, 1)),
+                                                   None, Gio.DBusCallFlags.NONE, 1500, None)
+                                    pressed_main = True
+                                    time.sleep(0.012)
+                                finally:
+                                    if pressed_main:
+                                        try:
+                                            conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                                           GLib.Variant('(oa{sv}iu)', (session_handle, {}, kcode, 0)),
+                                                           None, Gio.DBusCallFlags.NONE, 1500, None)
+                                        except Exception:
+                                            pass
+                                    for mc in reversed(pressed_mods):
+                                        try:
+                                            conn.call_sync(BUS_NAME, ROOT, REMOTE_IFACE, 'NotifyKeyboardKeycode',
+                                                           GLib.Variant('(oa{sv}iu)', (session_handle, {}, mc, 0)),
+                                                           None, Gio.DBusCallFlags.NONE, 1500, None)
+                                        except Exception:
+                                            pass
+                                time.sleep(0.045)
+                                latest_mru = list(gs.get_value('mru-sources').unpack() or [])
+                                if latest_mru and len(latest_mru[0]) >= 2 and matches_alias(latest_mru[0][1]):
+                                    break
+                        # Keep mru-sources coherent when fallback needed
+                        if target_entry is not None:
+                            try:
+                                gs.set_uint('current', target_idx)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
         if req_id is not None:
             emit_json({'id': req_id, 'ok': True})
     except Exception as call_err:
@@ -729,6 +851,7 @@ class LinuxWaylandInput {
     this.streamId = null;
     this.streamWidth = 1920;
     this.streamHeight = 1080;
+    this.portalProps = {};
     this.useRelativeFallback = false;
     this.relativeAnchored = false;
     this.cursorX = 0;
@@ -740,6 +863,8 @@ class LinuxWaylandInput {
     this.heldButtons = new Set();
     this.wheelX = 0;
     this.wheelY = 0;
+    this.activeKeyboardLanguage = '';
+    this.gnomeSwitchAccelsCache = null;
   }
 
   isActive() {
@@ -750,42 +875,51 @@ class LinuxWaylandInput {
     return Boolean(this.remote && this.sessionHandle && this.bus && this.busConnected);
   }
 
-  resolveLogicalDesktopSize(portalProps = {}) {
-    let fallbackW = 1920;
-    let fallbackH = 1080;
-    let scaleFactor = 1;
-    if (this.screen && typeof this.screen.getPrimaryDisplay === 'function') {
+  resolveLogicalDesktopSize(portalProps = {}, displayId = '') {
+    let displays = [];
+    let primaryDisplay = null;
+    if (this.screen) {
       try {
-        const primary = this.screen.getPrimaryDisplay();
-        if (primary && primary.bounds && primary.bounds.width > 0 && primary.bounds.height > 0) {
-          fallbackW = Math.round(primary.bounds.width);
-          fallbackH = Math.round(primary.bounds.height);
+        if (typeof this.screen.getAllDisplays === 'function') {
+          displays = this.screen.getAllDisplays() || [];
         }
-        if (primary && Number(primary.scaleFactor) > 0) {
-          scaleFactor = Number(primary.scaleFactor);
+        if (typeof this.screen.getPrimaryDisplay === 'function') {
+          primaryDisplay = this.screen.getPrimaryDisplay();
         }
       } catch {}
     }
+    const resolved = resolveWaylandPointerTarget({
+      normalizedX: 0,
+      normalizedY: 0,
+      portalProps: portalProps || {},
+      displays,
+      displayId,
+      primaryDisplay
+    });
+    return {
+      width: resolved.logicalWidth,
+      height: resolved.logicalHeight
+    };
+  }
 
-    const logicalSize = portalProps.logical_size;
-    if (Array.isArray(logicalSize) && logicalSize.length >= 2 && Number(logicalSize[0]) > 0 && Number(logicalSize[1]) > 0) {
-      return {
-        width: Math.max(1, Math.round(Number(logicalSize[0]))),
-        height: Math.max(1, Math.round(Number(logicalSize[1])))
-      };
-    }
-
-    const rawSize = portalProps.size;
-    if (Array.isArray(rawSize) && rawSize.length >= 2 && Number(rawSize[0]) > 0 && Number(rawSize[1]) > 0) {
-      const rw = Number(rawSize[0]);
-      const rh = Number(rawSize[1]);
-      if (scaleFactor > 1 && Math.abs(rw / scaleFactor - fallbackW) <= 4) {
-        return { width: fallbackW, height: fallbackH };
+  _readGnomeSwitchAccels() {
+    if (Array.isArray(this.gnomeSwitchAccelsCache)) return this.gnomeSwitchAccelsCache;
+    const parsed = [];
+    try {
+      const raw = execFileSync('gsettings', ['get', 'org.gnome.desktop.wm.keybindings', 'switch-input-source'], {
+        encoding: 'utf8',
+        timeout: 800,
+        stdio: ['ignore', 'pipe', 'ignore']
+      });
+      const matches = raw.match(/'([^']+)'/g) || [];
+      for (const tokenStr of matches) {
+        const accel = parseGtkAccelToEvdev(tokenStr.slice(1, -1));
+        if (accel) parsed.push(accel);
       }
-      return { width: Math.max(1, Math.round(rw)), height: Math.max(1, Math.round(rh)) };
-    }
-
-    return { width: fallbackW, height: fallbackH };
+    } catch {}
+    if (!parsed.length) parsed.push({ modifiers: [EVDEV_KEYCODES.MetaLeft], keycode: EVDEV_KEYCODES.Space });
+    this.gnomeSwitchAccelsCache = parsed;
+    return parsed;
   }
 
   _abortAllWaiters(reason) {
@@ -995,9 +1129,12 @@ class LinuxWaylandInput {
           this.abortWaiters.delete(abortOnClose);
 
           this.pyReady = true;
-          const resolved = this.resolveLogicalDesktopSize(msg.props || {});
+          this.portalProps = msg.props || {};
+          const resolved = this.resolveLogicalDesktopSize(this.portalProps);
           this.streamWidth = resolved.width;
           this.streamHeight = resolved.height;
+          this.activeKeyboardLanguage = '';
+          this.gnomeSwitchAccelsCache = null;
           if (typeof msg.streamId === 'number' && Number.isFinite(msg.streamId) && msg.pipewireConsumer) {
             this.streamId = msg.streamId;
             this.useRelativeFallback = false;
@@ -1202,6 +1339,7 @@ class LinuxWaylandInput {
       if (streams.length && this.dbusModule) {
         this.streamId = Number(streams[0][0]);
         const props = unwrapDict(streams[0][1]);
+        this.portalProps = props;
         const resolved = this.resolveLogicalDesktopSize(props);
         this.streamWidth = resolved.width;
         this.streamHeight = resolved.height;
@@ -1209,6 +1347,7 @@ class LinuxWaylandInput {
         console.info(`[mswnlink] Wayland input session started (stream=${this.streamId}, logical=${this.streamWidth}x${this.streamHeight}, devices=${granted}).`);
       } else {
         const props = streams.length ? unwrapDict(streams[0][1]) : {};
+        this.portalProps = props;
         const resolved = this.resolveLogicalDesktopSize(props);
         this.streamId = null;
         this.streamWidth = resolved.width;
@@ -1218,6 +1357,7 @@ class LinuxWaylandInput {
         console.info(`[mswnlink] Wayland input session started in relative pointer mode (logical=${this.streamWidth}x${this.streamHeight}, devices=${granted}).`);
       }
 
+      this.activeKeyboardLanguage = '';
       this.restoreToken = typeof started.restore_token === 'string' ? started.restore_token : '';
       this.heldKeys.clear();
       this.heldButtons.clear();
@@ -1277,18 +1417,31 @@ class LinuxWaylandInput {
   }
 
   async movePointerRelative(targetX, targetY) {
-    if (!this.relativeAnchored) {
+    const plan = shouldReanchorRelativePointer({
+      targetX,
+      targetY,
+      width: this.streamWidth,
+      height: this.streamHeight,
+      cursorX: this.cursorX,
+      cursorY: this.cursorY,
+      relativeAnchored: this.relativeAnchored
+    });
+    if (plan.mode === 'corner-reset') {
       await this._notifyPointerMotionRelative(-this.streamWidth * 1.5, -this.streamHeight * 1.5);
       this.cursorX = 0;
       this.cursorY = 0;
       this.relativeAnchored = true;
+    } else if (plan.mode === 'wall-snap') {
+      await this._notifyPointerMotionRelative(plan.wallDx, plan.wallDy);
+      this.cursorX = plan.anchorX;
+      this.cursorY = plan.anchorY;
     }
-    const dx = targetX - this.cursorX;
-    const dy = targetY - this.cursorY;
+    const dx = Math.max(0, Math.min(this.streamWidth - 1, targetX)) - this.cursorX;
+    const dy = Math.max(0, Math.min(this.streamHeight - 1, targetY)) - this.cursorY;
     if (Math.abs(dx) >= 0.5 || Math.abs(dy) >= 0.5) {
       await this._notifyPointerMotionRelative(dx, dy);
-      this.cursorX = targetX;
-      this.cursorY = targetY;
+      this.cursorX += dx;
+      this.cursorY += dy;
     }
   }
 
@@ -1378,8 +1531,13 @@ class LinuxWaylandInput {
       const x = Math.max(0, Math.min(1, Number(event.x)));
       const y = Math.max(0, Math.min(1, Number(event.y)));
       if (!Number.isFinite(x) || !Number.isFinite(y)) return { ok: false };
-      const px = Math.min(this.streamWidth - 1, Math.max(0, x * this.streamWidth));
-      const py = Math.min(this.streamHeight - 1, Math.max(0, y * this.streamHeight));
+      const resolved = this.resolveLogicalDesktopSize(this.portalProps || {}, event.displayId || '');
+      if (resolved.width > 0 && resolved.height > 0) {
+        this.streamWidth = resolved.width;
+        this.streamHeight = resolved.height;
+      }
+      const px = Math.min(this.streamWidth - 0.5, Math.max(0, x * this.streamWidth));
+      const py = Math.min(this.streamHeight - 0.5, Math.max(0, y * this.streamHeight));
 
       if (!this.useRelativeFallback && this.streamId !== null && Number.isFinite(this.streamId)) {
         try {
@@ -1389,17 +1547,29 @@ class LinuxWaylandInput {
           return { ok: true };
         } catch (absErr) {
           if (!this.isActive()) throw absErr;
-          console.warn('[mswnlink] NotifyPointerMotionAbsolute rejected; switching to relative Wayland pointer motion:', absErr.message);
-          const refreshed = this.resolveLogicalDesktopSize({});
+          const refreshed = this.resolveLogicalDesktopSize({}, event.displayId || '');
+          const dimsChanged = refreshed.width !== this.streamWidth || refreshed.height !== this.streamHeight;
+          this.portalProps = {};
           this.streamWidth = refreshed.width;
           this.streamHeight = refreshed.height;
+          if (dimsChanged) {
+            const retryX = Math.min(this.streamWidth - 0.5, Math.max(0, x * this.streamWidth));
+            const retryY = Math.min(this.streamHeight - 0.5, Math.max(0, y * this.streamHeight));
+            try {
+              await this._notifyPointerMotionAbsolute(retryX, retryY);
+              this.cursorX = retryX;
+              this.cursorY = retryY;
+              return { ok: true };
+            } catch {}
+          }
+          console.warn('[mswnlink] NotifyPointerMotionAbsolute rejected; switching to relative Wayland pointer motion:', absErr.message);
           this.useRelativeFallback = true;
           this.relativeAnchored = false;
         }
       }
       await this.movePointerRelative(
-        Math.min(this.streamWidth - 1, Math.max(0, x * this.streamWidth)),
-        Math.min(this.streamHeight - 1, Math.max(0, y * this.streamHeight))
+        Math.min(this.streamWidth - 0.5, Math.max(0, x * this.streamWidth)),
+        Math.min(this.streamHeight - 0.5, Math.max(0, y * this.streamHeight))
       );
       return { ok: true };
     }
@@ -1471,6 +1641,36 @@ class LinuxWaylandInput {
       if (needShift && !shiftHeld) await this._notifyKeyboardKeycode(EVDEV_KEYCODES.ShiftLeft, 0);
       if (!ctrlHeld) await this._notifyKeyboardKeycode(EVDEV_KEYCODES.ControlLeft, 0);
       return { ok: true };
+    }
+
+    if (event.kind === 'keyboard-layout') {
+      const norm = normalizeLanguageTag(event.language || event.layout || '');
+      if (!norm) return { ok: true };
+      if (this.activeKeyboardLanguage === norm) return { ok: true, unchanged: true };
+      const xkb = xkbLayoutForLanguage(norm) || norm;
+      const meta = LANGUAGE_LAYOUT_TABLE[norm];
+      const aliases = meta ? meta.xkbAliases : [xkb, norm];
+      if (this.pyWorker && this.pyReady) {
+        const accels = this._readGnomeSwitchAccels();
+        await this._sendPyCommand({
+          cmd: 'switchLayout',
+          language: norm,
+          xkbLayout: xkb,
+          aliases,
+          accels
+        }, 3000).catch(() => {});
+        this.activeKeyboardLanguage = norm;
+        return { ok: true, language: norm };
+      }
+      // Fallback path when running over dbus-next (or tests): tap Super+Space if configured
+      const accels = [{ modifiers: [EVDEV_KEYCODES.MetaLeft], keycode: EVDEV_KEYCODES.Space }];
+      const chosen = accels[0];
+      for (const mc of chosen.modifiers) await this._notifyKeyboardKeycode(mc, 1);
+      await this._notifyKeyboardKeycode(chosen.keycode, 1);
+      await this._notifyKeyboardKeycode(chosen.keycode, 0);
+      for (const mc of [...chosen.modifiers].reverse()) await this._notifyKeyboardKeycode(mc, 0);
+      this.activeKeyboardLanguage = norm;
+      return { ok: true, language: norm };
     }
 
     if (event.kind === 'releaseAll') {

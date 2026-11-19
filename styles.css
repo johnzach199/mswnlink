@@ -306,6 +306,7 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
 .toolbar-led { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background-color 0.2s, box-shadow 0.2s; }
 .toolbar-led.active { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
 .viewer-hint { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.viewer-lang-pill { padding: 2px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font-size: 11.5px; font-weight: 600; letter-spacing: 0.03em; white-space: nowrap; }
 .viewer-resolution { white-space: nowrap; }
 .fullscreen-exit-overlay { display: none; position: absolute; top: 42px; right: 16px; z-index: 30; padding: 8px 14px; border: 1px solid rgba(255, 255, 255, 0.25); border-radius: var(--radius-s); background: rgba(10, 13, 12, 0.78); color: #fff; font-weight: 600; opacity: 0.85; backdrop-filter: blur(8px); transition: opacity 0.15s, background-color 0.15s; }
 .fullscreen-exit-overlay:hover { opacity: 1; background: rgba(10, 13, 12, 0.92); }

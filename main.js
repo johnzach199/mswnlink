@@ -7,7 +7,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { promisify } = require('node:util');
 const pbkdf2Async = promisify(crypto.pbkdf2);
-const { execFile } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
 const dgram = require('node:dgram');
 const { WebSocketServer, WebSocket } = require('ws');
 const LinuxWaylandInput = process.platform === 'linux' ? require('./linux-wayland-input') : null;
@@ -30,7 +30,9 @@ const {
   encodeUriList,
   parseUriListPaths,
   isLinuxWaylandEnv,
-  isWindowsRdpEnv
+  isWindowsRdpEnv,
+  normalizeLanguageTag,
+  xkbLayoutForLanguage
 } = require('./lib/input-protocol');
 const isLinuxWaylandSession = Boolean(
   (LinuxWaylandInput && LinuxWaylandInput.isSupportedSession()) ||
@@ -109,10 +111,14 @@ let mainClipboardPollCount = 0;
 let clipboardFallbackBusy = false;
 let lastObservedMainClipboard = '';
 let lastObservedMainClipboardSignature = '';
+let lastObservedX11ClipboardSignature = '';
+let lastObservedWlClipboardSignature = '';
+let cachedWlClipboardTools = null;
 let lastObservedImagePayload = null;
 let displayMediaUsingSystemPicker = null;
 let linuxWorkAreaMaximized = false;
 let linuxNormalBounds = null;
+let lastHostKeyboardLanguage = '';
 
 function featurePreferencesPath() {
   return path.join(app.getPath('userData'), 'feature-preferences.json');
@@ -438,6 +444,129 @@ async function resolveUniquePath(targetDir, fileName) {
   return path.join(targetDir, `${baseName}-${Date.now()}${ext}`);
 }
 
+function execFileBuffer(cmd, args, timeout = 700) {
+  return new Promise((resolve) => {
+    try {
+      execFile(cmd, args, { encoding: 'buffer', maxBuffer: 8 * 1024 * 1024, timeout }, (err, stdout) => {
+        if (err || !Buffer.isBuffer(stdout)) resolve(null);
+        else resolve(stdout);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function hasWaylandClipboardTools() {
+  if (!isLinuxWaylandSession) return false;
+  if (cachedWlClipboardTools !== null) return cachedWlClipboardTools;
+  const pasteOut = await execFileBuffer('wl-paste', ['--version'], 600);
+  const copyOut = await execFileBuffer('wl-copy', ['--version'], 600);
+  cachedWlClipboardTools = Boolean(pasteOut && copyOut);
+  return cachedWlClipboardTools;
+}
+
+async function readWaylandClipboardTypes() {
+  const out = await execFileBuffer('wl-paste', ['--list-types'], 500);
+  if (!out) return [];
+  return out
+    .toString('utf8')
+    .split(/\r?\n/)
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function writeWaylandClipboardData(mime, content) {
+  if (!isLinuxWaylandSession || !cachedWlClipboardTools) return;
+  try {
+    const child = spawn('wl-copy', ['--type', mime], {
+      stdio: ['pipe', 'ignore', 'ignore'],
+      detached: true
+    });
+    child.on('error', () => {});
+    if (child.stdin) {
+      child.stdin.on('error', () => {});
+      child.stdin.end(content);
+    }
+    child.unref();
+  } catch {}
+}
+
+async function readWaylandClipboardPayload(options = {}) {
+  if (!(await hasWaylandClipboardTools())) return null;
+  const types = await readWaylandClipboardTypes();
+  if (!types.length) return null;
+  const typeSet = new Set(types);
+  const checkFiles = options.checkFiles !== false && Boolean(localFeaturePreferences.fileTransfer);
+  const checkImages = options.checkImages !== false;
+
+  if (checkFiles) {
+    let rawPaths = [];
+    if (typeSet.has('x-special/gnome-copied-files')) {
+      const buf = await execFileBuffer('wl-paste', ['--no-newline', '--type', 'x-special/gnome-copied-files'], 600);
+      if (buf && buf.length > 0) rawPaths = parseUriListPaths(buf.toString('utf8'), { gnomeCopiedFiles: true });
+    }
+    if (!rawPaths.length && typeSet.has('text/uri-list')) {
+      const buf = await execFileBuffer('wl-paste', ['--no-newline', '--type', 'text/uri-list'], 600);
+      if (buf && buf.length > 0) rawPaths = parseUriListPaths(buf.toString('utf8'));
+    }
+    if (rawPaths.length > 0) {
+      const verified = [];
+      for (const rawPath of rawPaths.slice(0, 32)) {
+        try {
+          const resolved = path.resolve(rawPath);
+          const stat = await fs.stat(resolved);
+          if (!stat.isFile() || stat.size > MAX_FILE_TRANSFER_BYTES) continue;
+          verified.push({ path: resolved, name: path.basename(resolved), size: stat.size });
+          allowedClipboardSourcePaths.add(resolved);
+        } catch {}
+      }
+      if (verified.length > 0) {
+        return normalizeClipboardPayload({ kind: 'files', files: verified });
+      }
+    }
+  }
+
+  let text = '';
+  const textMime = typeSet.has('text/plain;charset=utf-8')
+    ? 'text/plain;charset=utf-8'
+    : (typeSet.has('text/plain') ? 'text/plain' : (typeSet.has('utf8_string') ? 'UTF8_STRING' : ''));
+  if (textMime) {
+    const textBuf = await execFileBuffer('wl-paste', ['--no-newline', '--type', textMime], 600);
+    if (textBuf && textBuf.length > 0) {
+      text = normalizeClipboardText(textBuf.toString('utf8'), MAX_CLIPBOARD_CHARS);
+    }
+  }
+
+  let html = '';
+  if (text.trim() && typeSet.has('text/html')) {
+    const htmlBuf = await execFileBuffer('wl-paste', ['--no-newline', '--type', 'text/html'], 600);
+    if (htmlBuf && htmlBuf.length > 0) {
+      html = htmlBuf.toString('utf8').slice(0, MAX_CLIPBOARD_CHARS);
+    }
+  }
+
+  if (checkImages && !text.trim() && typeSet.has('image/png')) {
+    const pngBuf = await execFileBuffer('wl-paste', ['--type', 'image/png'], 900);
+    if (pngBuf && pngBuf.length > 0 && pngBuf.length <= 6 * 1024 * 1024) {
+      return normalizeClipboardPayload({
+        kind: 'image',
+        text: '',
+        html: '',
+        imageBase64: pngBuf.toString('base64')
+      });
+    }
+  }
+
+  if (html && text.trim()) {
+    return normalizeClipboardPayload({ kind: 'context', text, html });
+  }
+  if (text) {
+    return normalizeClipboardPayload({ kind: 'text', text, html: '' });
+  }
+  return null;
+}
+
 async function readOsClipboardFiles() {
   let candidatePaths = [];
   try {
@@ -474,6 +603,21 @@ async function readOsClipboardFiles() {
         const uriBuf = await Promise.resolve(clipboard.readBuffer('text/uri-list'));
         if (Buffer.isBuffer(uriBuf) && uriBuf.length > 0) {
           candidatePaths = parseUriListPaths(uriBuf.toString('utf8'));
+        }
+      }
+      if (!candidatePaths.length && isLinuxWaylandSession && await hasWaylandClipboardTools()) {
+        const types = await readWaylandClipboardTypes();
+        if (types.includes('x-special/gnome-copied-files')) {
+          const gnomeBuf = await execFileBuffer('wl-paste', ['--no-newline', '--type', 'x-special/gnome-copied-files'], 600);
+          if (gnomeBuf && gnomeBuf.length > 0) {
+            candidatePaths = parseUriListPaths(gnomeBuf.toString('utf8'), { gnomeCopiedFiles: true });
+          }
+        }
+        if (!candidatePaths.length && types.includes('text/uri-list')) {
+          const uriBuf = await execFileBuffer('wl-paste', ['--no-newline', '--type', 'text/uri-list'], 600);
+          if (uriBuf && uriBuf.length > 0) {
+            candidatePaths = parseUriListPaths(uriBuf.toString('utf8'));
+          }
         }
       }
     }
@@ -530,33 +674,63 @@ async function readOsClipboardPayload(options = {}) {
     hasImageFormat = Array.isArray(formats) && formats.some(f => String(f || '').toLowerCase().startsWith('image/'));
   } catch {}
 
+  let x11Payload = null;
   if (hasImageFormat && !text.trim()) {
     if (!checkImages && lastObservedImagePayload) {
-      return lastObservedImagePayload;
-    }
-    try {
-      const image = await Promise.resolve(clipboard.readImage());
-      if (image && typeof image.isEmpty === 'function' && !image.isEmpty()) {
-        const png = image.toPNG();
-        if (Buffer.isBuffer(png) && png.length > 0 && png.length <= 6 * 1024 * 1024) {
-          const payload = normalizeClipboardPayload({
-            kind: 'image',
-            text,
-            html: '',
-            imageBase64: png.toString('base64')
-          });
-          lastObservedImagePayload = payload;
-          return payload;
+      x11Payload = lastObservedImagePayload;
+    } else {
+      try {
+        const image = await Promise.resolve(clipboard.readImage());
+        if (image && typeof image.isEmpty === 'function' && !image.isEmpty()) {
+          const png = image.toPNG();
+          if (Buffer.isBuffer(png) && png.length > 0 && png.length <= 6 * 1024 * 1024) {
+            x11Payload = normalizeClipboardPayload({
+              kind: 'image',
+              text,
+              html: '',
+              imageBase64: png.toString('base64')
+            });
+            lastObservedImagePayload = x11Payload;
+          }
         }
-      }
-    } catch {}
+      } catch {}
+    }
   }
 
-  lastObservedImagePayload = null;
-  if (html && text.trim()) {
-    return normalizeClipboardPayload({ kind: 'context', text, html });
+  if (!x11Payload) {
+    lastObservedImagePayload = null;
+    if (html && text.trim()) {
+      x11Payload = normalizeClipboardPayload({ kind: 'context', text, html });
+    } else {
+      x11Payload = normalizeClipboardPayload({ kind: 'text', text, html: '' });
+    }
   }
-  return normalizeClipboardPayload({ kind: 'text', text, html: '' });
+
+  const x11Sig = clipboardPayloadSignature(x11Payload);
+  // On Fedora GNOME Wayland, Electron runs inside XWayland; Mutter can occasionally lag
+  // or drop clipboard sync from native Wayland apps. Bridge via wl-paste when available.
+  if (isLinuxWaylandSession && (await hasWaylandClipboardTools())) {
+    const x11Unchanged = x11Sig === lastObservedX11ClipboardSignature;
+    const x11Empty = x11Payload.kind === 'text' && !x11Payload.text;
+    if (x11Empty || x11Unchanged) {
+      const wlPayload = await readWaylandClipboardPayload({ checkFiles, checkImages });
+      if (wlPayload) {
+        const wlSig = clipboardPayloadSignature(wlPayload);
+        const wlChanged = wlSig && wlSig !== lastObservedWlClipboardSignature;
+        if (wlChanged || (x11Empty && wlSig)) {
+          lastObservedX11ClipboardSignature = x11Sig;
+          lastObservedWlClipboardSignature = wlSig;
+          if (wlPayload.kind === 'image') lastObservedImagePayload = wlPayload;
+          return wlPayload;
+        }
+        lastObservedWlClipboardSignature = wlSig;
+      }
+    } else {
+      lastObservedX11ClipboardSignature = x11Sig;
+    }
+  }
+
+  return x11Payload;
 }
 
 async function readOsClipboardText() {
@@ -568,11 +742,15 @@ async function readOsClipboardText() {
 
 async function writeOsClipboardPayload(value) {
   const payload = normalizeClipboardPayload(value, { maxTextChars: MAX_CLIPBOARD_CHARS });
+  const sig = clipboardPayloadSignature(payload);
   lastObservedMainClipboard = payload.text;
-  lastObservedMainClipboardSignature = clipboardPayloadSignature(payload);
+  lastObservedMainClipboardSignature = sig;
+  lastObservedX11ClipboardSignature = sig;
+  lastObservedWlClipboardSignature = sig;
 
   if (payload.kind === 'image' && payload.imageBase64) {
-    const img = nativeImage.createFromBuffer(Buffer.from(payload.imageBase64, 'base64'));
+    const pngBuf = Buffer.from(payload.imageBase64, 'base64');
+    const img = nativeImage.createFromBuffer(pngBuf);
     if (!img.isEmpty()) {
       lastObservedImagePayload = payload;
       await Promise.resolve(clipboard.write({
@@ -580,15 +758,24 @@ async function writeOsClipboardPayload(value) {
         ...(payload.text ? { text: payload.text } : {}),
         ...(payload.html ? { html: payload.html } : {})
       }));
+      if (isLinuxWaylandSession && await hasWaylandClipboardTools()) {
+        writeWaylandClipboardData('image/png', pngBuf);
+      }
       return payload;
     }
   }
   lastObservedImagePayload = null;
   if (payload.kind === 'context' && payload.html) {
     await Promise.resolve(clipboard.write({ text: payload.text || '', html: payload.html }));
+    if (isLinuxWaylandSession && await hasWaylandClipboardTools()) {
+      writeWaylandClipboardData('text/html', Buffer.from(payload.html, 'utf8'));
+    }
     return payload;
   }
   await Promise.resolve(clipboard.writeText(payload.text || ''));
+  if (isLinuxWaylandSession && await hasWaylandClipboardTools()) {
+    writeWaylandClipboardData('text/plain;charset=utf-8', Buffer.from(payload.text || '', 'utf8'));
+  }
   return payload;
 }
 
@@ -603,9 +790,12 @@ async function writeOsClipboardFiles(filePaths = []) {
   }
   if (!valid.length) throw new Error('No valid files to place on the clipboard.');
   const payload = normalizeClipboardPayload({ kind: 'files', files: valid });
+  const sig = clipboardPayloadSignature(payload);
   lastObservedImagePayload = null;
   lastObservedMainClipboard = '';
-  lastObservedMainClipboardSignature = clipboardPayloadSignature(payload);
+  lastObservedMainClipboardSignature = sig;
+  lastObservedX11ClipboardSignature = sig;
+  lastObservedWlClipboardSignature = sig;
 
   const absPaths = valid.map(item => item.path);
   if (process.platform === 'win32') {
@@ -613,7 +803,12 @@ async function writeOsClipboardFiles(filePaths = []) {
   } else if (process.platform === 'darwin') {
     await Promise.resolve(clipboard.writeBuffer('NSFilenamesPboardType', Buffer.from(encodeMacFilenamesPlist(absPaths), 'utf8')));
   } else {
-    await Promise.resolve(clipboard.writeBuffer('text/uri-list', Buffer.from(encodeUriList(absPaths), 'utf8')));
+    const uriList = encodeUriList(absPaths);
+    await Promise.resolve(clipboard.writeBuffer('text/uri-list', Buffer.from(uriList, 'utf8')));
+    if (isLinuxWaylandSession && await hasWaylandClipboardTools()) {
+      const gnomePayload = `copy\n${uriList.trimEnd()}`;
+      writeWaylandClipboardData('x-special/gnome-copied-files', Buffer.from(gnomePayload, 'utf8'));
+    }
   }
   return { ok: true, files: valid, payload };
 }
@@ -1377,6 +1572,55 @@ async function injectUnicodeTextOnDesktop(rawText, meta = null) {
   });
 }
 
+async function switchNonWaylandHostLanguage(rawLanguage) {
+  const norm = normalizeLanguageTag(rawLanguage);
+  if (!norm || norm === lastHostKeyboardLanguage) return { ok: true, unchanged: true };
+  lastHostKeyboardLanguage = norm;
+  const xkb = xkbLayoutForLanguage(norm) || norm;
+
+  if (process.platform === 'linux') {
+    // Best-effort X11/KDE layout switching without failing control sessions
+    execFile('setxkbmap', ['-query'], { timeout: 700 }, (err, stdout) => {
+      if (!err && stdout) {
+        const m = String(stdout).match(/layout:\s*([^\r\n]+)/i);
+        if (m) {
+          const existing = m[1].split(',').map(s => s.trim()).filter(Boolean);
+          const idx = existing.findIndex(item => normalizeLanguageTag(item) === norm);
+          if (idx >= 0) {
+            execFile('xdotool', ['key', `ISO_Group_Shift`], { timeout: 600 }, () => {});
+          }
+          if (idx === -1 && existing.length > 0 && existing[0] !== xkb) {
+            const updated = [xkb, ...existing.filter(item => item !== xkb)].join(',');
+            execFile('setxkbmap', ['-layout', updated], { timeout: 700 }, () => {});
+          } else if (idx > 0) {
+            const reordered = [existing[idx], ...existing.filter((_, i) => i !== idx)].join(',');
+            execFile('setxkbmap', ['-layout', reordered], { timeout: 700 }, () => {});
+          }
+        }
+      }
+    });
+    return { ok: true, language: norm };
+  }
+
+  if (process.platform === 'darwin') {
+    // Best-effort macOS input source switch via Carbon/AppleScript shortcut when multiple sources configured
+    const script = `
+      tell application "System Events"
+        keystroke space using {control down}
+      end tell
+    `;
+    const targetName = norm === 'el' ? 'Greek' : (norm === 'en' ? 'U.S.' : norm);
+    execFile('defaults', ['read', 'com.apple.HIToolbox', 'AppleSelectedInputSources'], { timeout: 600 }, (err, stdout) => {
+      if (!err && stdout && !String(stdout).toLowerCase().includes(targetName.toLowerCase())) {
+        execFile('osascript', ['-e', script], { timeout: 800 }, () => {});
+      }
+    });
+    return { ok: true, language: norm };
+  }
+
+  return { ok: true, language: norm };
+}
+
 async function injectInput(event) {
   if (!event || typeof event !== 'object') return { ok: false, reason: 'Invalid input event.' };
   // Release events are always honored, including after a focus loss or control
@@ -1384,6 +1628,22 @@ async function injectInput(event) {
   if (event.kind === 'releaseAll') { clearNativeInput(); return { ok: true }; }
   if (!hasInputBackend() || !activeSocket || !inputAllowed) {
     return { ok: false, reason: 'Control is not enabled.' };
+  }
+  if (event.kind === 'keyboard-layout') {
+    try {
+      if (isLinuxWaylandSession) {
+        if (waylandInputManager && waylandInputManager.isActive()) {
+          return await waylandInputManager.inject(event);
+        }
+        return { ok: true };
+      }
+      if (process.platform === 'win32' && win32InputManager && win32InputManager.isActive()) {
+        return win32InputManager.inject(event);
+      }
+      return await switchNonWaylandHostLanguage(event.language || event.layout || '');
+    } catch {
+      return { ok: true };
+    }
   }
   try {
     if (event.kind === 'text') {
