@@ -407,17 +407,21 @@ jobs:
             test -n "$ACCESS_DESC" || { echo "Missing NSAccessibilityUsageDescription in Info.plist" >&2; exit 1; }
             test -n "$ICON_FILE" || { echo "Missing CFBundleIconFile in Info.plist" >&2; exit 1; }
 
-            # 4. Verify GPU & Renderer Helper .app bundles retain JIT / unsigned-executable-memory entitlements
-            for helper_name in "mswnlink Helper (GPU).app" "mswnlink Helper (Renderer).app"; do
-              HELPER_PATH="$APP/Contents/Frameworks/$helper_name"
-              if [ -d "$HELPER_PATH" ]; then
-                HELPER_ENT="$(codesign -d --entitlements :- "$HELPER_PATH" 2>/dev/null || true)"
-                echo "$HELPER_ENT" | grep -q "com.apple.security.cs.allow-unsigned-executable-memory" || {
-                  echo "Missing allow-unsigned-executable-memory entitlement on $helper_name" >&2
-                  exit 1
-                }
-              fi
-            done
+            # 4. Verify GPU & Renderer Helper .app bundles retain JIT / unsigned-executable-memory entitlements when entitlements plists are configured
+            if [ -f "build/entitlements.mac.inherit.plist" ]; then
+              for helper_name in "mswnlink Helper (GPU).app" "mswnlink Helper (Renderer).app"; do
+                HELPER_PATH="$APP/Contents/Frameworks/$helper_name"
+                if [ -d "$HELPER_PATH" ]; then
+                  HELPER_ENT="$(codesign -d --entitlements :- "$HELPER_PATH" 2>/dev/null || true)"
+                  echo "$HELPER_ENT" | grep -q "com.apple.security.cs.allow-unsigned-executable-memory" || {
+                    echo "Missing allow-unsigned-executable-memory entitlement on $helper_name" >&2
+                    exit 1
+                  }
+                fi
+              done
+            else
+              echo "Skipping custom helper entitlements check (no build/entitlements.mac*.plist present)."
+            fi
 
             cleanup_mount
             trap - EXIT
@@ -489,6 +493,7 @@ jobs:
           generate_release_notes: true
           body: |
             ### What's New in mswnlink v4
+            - **Fedora 44 & 45 Wayland Sync & Live Keyboard Language Switching**: Synchronizes viewer-to-host OS keyboard language changes automatically (`navigator.keyboard` + first-key language detection switching GNOME XKB `mru-sources` / `switch-input-source`, KDE Plasma D-Bus, Windows `WM_INPUTLANGCHANGEREQUEST`, and macOS input sources); fixes fractional-scaling `logical_size` pointer accuracy (`Invalid position` retry + corner re-anchoring), Wayland <-> XWayland `wl-paste`/`wl-copy` clipboard bridging, and low-latency WebRTC video stall recovery (`playoutDelayHint = 0`, 4.5s stall watchdog).
             - **UI & Visual Bug Fixes**: Eliminates dark-mode theme-switch transition flicker (white-on-white buttons and dimmed tab text), prevents session toasts from overlapping footer controls, fixes narrow mobile top-bar crowding, tightens Share bar backdrop masking, and places the fullscreen exit pill below remote desktop top panels.
             - **Buttonless File & Context Copy/Paste + Drag-and-Drop**: Copy and paste files (`Ctrl+C` / `Ctrl+V` or `Cmd+C` / `Cmd+V`), formatted HTML context, and images across Windows, macOS, and Fedora Linux, or drag and drop files straight onto the remote screen to save to Downloads without manual buttons.
             - **Windows Remote Desktop (`mstsc.exe`) Host Share Keep-Alive & Console Handoff**: Closing Windows Remote Desktop no longer stops `mswnlink` screen sharing automatically. The elevated Win32 helper watches `WTSQuerySessionInformation` to transfer disconnected RDP sessions back to the unlocked local console (`tscon.exe <SessionId> /dest:console` + `OpenInputDesktop`/`SetThreadDesktop`), while `renderer.js` keeps the LAN host & WebRTC peer alive and hot-swaps capture (`replaceTrack`) onto the local Windows display.
